@@ -492,17 +492,14 @@ CURVE_ANGLE = math.radians(1.0)
 _BSPLINE_CURVE = GeomAbs_CurveType.GeomAbs_BSplineCurve
 
 
-def _polyline_of_degree_one(adaptor) -> np.ndarray | None:
+def _polyline_of_degree_one(adaptor, bs) -> np.ndarray | None:
     """An edge of degree 1 drawn as what it is, the polygon through its
     knots, or None for any other curve.
 
     Sampled by deflection, a long polyline kept as one edge, as Rhino
     keeps one, lost its kinks: the sampler stepped over them, and the
     line drawn ran metres from the points it was made of."""
-    if adaptor.GetType() != _BSPLINE_CURVE:
-        return None
-    bs = adaptor.BSpline()
-    if bs.Degree() != 1:
+    if bs is None or bs.Degree() != 1:
         return None
     first, last = adaptor.FirstParameter(), adaptor.LastParameter()
     span = max(abs(last - first), 1e-12)
@@ -516,10 +513,46 @@ def _polyline_of_degree_one(adaptor) -> np.ndarray | None:
     return np.array([value(u).Coord() for u in params], np.float64)
 
 
+def _bspline_points(bs, params: np.ndarray) -> np.ndarray:
+    """A non-periodic B-spline at `params`, all at once: its basis by the
+    Cox-de Boor recursion, in homogeneous coordinates so rational curves
+    come out exact too. Few, whole-array steps, since a curve from a .3dm
+    is a couple of hundred points and numpy's cost is per step."""
+    p = bs.Degree()
+    n = bs.NbPoles()
+    flat = bs.KnotSequence()
+    knots = np.array([flat.Value(i)
+                      for i in range(flat.Lower(), flat.Upper() + 1)])
+    poles = np.array([bs.Pole(i).Coord() for i in range(1, n + 1)])
+    weights = (np.array([bs.Weight(i) for i in range(1, n + 1)])
+               if bs.IsRational() else np.ones(n))
+    homogeneous = np.hstack([poles * weights[:, None], weights[:, None]])
+    t = params[:, None]
+    basis = ((knots[:-1] <= t) & (t < knots[1:])).astype(np.float64)
+    # the end of the curve belongs to its last span, not past it
+    end = params >= knots[n]
+    basis[end] = 0.0
+    basis[end, n - 1] = 1.0
+    for k in range(1, p + 1):
+        lo, hi = knots[:-k - 1], knots[k:-1]
+        lo2, hi2 = knots[1:-k], knots[k + 1:]
+        width, width2 = hi - lo, hi2 - lo2
+        left = np.divide(1.0, width, out=np.zeros_like(width),
+                         where=width != 0)
+        right = np.divide(1.0, width2, out=np.zeros_like(width2),
+                          where=width2 != 0)
+        basis = ((t - lo) * left * basis[:, :-1]
+                 + (hi2 - t) * right * basis[:, 1:])
+    point = basis @ homogeneous
+    return point[:, :3] / point[:, 3:]
+
+
 def _edge_polyline(edge, deflection: float) -> np.ndarray | None:
     try:
         adaptor = occ.edge_adaptor(edge)
-        exact = _polyline_of_degree_one(adaptor)
+        bs = (adaptor.BSpline() if adaptor.GetType() == _BSPLINE_CURVE
+              else None)
+        exact = _polyline_of_degree_one(adaptor, bs)
         if exact is not None:
             return exact
         disc = GCPnts_TangentialDeflection(adaptor, CURVE_ANGLE, deflection,
@@ -527,6 +560,17 @@ def _edge_polyline(edge, deflection: float) -> np.ndarray | None:
         n = disc.NbPoints()
         if n < 2:
             return None
+        if bs is not None and not bs.IsPeriodic():
+            # The sampler's parameters, one call a point instead of two;
+            # what a .3dm brings is almost all B-splines, and thousands.
+            parameter = disc.Parameter
+            try:
+                pts = _bspline_points(bs, np.array(
+                    [parameter(i) for i in range(1, n + 1)]))
+                if np.isfinite(pts).all():
+                    return pts
+            except Exception:                              # noqa: BLE001
+                pass
         value = disc.Value
         return np.array([value(i).Coord() for i in range(1, n + 1)],
                         np.float64)
