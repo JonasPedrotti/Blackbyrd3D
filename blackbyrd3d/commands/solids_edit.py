@@ -1,0 +1,523 @@
+"""Solid editing: edge fillets/chamfers, capping, intersection, contours."""
+
+from ..core import geometry as g
+from .base import OptionReq, SelectReq, command
+
+
+def _parse_radius(ctx, text):
+    """A radius from typed text: one length, or `start,end` for a linear
+    variable fillet, or `u:r;u:r;...` (positions 0..1 along the chain)
+    for a SolidWorks-style variable one."""
+    from ..utils.units import parse_length
+    text = text.strip()
+    if ";" in text:
+        points = []
+        for part in text.split(";"):
+            part = part.strip()
+            if not part:
+                continue
+            u, _, r = part.partition(":")
+            try:
+                u_val = float(u)
+            except ValueError:
+                return None
+            r_val = parse_length(r, ctx.scene.units)
+            if r_val is None:
+                return None
+            points.append((u_val, r_val))
+        return points or None
+    if "," in text:
+        a, _, b = text.partition(",")
+        ra = parse_length(a, ctx.scene.units)
+        rb = parse_length(b, ctx.scene.units)
+        return (ra, rb) if ra and rb else None
+    return parse_length(text, ctx.scene.units)
+
+
+def _echo_largest_fit(ctx, obj, radius, edges=None):
+    """After a failed fillet, name the biggest radius that does fit —
+    a number beats 'try a smaller value'."""
+    if not isinstance(radius, (int, float)):
+        return
+    best = g.largest_fillet_radius(obj.shape, radius, edges=edges)
+    if best:
+        ctx.echo(f"{obj.name}: the largest radius that fits is about "
+                 f"{best:.3g}.")
+
+
+def _edge_size_req(ctx, objs, prompt, build):
+    """A radius/chamfer distance dragged off the side of what is selected.
+
+    `build(size)` returns the shape to ghost. The drag starts on the surface
+    being cut back, so a 1 mm fillet on a 100 mm box is a 1 mm drag.
+    """
+    from . import dragging
+    from .base import PointReq
+    side = tuple(ctx.cplane.xdir)
+    base = dragging.edge_point(objs, side)
+    read = dragging.distance_from(base)
+
+    def _ghost(p):
+        size = read(p)
+        if size < 1e-9:
+            return None
+        try:
+            return build(size)
+        except g.GeometryError:
+            return None
+
+    return read, PointReq(prompt, number_from=(base, side),
+                          rubber_from=base, preview_fn=_ghost)
+
+
+def _subobject_edge_map(ctx):
+    """{obj_id: [edge shapes]} from the current sub-object selection."""
+    out = {}
+    for (obj_id, kind, idx) in ctx.selection.subobjects:
+        if kind != "edge":
+            continue
+        obj = ctx.scene.get(obj_id)
+        if obj is None:
+            continue
+        edges = g.edges_of(obj.shape)
+        if 0 <= idx < len(edges):
+            out.setdefault(obj_id, []).append(edges[idx])
+    return out
+
+
+@command("filletedge", aliases=("fe",))
+def cmd_filletedge(ctx, objs=None):
+    """Fillet edges. Ctrl+Shift-click edges first to fillet only those;
+    otherwise fillets every edge of the selected solids."""
+    picked = _subobject_edge_map(ctx)
+    if picked:
+        held_picks = list(ctx.selection.subobjects)
+        chain = yield OptionReq("Extend picks to smooth chains?",
+                                options=["No", "Yes"], default="No")
+        from .base import TextReq
+        r_text = yield TextReq("Fillet radius (start,end or u:r;u:r for "
+                               "variable)",
+                               default="1")
+        radius = _parse_radius(ctx, r_text)
+        if radius is None:
+            ctx.echo("Could not parse the radius.")
+            return
+        transition = "smooth"
+        if isinstance(radius, list):
+            transition = yield OptionReq(
+                "Straight lines between the radius points?",
+                options=["Smooth", "Straight"], default="Smooth")
+        done = 0
+        succeeded = set()
+        blamed_picks = {}
+        for obj_id, edges in picked.items():
+            obj = ctx.scene.get(obj_id)
+            if chain == "Yes":
+                all_edges = g.edges_of(obj.shape)
+                idx_set = set()
+                for (oid, kind, idx) in ctx.selection.subobjects:
+                    if oid == obj_id and kind == "edge":
+                        idx_set.update(g.edge_chain(obj.shape, idx))
+                span = sorted(idx_set)
+                edges = [all_edges[i] for i in span]
+            else:
+                span = [idx for (oid, kind, idx) in ctx.selection.subobjects
+                        if oid == obj_id and kind == "edge"]
+            try:
+                ctx.scene.replace_shape(
+                    obj_id, g.fillet_edges(obj.shape, radius, edges=edges,
+                                           transition=transition))
+                done += len(edges)
+                succeeded.add(obj_id)
+            except g.GeometryError as exc:
+                ctx.echo(f"{obj.name}: {exc}")
+                _echo_largest_fit(ctx, obj, radius, edges=edges)
+                blamed = getattr(exc, "blamed", None)
+                if blamed:
+                    # the kernel says which chains it choked on: keep
+                    # exactly those edges selected for the next try
+                    blamed_picks[obj_id] = [span[k] for k in blamed
+                                            if 0 <= k < len(span)]
+        ctx.selection.clear()
+        remaining = []
+        seen = set()
+        for s in held_picks:
+            if s[0] in succeeded:
+                continue
+            keep = [(s[0], "edge", i)
+                    for i in blamed_picks.get(s[0], [])]
+            for t in (keep or [s]):
+                if t not in seen:
+                    seen.add(t)
+                    remaining.append(t)
+        ctx.result_subobjects = remaining
+        ctx.echo(f"Filleted {done} edge(s).")
+        if blamed_picks:
+            ctx.echo("The edges the kernel blamed stay selected.")
+        return
+    if objs is None:
+        objs = yield SelectReq("Select solids to fillet (Ctrl+Shift-click "
+                               "edges beforehand to fillet specific ones)",
+                               kinds=("solid", "surface"))
+    ctx.echo("Filleting all edges. Ctrl+Shift-click specific edges before "
+             "running Fillet to round only those.")
+    read, req = _edge_size_req(
+        ctx, objs, "Fillet radius for all edges (click, or type a number)",
+        lambda r: g.make_compound(
+            [g.fillet_edges(o.shape, r) for o in objs]))
+    radius = read((yield req))
+    if radius < 1e-9:
+        ctx.echo("Zero radius — nothing filleted.")
+        return
+    done = 0
+    for o in objs:
+        try:
+            ctx.scene.replace_shape(o.id, g.fillet_edges(o.shape, radius))
+            done += 1
+        except g.GeometryError as exc:
+            ctx.echo(f"{o.name}: {exc}")
+            _echo_largest_fit(ctx, o, radius)
+            ctx.echo("Try a smaller radius, or Ctrl+Shift-click specific "
+                     "edges before running Fillet again.")
+    if done:
+        ctx.echo(f"Filleted all edges of {done} object(s) at r={radius:g}.")
+
+
+@command("chamferedge", aliases=("che",))
+def cmd_chamferedge(ctx):
+    picked = _subobject_edge_map(ctx)
+    if picked:
+        chosen = [ctx.scene.get(oid) for oid in picked]
+        read, req = _edge_size_req(
+            ctx, [o for o in chosen if o is not None],
+            "Chamfer distance (click, or type a number)",
+            lambda d: g.make_compound(
+                [g.fillet_edges(ctx.scene.get(oid).shape, d, edges=edges,
+                                chamfer=True)
+                 for oid, edges in picked.items()]))
+        dist = read((yield req))
+        if dist < 1e-9:
+            ctx.echo("Zero distance — nothing chamfered.")
+            return
+        done = 0
+        for obj_id, edges in picked.items():
+            obj = ctx.scene.get(obj_id)
+            try:
+                ctx.scene.replace_shape(
+                    obj_id, g.fillet_edges(obj.shape, dist, edges=edges,
+                                           chamfer=True))
+                done += len(edges)
+            except g.GeometryError as exc:
+                ctx.echo(f"{obj.name}: {exc}")
+        ctx.selection.clear()
+        ctx.echo(f"Chamfered {done} picked edge(s) at {dist:g}.")
+        return
+    objs = yield SelectReq("Select solids to chamfer",
+                           kinds=("solid", "surface"))
+    read, req = _edge_size_req(
+        ctx, objs, "Chamfer distance (click, or type a number)",
+        lambda d: g.make_compound(
+            [g.fillet_edges(o.shape, d, chamfer=True) for o in objs]))
+    dist = read((yield req))
+    if dist < 1e-9:
+        ctx.echo("Zero distance — nothing chamfered.")
+        return
+    done = 0
+    for o in objs:
+        try:
+            ctx.scene.replace_shape(
+                o.id, g.fillet_edges(o.shape, dist, chamfer=True))
+            done += 1
+        except g.GeometryError as exc:
+            ctx.echo(f"{o.name}: {exc}")
+    if done:
+        ctx.echo(f"Chamfered {done} object(s) at {dist:g}.")
+
+
+@command("cap")
+def cmd_cap(ctx):
+    objs = yield SelectReq("Select open surfaces to cap",
+                           kinds=("surface", "solid", "compound"))
+    done = 0
+    for o in objs:
+        try:
+            capped = g.cap_holes(o.shape)
+            new = ctx.scene.replace_shape(o.id, capped)
+            done += 1
+            ctx.echo(f"{o.name} -> {new.kind}.")
+        except g.GeometryError as exc:
+            ctx.echo(f"{o.name}: {exc}")
+    if done:
+        ctx.echo(f"Capped {done} object(s).")
+    elif len(objs) > 1:
+        ctx.echo("For adjoining walls, Join the surfaces first, then run Cap.")
+
+
+@command("intersect", aliases=("int",))
+def cmd_intersect(ctx):
+    a = yield SelectReq("Select first object", kinds=("surface", "solid"),
+                        max_count=1)
+    b = yield SelectReq("Select second object", kinds=("surface", "solid"),
+                        max_count=1, allow_preselected=False)
+    curves = g.intersect_shapes(a[0].shape, b[0].shape)
+    for c in curves:
+        ctx.scene.add(c)
+    ctx.echo(f"Created {len(curves)} intersection curve(s).")
+
+
+@command("contour")
+def cmd_contour(ctx):
+    objs = yield SelectReq("Select objects to contour",
+                           kinds=("surface", "solid"))
+    axis = yield OptionReq("Contour direction",
+                           options=["Z", "X", "Y", "CPlane"], default="Z")
+    direction = {"X": (1, 0, 0), "Y": (0, 1, 0), "Z": (0, 0, 1),
+                 "CPlane": tuple(ctx.cplane.normal)}[axis]
+    from . import dragging
+    from .base import PointReq
+    # the spacing is a step up the contour axis, so it is dragged up that
+    # axis from the bottom of the stack: one drag, one visible gap
+    start = dragging.edge_point(objs, tuple(-c for c in direction))
+    read = dragging.signed_along(start, direction)
+    span = dragging.bounds(objs)
+    reach = max(abs(h - lo) for lo, h in zip(*span)) if span else 0.0
+
+    def _levels_to(p):
+        step = read(p)
+        # a hair of spacing over a big solid is thousands of slices; that is
+        # not a preview, it is a hang
+        if step < 1e-9 or (reach and step < reach / 200):
+            return None
+        out = []
+        for o in objs:
+            try:
+                for _, curves in g.contour(o.shape, direction, step):
+                    out.extend(curves)
+            except g.GeometryError:
+                return None
+        return g.make_compound(out) if out else None
+
+    sp = yield PointReq("Distance between contours (click, or type a number)",
+                        axis_lock=(start, direction),
+                        number_from=(start, direction),
+                        rubber_from=start, preview_fn=_levels_to)
+    spacing = read(sp)
+    if spacing < 1e-9:
+        ctx.echo("Zero spacing — no contours created.")
+        return
+    layer = ctx.scene.layers.find_by_name("Contours")
+    layer_id = layer.id if layer else ctx.scene.layers.create(
+        "Contours", (0.95, 0.75, 0.35)).id
+    total = 0
+    for o in objs:
+        try:
+            levels = g.contour(o.shape, direction, spacing)
+        except g.GeometryError as exc:
+            ctx.echo(f"{o.name}: {exc}")
+            continue
+        for _, curves in levels:
+            for c in curves:
+                ctx.scene.add(c, layer_id=layer_id)
+                total += 1
+    ctx.scene.notify()
+    ctx.echo(f"Created {total} contour curve(s) on layer 'Contours' "
+             f"(spacing {spacing:g}).")
+
+
+def _section_normal(p1, p2, up):
+    """The normal of the plane standing on the line from `p1` to `p2`.
+
+    A section line is drawn across the plan and the saw goes down, so the
+    plane contains the line and stands square to the construction plane.
+    That is what makes the same two points cut vertically in Front and
+    horizontally in Top, the way anyone from Rhino expects.
+
+    None when the two points sit on top of each other, or when the line
+    runs straight up the construction plane's normal, because neither
+    names a plane to cut with.
+    """
+    import numpy as np
+    normal = np.cross(up, np.subtract(p2, p1))
+    if np.linalg.norm(normal) < 1e-9:
+        return None
+    return tuple(float(c) for c in normal)
+
+
+def _cut_through(obj, point, normal):
+    """What the plane takes out of one object.
+
+    A solid gives the filled face, because that is what a section drawing
+    shows and what a hatch needs: an outline cannot say which side is
+    material, so a pipe would read as two unrelated circles instead of a
+    ring of wall with a bore down the middle. A surface has no inside and
+    so gives the curve.
+    """
+    if obj.kind == "solid":
+        return g.section_regions(obj.shape, point, normal)
+    return g.section_curves(obj.shape, point, normal)
+
+
+@command("section", aliases=("sec",))
+def cmd_section(ctx):
+    """Cut the selection with a plane drawn as a line across it.
+
+    You draw the line where the saw goes and get back what it went
+    through: the filled face for a solid, the curve for a surface. The
+    plane stands on that line and leans with the construction plane.
+
+    The objects you picked are left alone. A section is a drawing of the
+    model, not a change to it.
+    """
+    from .base import PointReq
+    objs = yield SelectReq("Select objects to section",
+                           kinds=("surface", "solid"))
+    up = tuple(ctx.cplane.normal)
+    p1 = yield PointReq("Start of section line")
+
+    def _cut_to(p):
+        normal = _section_normal(p1, p, up)
+        if normal is None:
+            return None
+        made = []
+        for o in objs:
+            try:
+                made.extend(_cut_through(o, p1, normal))
+            except g.GeometryError:
+                return None
+        return g.make_compound(made) if made else None
+
+    p2 = yield PointReq("End of section line", rubber_from=p1,
+                        preview_fn=_cut_to)
+    normal = _section_normal(p1, p2, up)
+    if normal is None:
+        ctx.echo("Those two points do not stand a plane up, so nothing "
+                 "was cut.")
+        return
+    made = []
+    for o in objs:
+        try:
+            made.extend(_cut_through(o, p1, normal))
+        except g.GeometryError as exc:
+            ctx.echo(f"{o.name}: {exc}")
+    if not made:
+        ctx.echo("The section plane missed everything selected.")
+        return
+    layer = ctx.scene.layers.find_by_name("Sections")
+    layer_id = layer.id if layer else ctx.scene.layers.create(
+        "Sections", (0.90, 0.45, 0.45)).id
+    with ctx.scene.batched():
+        for shape in made:
+            ctx.scene.add(shape, layer_id=layer_id)
+    ctx.scene.notify()
+    ctx.echo(f"Created {len(made)} section piece(s) on layer 'Sections'.")
+
+
+@command("booleansplit", aliases=("bsplit",))
+def cmd_booleansplit(ctx):
+    """Split solids with cutters, keeping every piece."""
+    targets = yield SelectReq("Select solids to split", kinds=("solid",))
+    cutters = yield SelectReq("Select cutting objects",
+                              allow_preselected=False)
+    made = []
+    for t in targets:
+        try:
+            pieces = g.split_shape(t.shape, [c.shape for c in cutters],
+                                   direction=tuple(ctx.cplane.normal))
+        except g.GeometryError as exc:
+            ctx.echo(f"{t.name}: {exc}")
+            continue
+        for p in pieces:
+            made.append(ctx.scene.add(p, layer_id=t.layer_id))
+        ctx.scene.remove(t.id)
+    # the pieces stand in for the solid you were holding, so they are what
+    # you are holding now and the gumball comes to them
+    ctx.select_result(made)
+    ctx.echo(f"Split into {len(made)} piece(s).")
+
+
+@command("mergeallcoplanarfaces", aliases=("mergeallfaces",))
+def cmd_merge_all_coplanar_faces(ctx):
+    """Fuse coplanar neighbouring faces of each selected polysurface.
+
+    Rhino's MergeAllCoplanarFaces. A union that left a side split along a
+    seam reads back as one face. An object with nothing to merge is left
+    alone, so running this on a clean box does nothing and says so.
+    """
+    objs = yield SelectReq("Select solids or surfaces to merge coplanar faces",
+                           kinds=("solid", "surface", "compound"))
+    removed = 0
+    touched = []
+    for o in objs:
+        before = len(g.faces_of(o.shape))
+        merged = g.merge_coplanar_faces(o.shape)
+        after = len(g.faces_of(merged))
+        if after < before:
+            touched.append(ctx.scene.replace_shape(o.id, merged))
+            removed += before - after
+    if not touched:
+        ctx.echo("No coplanar faces to merge.")
+        return
+    ctx.select_result(touched)
+    ctx.echo(f"Merged {removed} coplanar face(s) across {len(touched)} "
+             f"object(s).")
+
+
+@command("pushpull", aliases=("pp", "moveface"))
+def cmd_pushpull(ctx):
+    """SketchUp-style push/pull on a planar face.
+
+    Ctrl+Shift-click a face first, then run pushpull with a distance:
+    positive pushes the face outward, negative carves inward."""
+    faces = [(oid, idx) for (oid, kind, idx) in ctx.selection.subobjects
+             if kind == "face"]
+    if not faces:
+        ctx.echo("Ctrl+Shift-click a planar face first, then run pushpull.")
+        return
+        yield  # pragma: no cover
+    from . import dragging
+    from .base import PointReq
+    # the face knows which way it goes, so the drag rides its own normal:
+    # out of the solid adds material, into it carves
+    first = ctx.scene.get(faces[0][0])
+    origin, normal = g.face_point_normal(g.faces_of(first.shape)[faces[0][1]])
+    read = dragging.signed_along(origin, normal)
+
+    def _push_to(p):
+        v = read(p)
+        if abs(v) < 1e-9:
+            return None
+        made = []
+        for obj_id, idx in faces:
+            obj = ctx.scene.get(obj_id)
+            if obj is None:
+                continue
+            try:
+                made.append(g.push_pull(obj.shape, idx, v))
+            except g.GeometryError:
+                return None
+        return g.make_compound(made) if made else None
+
+    dp = yield PointReq("Distance (drag the face, or type a number — "
+                        "positive = outward, negative = cut)",
+                        axis_lock=(origin, normal),
+                        number_from=(origin, normal),
+                        rubber_from=origin, preview_fn=_push_to)
+    dist = read(dp)
+    if abs(dist) < 1e-9:
+        ctx.echo("Zero distance — nothing moved.")
+        return
+    done = 0
+    for obj_id, idx in faces:
+        obj = ctx.scene.get(obj_id)
+        if obj is None:
+            continue
+        try:
+            ctx.scene.replace_shape(
+                obj_id, g.push_pull(obj.shape, idx, dist))
+            done += 1
+        except g.GeometryError as exc:
+            ctx.echo(f"{obj.name}: {exc}")
+    ctx.selection.clear()
+    if done:
+        ctx.echo(f"Push/pulled {done} face(s) by "
+                 f"{ctx.scene.format_length(dist)}.")

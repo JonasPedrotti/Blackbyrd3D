@@ -1,0 +1,1550 @@
+"""Interactive command framework.
+
+A command is a generator function: it yields input requests (points, numbers,
+object selections, options) and receives the resolved values back. The
+CommandProcessor drives the generator from typed command-line input, viewport
+clicks, or the MCP bridge — the command code never knows the difference.
+
+    @command("line", aliases=("l",))
+    def cmd_line(ctx):
+        p1 = yield PointReq("Start of line")
+        p2 = yield PointReq("End of line", rubber_from=p1)
+        obj = ctx.scene.add(geometry.make_line(p1, p2))
+        ctx.echo(f"Created {obj.name}.")
+"""
+
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass, field
+from typing import Callable
+
+from ..core import geometry
+from ..utils.units import TO_MM, paper_units
+
+Point = tuple[float, float, float]
+
+
+# --------------------------------------------------------------- input requests
+
+class Req:
+    prompt: str = ""
+    choices: dict | None = None      # {"Cap": ["Yes","No"]} option chips
+    preview_fn = None                # callable(value) -> shape for ghosts
+
+
+@dataclass
+class PointReq(Req):
+    prompt: str
+    default: Point | None = None
+    rubber_from: Point | None = None      # draw rubber-band line while picking
+    rubber_pts: list | None = None        # accumulated points (polyline preview)
+    rubber_sides: object = None           # point -> the sides of the frame it
+                                          # spans: no band, and two numbers
+    rubber_band: bool = True              # False: keep the picked markers but
+                                          # draw no line between them, for a
+                                          # shape the ghost already draws and
+                                          # that does not run through them
+    allow_empty: bool = False             # Enter with no input -> None (done)
+    extra_options: tuple = ()             # typed keywords returned verbatim
+    choices: dict | None = None
+    preview_fn: object = None             # value/point -> ghost shape
+    # point -> a quick ghost (a DisplayMesh) shown while the cursor moves,
+    # where preview_fn would be too slow to follow it
+    draft_fn: object = None
+    axis_lock: tuple | None = None        # (base, dir): pick along this axis
+    number_from: object = None            # (base, dir) or point-fn: '10' ->
+                                          # base+10*dir / number_from(10.0)
+    allow_number: bool = False            # bare number returns the float
+    option_changed: object = None         # update constraints before notifying
+    # This prompt is one of a run of points, which Ctrl+Z walks back one at a
+    # time rather than ending the command. The command offers the UNDO_POINT
+    # keyword whenever it has a point to give up, and takes it off its list.
+    steps_back: bool = False
+    # The point just picked is a snap target too, which it normally is not
+    # since it sits under the cursor and would glue the next leg to nothing.
+    newest_snaps: bool = False
+    # A curve the point lies on: its crossings with the drawing are the
+    # intersections to snap to, as the end of an arc is on its circle.
+    snap_on: object = None
+    # (origin, normal): a pick that hits nothing to snap to lands on this
+    # plane rather than the CPlane, as a point turned round an axis does.
+    pick_plane: tuple | None = None
+    # point -> [[points], ...]: construction lines drawn with the cursor,
+    # like the band but of the command's own shape.
+    guide_fn: object = None
+    # [(point, label), ...]: points picked earlier, shown with their label
+    # whatever the band is doing, as Orient numbers its references.
+    marks: list | None = None
+
+
+# The keyword a steps_back prompt answers with to give up its last point.
+UNDO_POINT = "Undo"
+
+
+def frame_sides(corner, cplane):
+    """A `rubber_sides` for a rectangle dragged out from `corner`.
+
+    Measured on the plane it is being drawn on, which is the only place the
+    two numbers mean anything: a rectangle on a tilted plane has sides of its
+    own, and the world's idea of them is a pair of shadows.
+    """
+    def sides(p):
+        u1, v1, _ = cplane.from_world(corner)
+        u2, v2, _ = cplane.from_world(p)
+        return (abs(u2 - u1), abs(v2 - v1))
+    return sides
+
+
+def quadrant(ctx, cplane=None):
+    """Which way the sides run when only their lengths were given.
+
+    A typed length says how big, never which way, and the cursor has been
+    saying which way all along. Measured on the plane the shape is drawn on
+    when it has one, the world axes when it does not. Positive where there
+    is no cursor to ask — a batch, or the bridge — because something has to
+    be drawn.
+    """
+    aim = ctx.aim_direction()
+    if aim is None:
+        return 1.0, 1.0
+    _base, d = aim
+    if cplane is None:
+        u, v = d[0], d[1]
+    else:
+        u = sum(a * b for a, b in zip(d, cplane.xdir))
+        v = sum(a * b for a, b in zip(d, cplane.ydir))
+    return (-1.0 if u < 0 else 1.0), (-1.0 if v < 0 else 1.0)
+
+
+@dataclass
+class NumberReq(Req):
+    prompt: str
+    default: float | None = None
+    minimum: float | None = None
+    choices: dict | None = None
+    preview_fn: object = None
+
+
+@dataclass
+class LengthReq(NumberReq):
+    """A length in document units — accepts 3'6", 30cm, 1.5in, etc.
+
+    `paper` makes it a size on paper, a text height or an arrow, wherever
+    it is asked: kept in millimetres, like its default, but shown and typed
+    in the units the sheet is read in."""
+    paper: bool = False
+
+
+@dataclass
+class IntReq(Req):
+    prompt: str
+    default: int | None = None
+    minimum: int | None = None
+    choices: dict | None = None
+    preview_fn: object = None
+
+
+@dataclass
+class TextReq(Req):
+    prompt: str
+    default: str | None = None
+
+
+@dataclass
+class FileReq(TextReq):
+    """A path prompt a live window may answer with its file chooser."""
+    save: bool = False
+    title: str = "Choose file"
+    filters: str = ""
+
+
+@dataclass
+class TextEditorReq(TextReq):
+    """Typography answered by the live window's multiline editor."""
+    values: dict = field(default_factory=dict)
+    curve_output: bool = False
+    units: str = "mm"
+    shape_fn: object = None
+    target_id: str | None = None
+    anchor: tuple[float, float, float] = (0., 0., 0.)
+    paper_layout: object = None
+
+
+def has_text_editor(ctx):
+    """Scripted and replayed commands keep their ordinary text prompts."""
+    processor = getattr(ctx.window, "processor", None)
+    return processor is not None and not processor.headless
+
+
+# the most answers a question shows as chips to click
+MAX_ANSWER_CHIPS = 10
+
+
+@dataclass
+class OptionReq(Req):
+    prompt: str
+    options: list[str] = field(default_factory=list)
+    default: str | None = None
+    preview_fn: object = None             # option -> ghost, shown while asked
+
+
+@dataclass
+class FormField:
+    """One answer a form asks for: a name to give it back under, the
+    ordinary request that asks it, and when it applies at all.
+
+    `when` is a callable over the answers given so far. A field that does
+    not apply is not asked and is not typed at: a popup greys it out, and
+    a prompt simply skips it, so a solid hatch still finishes at the
+    pattern rather than asking for a spacing that means nothing.
+    """
+    name: str
+    req: Req
+    when: object = None
+
+
+@dataclass
+class FormReq(Req):
+    """Several answers asked as one thing: a popup, where there is a window
+    to put one in, and the same prompts one after another where there is
+    not (#45).
+
+    Each field is an ordinary request, so nothing about typing, scripting,
+    the journal, replay or MCP changes: a form says how the answers belong
+    together, not that they are a new kind of answer. The command is sent
+    back a dict of {name: value}, and a window may answer the whole of it
+    at once with `CommandProcessor.provide_form`.
+
+    `preview_fn(answers)` is what the answers would make, for a popup to
+    ghost while it is open and as its answers change.
+    """
+    prompt: str = ""
+    fields: tuple = ()
+    title: str = ""
+    preview_fn: object = None
+
+
+@dataclass
+class SelectReq(Req):
+    prompt: str
+    # The option a typed number sets, rather than answering the prompt:
+    # at "Select first curve (Radius=0)", 5 or 2mm means that radius and
+    # the question still stands. Rhino's prompts work this way, and a
+    # number is never the name of an object anyway.
+    number_option: str = ""
+    min_count: int = 1
+    max_count: int | None = None          # None = unlimited, finish with Enter
+    kinds: tuple = ()                     # () = any; else e.g. ("curve",)
+    allow_preselected: bool = True
+    choices: dict | None = None
+    preview_fn: object = None
+    accept: object = None                 # callable(obj) -> bool, extra filter
+    # Ask for where on the object a click landed, as well as which object:
+    # trim takes the part that point is on (#31). A viewport click supplies
+    # it; a typed, scripted or listed pick cannot, and leaves it out.
+    want_point: bool = False
+    # Leave the answer selected rather than letting go of it: what a
+    # transform moves stays lit while you place it.
+    keep: bool = False
+    # Enter or a right-click with fewer than min_count picked ends the
+    # command rather than asking again: Join with one curve is done.
+    too_few_ends: bool = False
+    # Typed or clicked keywords that answer the prompt with their name in
+    # place of the objects: Split's Points goes straight to picking points.
+    extra_options: tuple = ()
+
+
+def _is_length(text: str, units: str) -> bool:
+    from ..utils.units import parse_length
+    return parse_length(str(text), units) is not None
+
+
+def _kinds_phrase(kinds: tuple) -> str:
+    """The kinds filter as prompt English: ('solid','surface') -> 'solid
+    or surface'. Every message about a rejected selection ends with this,
+    so the why is always in the same words the filter actually used."""
+    if not kinds:
+        return "any object"
+    if len(kinds) == 1:
+        return kinds[0]
+    return ", ".join(kinds[:-1]) + " or " + kinds[-1]
+
+
+class CancelCommand(Exception):
+    """Raised inside a generator when the user hits Escape."""
+
+
+# --------------------------------------------------------------- registry
+
+@dataclass
+class CommandDef:
+    name: str
+    fn: Callable
+    aliases: tuple = ()
+    label: str = ""
+    mutates: bool = True
+    # Whether an empty Enter, or a right-click on an idle prompt, may repeat
+    # this command. Rhino keeps a list it will never repeat and delete is on
+    # it: right-clicking is a reflex, and a reflex should not be able to
+    # throw away the geometry that is still picked.
+    repeatable: bool = True
+    # Which space this command's picked points are in: "model" coordinates,
+    # "paper" millimetres on a sheet, or "any" for the few that read the
+    # viewport and cope with either. Only a sheet can tell them apart, and
+    # the default is the safe one — a command that never said is not let
+    # loose on paper it cannot mean anything about.
+    space: str = "model"
+
+
+_REGISTRY: dict[str, CommandDef] = {}
+_ALIASES: dict[str, str] = {}
+
+
+def command(name: str, aliases: tuple = (), label: str = "",
+            mutates: bool = True, space: str = "model",
+            repeatable: bool = True):
+    def wrap(fn):
+        cd = CommandDef(name=name.lower(), fn=fn, aliases=aliases,
+                        label=label or name.capitalize(), mutates=mutates,
+                        space=space, repeatable=repeatable)
+        _REGISTRY[cd.name] = cd
+        for a in aliases:
+            _ALIASES[a.lower()] = cd.name
+        return fn
+    return wrap
+
+
+def add_alias(alias: str, target: str):
+    """Register a user alias at runtime (overrides built-ins)."""
+    _ALIASES[alias.lower().strip()] = target.lower().strip()
+
+
+def remove_alias(alias: str):
+    _ALIASES.pop(alias.lower().strip(), None)
+
+
+def resolve(name: str) -> CommandDef | None:
+    key = name.lower().strip()
+    if key in _REGISTRY:
+        return _REGISTRY[key]
+    if key in _ALIASES:
+        return _REGISTRY.get(_ALIASES[key].split()[0])
+    return None
+
+
+def all_commands() -> list[CommandDef]:
+    return sorted(_REGISTRY.values(), key=lambda c: c.name)
+
+
+def completions(prefix: str) -> list[str]:
+    prefix = prefix.lower()
+    names = [c.name for c in _REGISTRY.values()]
+    return sorted(n for n in names if n.startswith(prefix))
+
+
+# --------------------------------------------------------------- context
+
+class CommandContext:
+    def __init__(self, scene, selection, history, viewport=None, window=None):
+        self.scene = scene
+        self.selection = selection
+        self.history = history
+        self.viewport = viewport
+        self.window = window
+        self.last_point: Point | None = None
+        self._echo_fns: list = []
+        self.result_ids: list[str] = []
+        # object id -> the world point a click landed on it, for the current
+        # selection prompt only (see SelectReq.want_point)
+        self.pick_points: dict = {}
+        self.result_subobjects: list = []
+        # set by the replay engine: the plane and aim a headless replay
+        # answers with, standing in for the viewport that recorded them
+        self.replay_cplane = None
+        self.replay_aim = None
+        self.replay_space = None
+        # Set once a command has chosen the sheet's own items (`sheet_view`):
+        # every point it asks for after that is on the paper, wherever the
+        # click lands (#129).
+        self.paper_points = False
+
+    def held_control_points(self) -> dict:
+        """{obj_id: [index, ...]} — the control points the selection holds.
+
+        Empty in the ordinary case, which is what tells a command it is
+        working on whole objects as it always has. Must be read before the
+        command asks anything, since a select prompt clears the selection to
+        take its answer and the held points would go with it.
+        """
+        held: dict = {}
+        for entry in getattr(self.selection, "subobjects", []):
+            obj_id, kind, index = entry
+            if kind != "cv" or self.scene.get(obj_id) is None:
+                continue
+            held.setdefault(obj_id, []).append(int(index))
+        return held
+
+    def held_parts(self) -> dict:
+        """What the selection is holding, grouped by what can be done to it.
+
+        A command needs to tell a curve's segment from a solid's edge: both
+        arrive as ("edge", index) and they are not the same thing, so the
+        object's own kind decides which bucket a held edge lands in.
+
+        Empty in the ordinary case, which is what tells a command it is
+        working on whole objects as it always has. Must be read before the
+        command asks anything, since a select prompt clears the selection to
+        take its answer and everything held would go with it.
+        """
+        parts: dict = {}
+        for entry in getattr(self.selection, "subobjects", []):
+            obj_id, kind, index = entry
+            obj = self.scene.get(obj_id)
+            if obj is None:
+                continue
+            if obj.kind == "mesh":
+                # a mesh's triangles, edges and corners all come down to
+                # its points, kept as they were held
+                parts.setdefault("mesh", {}).setdefault(obj_id, []).append(
+                    (kind, int(index)))
+                continue
+            if kind == "cv":
+                bucket = "cv"
+            elif kind == "face":
+                bucket = "face"
+            elif kind == "edge":
+                bucket = "segment" if obj.kind == "curve" else "edge"
+            elif kind == "vertex":
+                # a curve's corner bends the segments meeting there; a
+                # solid's is a corner its faces lean to follow
+                bucket = "curve_point" if obj.kind == "curve" else "point"
+            else:
+                continue
+            parts.setdefault(bucket, {}).setdefault(obj_id, []).append(
+                int(index))
+        return parts
+
+    def moved_mesh_parts(self, held, fn):
+        """(obj_id, mesh) for each mesh, its held parts' points put through
+        `fn`, as one change: a corner two held triangles share moves once."""
+        from ..core.mesh import _weld
+        for obj_id, entries in held.items():
+            obj = self.scene.get(obj_id)
+            if obj is None:
+                continue
+            mesh = obj.shape
+            welding = _weld(mesh.vertices)
+            try:
+                points = {i for kind, index in entries
+                          for i in mesh.part_points(kind, index, welding)}
+            except (IndexError, ValueError):
+                continue
+            yield obj_id, mesh.points_moved(
+                points, lambda p: geometry.transform_points([tuple(p)], fn)[0],
+                welding)
+
+    def control_point_ghost(self, held, fn):
+        """Preview of those objects with their held points put through `fn`."""
+        shapes = [s for _id, s in self._moved_control_points(held, fn)]
+        return geometry.make_compound(shapes) if shapes else None
+
+    def apply_to_control_points(self, held, fn) -> int:
+        """Put every held control point through `fn`; how many moved.
+
+        The points stay held afterwards. A command that ends by letting go of
+        them would be a command you have to pick your way back into before
+        you can nudge the same corner again, and nudging the same corner
+        again is most of what control point editing is.
+        """
+        moved = 0
+        for obj_id, shape in self._moved_control_points(held, fn):
+            self.scene.replace_shape(obj_id, shape)
+            moved += len(held[obj_id])
+        self.result_subobjects = [(oid, "cv", i)
+                                  for oid, idxs in held.items() for i in idxs]
+        return moved
+
+    def _moved_control_points(self, held, fn):
+        """(obj_id, shape) for each object, its held points through `fn`.
+
+        Every point is measured from the shape as it stands and put back one
+        at a time, the same way the gumball edits them, so a command and a
+        drag of the gumball cannot disagree about what a moved corner does to
+        the curve. An object whose points cannot be read is skipped rather
+        than half-transformed.
+        """
+        for obj_id, idxs in held.items():
+            obj = self.scene.get(obj_id)
+            if obj is None:
+                continue
+            surface = obj.kind == "surface"
+            try:
+                was = (geometry.surface_control_points(obj.shape)[0]
+                       if surface else geometry.get_control_points(obj.shape))
+                to = geometry.transform_points([was[i] for i in idxs], fn)
+                shape = obj.shape
+                for i, p in zip(idxs, to):
+                    shape = (geometry.move_surface_control_point(shape, i, p)
+                             if surface
+                             else geometry.move_control_point(shape, i, p))
+            except (geometry.GeometryError, IndexError):
+                continue
+            yield obj_id, shape
+
+    def select_result(self, objs):
+        """Say what this command made, to be left selected when it ends.
+
+        Most commands let go of the selection on the way out, because you
+        picked those objects to say which ones and the pick has been spent.
+        A boolean is the other sort: it eats what you picked and puts
+        something else there, so letting go leaves you holding nothing and
+        the gumball, which was on the solid you were working on, with
+        nowhere to be.
+        """
+        self.result_ids = [o if isinstance(o, str) else o.id for o in objs]
+
+    def flash(self, objs):
+        """Light what this command made for a moment, so a success that
+        changes nothing you can see is still seen. Nothing without a window."""
+        show = getattr(self.window, "flash_objects", None)
+        if show is not None:
+            show([o if isinstance(o, str) else o.id for o in objs])
+
+    def opt(self, name: str, default: str) -> str:
+        return getattr(self, "options", {}).get(name, default)
+
+    @property
+    def cplane(self):
+        """The plane the running command draws on.
+
+        The viewport is asked rather than told: inside a detail the plane is
+        the one that detail looks at, and a command has no business knowing
+        whether it is being run through a window onto the model.
+        """
+        if self.replay_cplane is not None:
+            return self.replay_cplane
+        if self.viewport is not None:
+            return self.viewport.active_cplane()
+        from ..core.cplane import CPlane
+        return CPlane()
+
+    def locked_direction(self):
+        """The Tab direction lock, if one is being held for this point.
+
+        Typing a length is how you use a lock, so the parser has to know
+        about it, and only the viewport can say whether the lock still
+        belongs to the point being picked rather than an earlier one.
+        """
+        vp = self.viewport
+        fn = getattr(vp, "locked_direction", None) if vp is not None else None
+        return fn() if fn is not None else None
+
+    def aim_direction(self):
+        """The direction the cursor is pointing from the point before it.
+
+        What makes a bare number a point at a prompt no command named an
+        axis for: the rubber band on screen says which way, the number says
+        how far. Only the viewport knows where the cursor is, and only it
+        knows that ortho or a snap has already moved the answer.
+        """
+        if self.replay_aim is not None:
+            return self.replay_aim
+        for vp in self._aiming_panes():
+            fn = getattr(vp, "aim_direction", None)
+            aim = fn() if fn is not None else None
+            if aim is not None:
+                return aim
+        return None
+
+    def _aiming_panes(self):
+        """The panes to ask which way, the cursor's own first.
+
+        Four panes share one command line. The number is typed at the
+        keyboard but it is aimed with the mouse, and the mouse is not
+        always in the pane the last click made active — draw in Top with
+        Perspective still active and the pane commands act on has never
+        had the cursor over it, so it has nothing to say.
+        """
+        panes = []
+        listing = getattr(self.window, "all_viewports", None)
+        if listing is not None:
+            panes = [v for v in listing()
+                     if getattr(v, "underMouse", None) is not None
+                     and v.underMouse()]
+        if self.viewport is not None and self.viewport not in panes:
+            panes.append(self.viewport)
+        return panes
+
+    def on_bare_paper(self) -> bool:
+        """True when a pick can only name paper, and not the model.
+
+        Inside a detail it can name both — the detail is a window onto the
+        model, so the viewport unprojects through it.
+        """
+        vp = self.viewport
+        if vp is None or getattr(vp, "space", "model") == "model":
+            return False
+        lv = getattr(vp, "layout_view", None)
+        return getattr(lv, "entered_detail", None) is None
+
+    def typed_units(self) -> tuple[str, float]:
+        """The units a length is typed in here, and how many of the units it
+        is kept in make one of them. In the model and in a detail both are
+        the document's units; bare paper is kept in millimetres but typed in
+        the units its sheet is read in, inches in an inch or a feet document."""
+        if self.on_bare_paper():
+            unit = paper_units(self.scene.units)
+            return unit, TO_MM[unit]
+        return self.scene.units, 1.0
+
+    def length_units(self, req: LengthReq) -> tuple[str, float]:
+        """The units `req` is typed in, and how many of the units it is kept
+        in make one of them: the sheet's for a size on paper, wherever it is
+        asked, and otherwise the document's, even asked from bare paper,
+        since what such a length measures is in the model."""
+        if req.paper:
+            unit = paper_units(self.scene.units)
+            return unit, TO_MM[unit]
+        return self.scene.units, 1.0
+
+    def from_typed(self, value: float) -> float:
+        """A number typed here as a length, in the units it is kept in."""
+        return value * self.typed_units()[1]
+
+    def as_typed(self, length: float) -> float:
+        """A length as kept, in the units it would be typed in here."""
+        return length / self.typed_units()[1]
+
+    def sheet_view(self):
+        """The layout view, when a command asking for objects means the sheet.
+
+        A sheet has two things on it a command could mean: the sheet's own
+        geometry, frames and annotations, and the model seen through a detail.
+        The same thing that decides where a point lands decides this — a detail
+        is a window onto the model, so inside one a command is working on the
+        model and can ask for model objects the ordinary way, by clicking them
+        through the frame. On bare paper there is no model to ask about and no
+        click that could name one, so the sheet is the answer, and a command
+        that went looking for model objects there would wait for ever.
+
+        None for the headless stub viewport, which has no sheet to pick on.
+
+        A command that gets the sheet is working on paper from then on, so
+        its points stay paper points: a click inside a frame it is scaling
+        is a corner to scale from, not a way into the model (#129).
+        """
+        if not self.on_bare_paper():
+            return None
+        lv = getattr(self.viewport, "layout_view", None)
+        if not hasattr(lv, "delete_selected"):
+            return None
+        self.paper_points = True
+        return lv
+
+    def add(self, shape, name: str | None = None):
+        """Put a new shape where the command is drawing it.
+
+        The model, normally. On bare paper there is no model point the command
+        could have been given, so what it drew is paper geometry and belongs to
+        the sheet — the millimetres it was handed are the millimetres it keeps.
+        Inside a detail the picks were model points already, so it goes in the
+        model like anything else.
+
+        Commands that can only mean the model — a box, an extrusion — never
+        reach here on paper: the processor refuses their first point instead.
+        """
+        lay = self.viewport.layout_view.layout if self.on_bare_paper() else None
+        if lay is None:
+            return self.scene.add(shape, name=name)
+        obj = lay.add(shape, name=name)
+        # so the checkpoint taken at the start of the command is kept: it is
+        # discarded if the scene says nothing changed, and a sheet is the scene
+        self.scene.notify("layouts")
+        return obj
+
+    def add_echo_listener(self, fn):
+        self._echo_fns.append(fn)
+
+    def echo(self, msg: str):
+        for fn in self._echo_fns:
+            fn(msg)
+
+
+# --------------------------------------------------------------- input parsing
+
+def parse_point(text: str, last_point: Point | None = None,
+                units: str = "mm", cplane=None) -> Point | None:
+    """Parse coordinates: 'x,y[,z]' absolute, '@dx,dy[,dz]' relative, or
+    'dist<angle' polar (relative to the last point, on the CPlane).
+
+    Each coordinate accepts unit expressions (3'6", 30cm, 1.5in)."""
+    from ..utils.units import parse_length
+    text = text.strip()
+
+    # polar: distance<angle_degrees (CPlane XY, from last point)
+    if "<" in text:
+        dist_s, _, ang_s = text.partition("<")
+        dist = parse_length(dist_s, units)
+        try:
+            ang = math.radians(float(ang_s.strip()))
+        except ValueError:
+            return None
+        if dist is None:
+            return None
+        base = last_point or (0.0, 0.0, 0.0)
+        if cplane is not None:
+            u, v, w = cplane.from_world(base)
+            return cplane.to_world(u + dist * math.cos(ang),
+                                   v + dist * math.sin(ang), w)
+        return (base[0] + dist * math.cos(ang),
+                base[1] + dist * math.sin(ang), base[2])
+
+    relative = text.startswith("@")
+    if relative:
+        text = text[1:]
+    parts = [p.strip() for p in text.replace(";", ",").split(",")]
+    if len(parts) not in (2, 3):
+        return None
+    vals = []
+    for p in parts:
+        v = parse_length(p, units)
+        if v is None:
+            return None
+        vals.append(v)
+    if len(vals) == 2:
+        vals.append(0.0)
+    if relative:
+        base = last_point or (0.0, 0.0, 0.0)
+        vals = [b + v for b, v in zip(base, vals)]
+    return tuple(vals)
+
+
+def parse_value(req: Req, text: str, ctx: CommandContext):
+    """Parse typed text against a request. Returns (ok, value_or_error)."""
+    text = text.strip()
+    if isinstance(req, PointReq):
+        if not text and req.allow_empty:
+            return True, None
+        if not text and req.default is not None:
+            return True, req.default
+        for opt in req.extra_options:
+            if text and opt.lower().startswith(text.lower()):
+                return True, opt
+        # Zero abbreviates absolute world coordinates at a position prompt.
+        # Prompts measuring a dimension or factor keep their numeric zero.
+        if text == "0" and req.number_from is None and not req.allow_number:
+            return True, (0.0, 0.0, 0.0)
+        # On bare paper a typed point is the sheet's, in the units it is
+        # read in; it has no construction plane to be measured on.
+        units, per = ctx.typed_units()
+        cplane = None if ctx.on_bare_paper() else ctx.cplane
+        last = ctx.last_point          # a raw number, after a prompt took one
+        if per != 1.0 and isinstance(last, (tuple, list)):
+            last = tuple(c / per for c in last)
+        pt = parse_point(text, last, units, cplane)
+        if pt is not None and per != 1.0:
+            pt = tuple(c * per for c in pt)
+        # A command that runs along an axis of its own says so; failing
+        # that, Tab lets you aim one by hand, and failing that the cursor is
+        # aiming one anyway. A number means the same thing in all three: how
+        # far along it. Tab beats the cursor because a frozen direction is a
+        # decision already made, and moving the mouse afterwards must not
+        # quietly undo it.
+        along = req.number_from
+        if along is None and not req.allow_number:
+            along = ctx.locked_direction() or ctx.aim_direction()
+        if pt is None and (along is not None or req.allow_number):
+            from ..utils.units import parse_length
+            v = parse_length(text, units)
+            if v is not None:
+                if callable(along):
+                    pt = tuple(along(v * per))
+                elif along is not None:
+                    base, direction = along
+                    pt = tuple(b + v * per * d
+                               for b, d in zip(base, direction))
+                else:
+                    # an angle or a factor as often as a length, so the
+                    # command that asked says which and converts a length
+                    return True, float(v)     # allow_number: the raw value
+        if pt is None:
+            return False, ("Expected coordinates like 3,4,0 "
+                           "(@1,0 relative, 10<45 polar, units like 3'6\")")
+        return True, pt
+    if isinstance(req, LengthReq):
+        if not text and req.default is not None:
+            return True, req.default
+        from ..utils.units import format_paper_length, parse_length
+        units, per = ctx.length_units(req)
+        v = parse_length(text, units)
+        if v is None:
+            return False, "Expected a length (e.g. 250, 3'6\", 30cm)"
+        v *= per
+        if req.minimum is not None and v < req.minimum:
+            least = (format_paper_length(req.minimum, ctx.scene.units)
+                     if req.paper else req.minimum)
+            return False, f"Value must be >= {least}"
+        return True, v
+    if isinstance(req, NumberReq):
+        if not text and req.default is not None:
+            return True, req.default
+        try:
+            v = float(text)
+        except ValueError:
+            return False, "Expected a number"
+        if req.minimum is not None and v < req.minimum:
+            return False, f"Value must be >= {req.minimum}"
+        return True, v
+    if isinstance(req, IntReq):
+        if not text and req.default is not None:
+            return True, req.default
+        try:
+            v = int(text)
+        except ValueError:
+            return False, "Expected an integer"
+        if req.minimum is not None and v < req.minimum:
+            return False, f"Value must be >= {req.minimum}"
+        return True, v
+    if isinstance(req, TextReq):
+        if not text and req.default is not None:
+            return True, req.default
+        if not text:
+            return False, "Expected text"
+        return True, text
+    if isinstance(req, OptionReq):
+        if not text and req.default is not None:
+            return True, req.default
+        for opt in req.options:                    # exact match first
+            if text and opt.lower() == text.lower():
+                return True, opt
+        for opt in req.options:
+            if text and opt.lower().startswith(text.lower()):
+                return True, opt
+        return False, f"Options: {', '.join(req.options)}"
+    return False, "Unsupported input"
+
+
+def format_prompt(req: Req, ctx: CommandContext | None = None) -> str:
+    p = req.prompt
+    # A size on paper says the units it is typed in, which the sheet's
+    # units decide, so the prompt itself can't: "Text height (in)".
+    paper = isinstance(req, LengthReq) and req.paper and ctx is not None
+    if paper:
+        unit, per = ctx.length_units(req)
+        p += f" ({unit})"
+    if isinstance(req, OptionReq) and req.options:
+        p += f" ({'/'.join(req.options)})"
+    extras = getattr(req, "extra_options", ())
+    if extras:
+        p += f" ({'/'.join(extras)})"
+    default = getattr(req, "default", None)
+    if default is not None:
+        if paper:
+            # in those units; Enter still keeps the default exactly
+            p += f" <{round(default / per, 4)}>"
+        elif isinstance(default, tuple):
+            p += f" <{','.join(str(round(c, 4)) for c in default)}>"
+        else:
+            p += f" <{default}>"
+    return p
+
+
+def unused_inputs_message(command: str, answered: list[tuple[str, str]],
+                          unused: list[str], messages: list[str]) -> str:
+    """The error for scripted inputs left over once their command finished.
+
+    The command's result stands by then (the export is written, the curve
+    made), so the message says which prompt each used input answered and
+    what the command did: enough to spot the mix-up and not retry blind.
+    """
+    name = (command.split() or [command])[0]
+    count = f"{len(unused)} input{'' if len(unused) == 1 else 's'}"
+    took = "; ".join(f"{prompt} = {text!r}" for prompt, text in answered)
+    did = " ".join(m for m in messages if not m.startswith("> ")).rstrip()
+    if did and did[-1] not in ".!?":
+        did += "."
+    return (f"{name} finished with {count} unused: "
+            f"{', '.join(repr(t) for t in unused)}. "
+            + (f"Its prompts took: {took}. " if took
+               else "It asked for no input. ")
+            + (f"It still ran: {did} " if did else "It still ran. ")
+            + "Send only the inputs its prompts ask for, and check what it "
+              "did before running it again.")
+
+
+# --------------------------------------------------------------- processor
+
+class CommandProcessor:
+    """Drives command generators; UI- and transport-agnostic."""
+
+    def __init__(self, ctx: CommandContext):
+        self.ctx = ctx
+        self.gen = None
+        self.active: CommandDef | None = None
+        self.request: Req | None = None
+        self.last_command: str | None = None
+        self.command_options: dict = {}
+        self.headless = False            # keep FileReq as typed input
+        # The form being asked field by field, if any, with the answers
+        # given so far. A window shows it as one popup; see FormReq.
+        self.form: FormReq | None = None
+        self._form_values: dict = {}
+        self._form_index = 0
+        self._start_revision = 0
+        self._select_buffer: list[str] = []
+        self._listeners: list = []       # notified on state change
+        # every point the running command has taken, so the UI can offer
+        # them as snaps: what you are drawing is not in the scene yet
+        self.picked_points: list = []
+        # where a relative point measured from when the command started, for
+        # when the command gives up the first point it took
+        self._last_point_at_start = None
+        # the session journal, when one is attached (core/journal.py); the
+        # priming flag keeps the generator's start-up advance — which is
+        # nobody's answer to anything — out of the recording
+        self.journal = None
+        self._journal_priming = False
+
+    # -- observers --
+    def add_listener(self, fn):
+        self._listeners.append(fn)
+
+    def _notify(self):
+        for fn in self._listeners:
+            fn()
+
+    @property
+    def busy(self) -> bool:
+        return self.gen is not None
+
+    # -- lifecycle --
+    def run(self, name: str) -> bool:
+        if self.busy:
+            # Undo at a run of points takes back the last one. Anywhere else
+            # it ends the command, as every other command does.
+            # A Rhino preset binds Ctrl+Z to !_Undo; read it as below.
+            control = resolve(name.strip().removeprefix("!").removeprefix("_"))
+            if (control is not None and control.name == "undo"
+                    and self.undo_point()):
+                return True
+            self.cancel()
+        # macro form: 'osnap mid toggle' — first token is the command,
+        # the rest answer its prompts; aliases may expand to macros too
+        # Rhino shortcut presets may prefix an invocation with ! and its
+        # command word with _. Keep those markers out of argument text.
+        tokens = name.strip().removeprefix("!").split()
+        name = tokens[0].removeprefix("_") if tokens else name
+        args = tokens[1:]
+        alias_target = _ALIASES.get(name.lower().strip())
+        if alias_target:
+            expanded = alias_target.removeprefix("!").split()
+            name = expanded[0].removeprefix("_") if expanded else alias_target
+            args = expanded[1:] + args
+        self.headless = any(arg.lower() == "--headless" for arg in args)
+        args = [arg for arg in args if arg.lower() != "--headless"]
+        cd = resolve(name)
+        if cd is None:
+            self.ctx.echo(f"Unknown command: {name}")
+            self._notify()
+            return False
+        self.active = cd
+        self.picked_points = []
+        self._last_point_at_start = self.ctx.last_point
+        if cd.repeatable:
+            # A command that is never repeated does not disturb the repeat
+            # target either: after delete, Enter still repeats whatever you
+            # were doing before it.
+            self.last_command = cd.name
+        self.ctx.echo(f"> {cd.name}")
+        # before the checkpoint: the journal separates a command's own
+        # checkpoint from an idle edit's by whether a command has begun
+        if self.journal is not None:
+            self.journal.begin_command(cd.name, self.ctx)
+        if cd.mutates:
+            self._start_revision = self.ctx.scene.revision
+            # what there was before, so what the command made can be told
+            # from it when it is done (see _finish)
+            self._ids_before = set(self.ctx.scene.objects)
+            self.ctx.history.checkpoint(cd.name)
+        self.gen = cd.fn(self.ctx)
+        self.ctx.paper_points = False
+        self.ctx.result_ids = []
+        self.ctx.result_subobjects = []
+        self._select_buffer = []
+        self.command_options = {}
+        self.ctx.options = self.command_options
+        self._journal_priming = True
+        self._advance(None)
+        for arg in args:
+            if not self.busy:
+                break
+            self.provide_text(arg)
+        return True
+
+    def _advance(self, value, journal: bool = True):
+        if self.form is not None:
+            # A form's fields are answered here rather than by the command,
+            # which asked for all of them at once. Each one is journalled
+            # as the answer it is, so a replay walks the same prompts.
+            if self._answer_field(value):
+                return
+            value = dict(self._form_values)
+            self._end_form()
+        elif (journal and self.journal is not None
+                and not self._journal_priming):
+            self.journal.value(value, self.ctx)
+        try:
+            self.request = self.gen.send(value)
+        except StopIteration:
+            self._finish(success=True)
+            return
+        except CancelCommand:
+            self._finish(success=False)
+            return
+        except geometry.GeometryError as exc:
+            self.ctx.echo(f"Error: {exc}")
+            self._finish(success=False)
+            return
+        except Exception as exc:                          # noqa: BLE001
+            self.ctx.echo(f"Command failed: {type(exc).__name__}: {exc}")
+            self._finish(success=False)
+            return
+        if isinstance(self.request, FormReq):
+            self._start_form(self.request)
+        # cleared before _prepare_request: a consumed preselection advances
+        # again from inside it, and that one IS an answer worth recording
+        self._journal_priming = False
+        self._prepare_request()
+        self._notify()
+
+    # -- forms -----------------------------------------------------------
+
+    def _start_form(self, form: FormReq):
+        """Ask a form's first field. A window may answer the lot at once."""
+        self.form = form
+        self._form_values = {}
+        self._form_index = 0
+        if not self._ask_next_field():
+            values = dict(self._form_values)
+            self._end_form()
+            self._advance(values, journal=False)
+
+    def _applies(self, field) -> bool:
+        return field.when is None or bool(field.when(self._form_values))
+
+    def _ask_next_field(self) -> bool:
+        """Put the next field that applies up as the request.
+
+        False when there is none left, which is the whole form answered:
+        a field that does not apply keeps its default and is skipped.
+        Preparing the request is the caller's, since the one that starts a
+        form is on its way to doing that anyway.
+        """
+        while self._form_index < len(self.form.fields):
+            field = self.form.fields[self._form_index]
+            if self._applies(field):
+                self.request = field.req
+                return True
+            self._form_values[field.name] = getattr(field.req, "default", None)
+            self._form_index += 1
+        return False
+
+    def _answer_field(self, value) -> bool:
+        """Keep one field's answer. True while more are still to ask."""
+        field = self.form.fields[self._form_index]
+        if self.journal is not None and not self._journal_priming:
+            self.journal.value(value, self.ctx)
+        self._form_values[field.name] = value
+        self._form_index += 1
+        if not self._ask_next_field():
+            return False
+        self._prepare_request()
+        self._notify()
+        return True
+
+    def _end_form(self):
+        self.form = None
+        self._form_values = {}
+        self._form_index = 0
+
+    def provide_form(self, values: dict):
+        """Answer every field of the running form at once, as a popup does.
+
+        Fields the caller left out keep the answers already given, or the
+        field's own default, so a dialog may send back only what it shows.
+        """
+        form = self.form
+        if form is None or not self.busy:
+            return
+        answers = {}
+        for field in form.fields:
+            if field.name in values:
+                answers[field.name] = values[field.name]
+            elif field.name in self._form_values:
+                answers[field.name] = self._form_values[field.name]
+            else:
+                answers[field.name] = getattr(field.req, "default", None)
+        # Journalled as the prompts would have been, skipped fields left
+        # out, so a replay of this answers the same questions in the same
+        # order whether it was typed or clicked.
+        if self.journal is not None and not self._journal_priming:
+            seen = {}
+            for field in form.fields:
+                if field.when is not None and not field.when(seen):
+                    continue
+                seen[field.name] = answers[field.name]
+                self.journal.value(answers[field.name], self.ctx)
+        self._end_form()
+        self._advance(answers, journal=False)
+
+    def _prepare_request(self):
+        req = self.request
+        if (isinstance(req, PointReq) and self.active is not None
+                and self.active.space == "model"
+                and self.ctx.on_bare_paper()):
+            # Bare paper is not somewhere a model coordinate exists, and
+            # answering with millimetres put the geometry in the model at the
+            # paper's numbers. Cancel first, so that the reason is the last
+            # thing said rather than buried under "cancelled".
+            # Two lines, because only the newest line or two is on screen and
+            # each half has to stand on its own: what went wrong, then what to
+            # do about it.
+            label = self.active.label
+            self.cancel()
+            self.ctx.echo(f"{label} needs a point in the model, "
+                          "and bare paper is not the model.")
+            self.ctx.echo("Double-click a detail to work inside it, or "
+                          "annotate the sheet with text, dim, leader or hatch.")
+            return
+        if isinstance(req, SelectReq):
+            self._select_buffer = []
+            self.ctx.pick_points = {}
+            if (req.allow_preselected and self.ctx.selection.ids):
+                held = self.ctx.selection.objects()
+                pre = [o.id for o in held
+                       if not req.kinds or o.kind in req.kinds]
+                # A selection the filter throws out has to be spoken for:
+                # the alternative is a command parked on a prompt while the
+                # highlight still says "these", and every click from then
+                # on reads as a dead viewport.
+                if not pre:
+                    self.ctx.echo(
+                        f"None of the {len(held)} selected object(s) can "
+                        f"be used here — needs: {_kinds_phrase(req.kinds)}.")
+                    return
+                if len(pre) < len(held):
+                    self.ctx.echo(
+                        f"Skipped {len(held) - len(pre)} selected "
+                        f"object(s) — needs: {_kinds_phrase(req.kinds)}.")
+                if req.max_count and len(pre) > req.max_count:
+                    self.ctx.echo(f"Using the first {req.max_count} of "
+                                  f"{len(pre)} selected.")
+                    pre = pre[:req.max_count]
+                if len(pre) >= req.min_count:
+                    # consume pre-selection immediately
+                    if req.keep:
+                        self.ctx.selection.set(pre)
+                    else:
+                        self.ctx.selection.clear()
+                    self._advance(
+                        [self.ctx.scene.objects[i] for i in pre])
+                    return
+                # too few to consume: carry the usable part into the
+                # pending pick, so adding to it completes the answer
+                # rather than starting the count again from nothing
+                self._select_buffer = pre
+                self.ctx.selection.set(pre)
+
+    def _finish(self, success: bool):
+        if self.journal is not None:
+            self.journal.finish(success)
+        self.picked_points = []
+        was = self.active
+        self.gen = None
+        self.request = None
+        self.active = None
+        self._end_form()
+        made = [i for i in self.ctx.result_ids if i in self.ctx.scene.objects]
+        held = [e for e in self.ctx.result_subobjects
+                if e[0] in self.ctx.scene.objects]
+        self.ctx.result_ids = []
+        self.ctx.result_subobjects = []
+        if was and was.mutates and success:
+            # command is over: release the selection (Rhino-style);
+            # 'sellast' / 'selprev' habits bring it back. Unless it said what
+            # it made, in which case that is what you are holding — see
+            # CommandContext.select_result.
+            if made:
+                self.ctx.selection.set(made)
+            else:
+                self.ctx.selection.clear()
+            # Control points are the exception again, and the other way about:
+            # a command that worked on them hands them back, because the next
+            # thing you do to a corner is nearly always move it again.
+            if held:
+                self.ctx.selection.set_subobjects(held)
+            # What it drew is what SelPrev brings back: a line, a polyline,
+            # an offset, released like everything else but not lost track
+            # of. A command that made nothing leaves SelPrev the objects it
+            # worked on, as before.
+            before = getattr(self, "_ids_before", None)
+            if before is not None:
+                drawn = [i for i in self.ctx.scene.objects if i not in before]
+                if drawn:
+                    self.ctx.selection.previous_ids = drawn
+        self._ids_before = None
+        if was and was.mutates and not success:
+            # nothing changed -> no undo entry; partial work stays undoable
+            if self.ctx.scene.revision == self._start_revision:
+                self.ctx.history.discard_checkpoint()
+        if not success and was:
+            self.ctx.echo(f"{was.label} cancelled.")
+        self._notify()
+
+    def cancel(self):
+        if self.gen is not None and self.journal is not None:
+            self.journal.cancelled()
+        if self.gen is not None:
+            gen = self.gen
+            self.gen = None
+            try:
+                gen.close()
+            except Exception:                              # noqa: BLE001
+                pass
+            self.gen = None
+            self._finish(success=False)
+
+    # -- input feeding --
+    def provide(self, value):
+        """Feed a resolved value (from click or programmatic caller)."""
+        if not self.busy or self.request is None:
+            return
+        if isinstance(self.request, PointReq):
+            # Enter answers with None and an option answers with its name;
+            # neither is somewhere you can snap to
+            if value is not None and not isinstance(value, str):
+                self.ctx.last_point = value
+                try:
+                    self.picked_points.append(
+                        tuple(float(c) for c in value)[:3])
+                except (TypeError, ValueError):
+                    pass
+            elif value == UNDO_POINT and self.request.steps_back:
+                # or an @ typed next would measure from the point just
+                # taken back, and it would still be offered as a snap
+                if self.picked_points:
+                    self.picked_points.pop()
+                self.ctx.last_point = (self.picked_points[-1]
+                                       if self.picked_points
+                                       else self._last_point_at_start)
+        self._advance(value)
+
+    def undo_point(self) -> bool:
+        """Take back the last point of a run, for Ctrl+Z.
+
+        True if the prompt is one that steps back, even with nothing left
+        to take back: the key is pressed repeatedly, and one press too many
+        must not fall through to undoing the drawing behind the command.
+        """
+        req = self.request
+        if not isinstance(req, PointReq) or not req.steps_back:
+            return False
+        if UNDO_POINT in req.extra_options:
+            self.provide(UNDO_POINT)
+        else:
+            self.ctx.echo("No point to undo.")
+        return True
+
+    def set_option(self, name: str, value: str | None = None):
+        """Set (or cycle) a persistent option of the running command."""
+        req = self.request
+        if req is None or not getattr(req, "choices", None):
+            return False
+        for opt_name, values in req.choices.items():
+            if opt_name.lower() == name.lower():
+                if value is None and not values:
+                    return False         # nothing to cycle through
+                if value is None:            # cycle
+                    cur = self.command_options.get(opt_name, values[0])
+                    idx = (values.index(cur) + 1) % len(values) \
+                        if cur in values else 0
+                    value = values[idx]
+                elif (getattr(req, "number_option", "") == opt_name
+                        and _is_length(value, self.ctx.scene.units)):
+                    # The prompt's own number: a radius is whatever was
+                    # typed, not one of a few listed answers. What the
+                    # option lists is only what it opens on.
+                    value = value.strip()
+                else:
+                    matches = [v for v in values
+                               if v.lower().startswith(value.lower())]
+                    if not matches:
+                        return False
+                    value = matches[0]
+                self.command_options[opt_name] = value
+                changed = getattr(req, "option_changed", None)
+                if changed is not None:
+                    changed()
+                if self.journal is not None:
+                    self.journal.option(opt_name, value)
+                self.ctx.echo(f"{opt_name}={value}")
+                self._notify()
+                return True
+        return False
+
+    def _number_option(self, text: str) -> bool:
+        """A number typed at a prompt that has one is that option's value.
+
+        "5" at "Select first curve (Radius=0)" is a radius of five, and
+        the prompt stands until a curve is picked: the option is what the
+        number was for, and an object is never called 5.
+        """
+        req = self.request
+        name = getattr(req, "number_option", "")
+        if not name:
+            return False
+        if not _is_length(text, self.ctx.scene.units):
+            return False
+        return self.set_option(name, text.strip())
+
+    def _try_option_text(self, text: str) -> bool:
+        req = self.request
+        if req is None or not getattr(req, "choices", None):
+            return False
+        # Only option identifiers accept the Rhino _ marker. If this is
+        # not an option, provide_text still parses the original argument.
+        text = text.strip().removeprefix("_")
+        if not text:
+            return False
+        if "=" in text:
+            name, _, value = text.partition("=")
+            return self.set_option(name.strip(), value.strip())
+        matches = [name for name in req.choices
+                   if name.lower().startswith(text.lower())]
+        exact = next((name for name in matches
+                      if name.lower() == text.lower()), None)
+        if exact is not None:
+            return self.set_option(exact)
+        # Construction keywords already accept abbreviations. Let their
+        # existing parser answer the prompt when a chip shares that prefix.
+        if any(word.lower().startswith(text.lower())
+               for word in getattr(req, "extra_options", ())):
+            return False
+        if len(matches) == 1:
+            return self.set_option(matches[0])
+        return False
+
+    def option(self, name: str, default: str) -> str:
+        return self.command_options.get(name, default)
+
+    def preview_shape(self, text: str):
+        """Ghost shape for text being typed at the current request, or None."""
+        req = self.request
+        if req is None or getattr(req, "preview_fn", None) is None:
+            return None
+        ok, value = parse_value(req, text, self.ctx)
+        return self.preview_for(value) if ok else None
+
+    def preview_for(self, value):
+        """Ghost shape for a candidate value (e.g. the mouse point)."""
+        req = self.request
+        fn = getattr(req, "preview_fn", None) if req else None
+        if fn is None or value is None:
+            return None
+        try:
+            return fn(value)
+        except Exception:                                  # noqa: BLE001
+            return None
+
+    def provide_text(self, text: str):
+        """Feed typed text for the current request."""
+        if not self.busy or self.request is None:
+            return
+        # A leading ! can launch a shortcut from a pending command prompt;
+        # names, paths and other literal text answers keep the character.
+        if text.lstrip().startswith("!") and not isinstance(self.request, TextReq):
+            self.run(text)
+            return
+        if text.strip() and self._number_option(text):
+            return
+        if text.strip() and self._try_option_text(text):
+            return
+        req = self.request
+        if isinstance(req, SelectReq):
+            self._select_text(text)
+            return
+        ok, result = parse_value(req, text, self.ctx)
+        if not ok:
+            self.ctx.echo(result)
+            self._notify()
+            return
+        self.provide(result)
+
+    # -- selection request handling --
+    def _matching(self, obj, req: SelectReq) -> bool:
+        if not self.ctx.scene.is_selectable(obj.id):
+            return False
+        if req.kinds and obj.kind not in req.kinds:
+            return False
+        return req.accept is None or bool(req.accept(obj))
+
+    def click_object(self, obj_id: str, at=None):
+        """Pick an object for the current selection prompt. `at` is where
+        on it the click landed, when the pick came from a viewport."""
+        req = self.request
+        if not isinstance(req, SelectReq):
+            return
+        obj = self.ctx.scene.get(obj_id)
+        if obj is None or not self._matching(obj, req):
+            self.ctx.echo("Object type not accepted here.")
+            return
+        if at is not None:
+            self.ctx.pick_points[obj_id] = tuple(float(v) for v in at)
+        if obj_id in self._select_buffer:
+            self._select_buffer.remove(obj_id)
+        else:
+            self._select_buffer.append(obj_id)
+        self.ctx.selection.set(self._select_buffer)
+        if req.max_count and len(self._select_buffer) >= req.max_count:
+            self.finish_selection()
+        else:
+            self._notify()
+
+    def _select_text(self, text: str):
+        req = self.request
+        text = text.strip()
+        if not text:
+            self.finish_selection()
+            return
+        keyword = next((w for w in req.extra_options
+                        if w.lower().startswith(text.lower())), None)
+        if keyword is not None:
+            self._select_buffer = []
+            self.ctx.selection.clear()
+            self._advance(keyword)
+            return
+        if text.lower() == "all":
+            matches = [o.id for o in self.ctx.scene.visible_objects()
+                       if self._matching(o, req)]
+            if not matches:
+                # 'all' of nothing used to empty the buffer and fall into
+                # the Enter-on-nothing cancel — the command vanished with
+                # no word on why. Explain and keep asking instead.
+                self.ctx.echo("Nothing eligible to select — needs: "
+                              f"{_kinds_phrase(req.kinds)}.")
+                self._notify()
+                return
+            self._select_buffer = matches
+            self.ctx.selection.set(self._select_buffer)
+            self.finish_selection()
+            return
+        obj = self.ctx.scene.find_by_name(text)
+        if obj and self._matching(obj, req):
+            if obj.id not in self._select_buffer:
+                self._select_buffer.append(obj.id)
+            self.ctx.selection.set(self._select_buffer)
+            if req.max_count and len(self._select_buffer) >= req.max_count:
+                self.finish_selection()
+            else:
+                self._notify()
+        else:
+            self.ctx.echo(f"No selectable object named '{text}'.")
+
+    def box_objects(self, obj_ids: list[str]):
+        """Add box-selected objects to an active selection request."""
+        req = self.request
+        if not isinstance(req, SelectReq):
+            return
+        eligible = False
+        for obj_id in obj_ids:
+            obj = self.ctx.scene.get(obj_id)
+            if obj is None or not self._matching(obj, req):
+                continue
+            eligible = True
+            if obj_id not in self._select_buffer:
+                self._select_buffer.append(obj_id)
+                if req.max_count and len(self._select_buffer) >= req.max_count:
+                    break
+        if obj_ids and not eligible:
+            # a sweep that catches only wrong-kind objects looks exactly
+            # like a sweep that caught nothing — same words as a click
+            self.ctx.echo("Object type not accepted here.")
+        self.ctx.selection.set(self._select_buffer)
+        if req.max_count and len(self._select_buffer) >= req.max_count:
+            self.finish_selection()
+        else:
+            self._notify()
+
+    def finish_selection(self):
+        req = self.request
+        if not isinstance(req, SelectReq):
+            return
+        if not self._select_buffer and req.min_count > 0:
+            self.cancel()                    # Enter on nothing: never mind
+            return
+        if len(self._select_buffer) < req.min_count:
+            if req.too_few_ends:
+                self.ctx.echo(
+                    f"Needs at least {req.min_count} objects, so nothing "
+                    "was done.")
+                self.cancel()
+                return
+            self.ctx.echo(
+                f"Select at least {req.min_count} object(s) — "
+                f"{len(self._select_buffer)} selected.")
+            self._notify()
+            return
+        objs = [self.ctx.scene.objects[i] for i in self._select_buffer]
+        # sub-objects picked while the request waited (control points go
+        # around the request, straight into the selection) are part of
+        # the answer: the command reads them after the yield returns
+        held = list(self.ctx.selection.subobjects)
+        self.ctx.selection.clear()
+        if req.keep:
+            self.ctx.selection.set(list(self._select_buffer))
+        if held:
+            self.ctx.selection.set_subobjects(held)
+        self._advance(objs)
+
+    # -- prompt for UI --
+    def keyword_chips(self) -> list[str]:
+        """One-shot words the current prompt accepts, for clickable chips.
+
+        Where option chips carry a value and cycle, these answer the prompt
+        outright: Close on a polyline, Center on an arc. Clicking one is
+        the same as typing it.
+        """
+        req = self.request
+        if isinstance(req, OptionReq):
+            # a question's answers, the way Rhino puts them on its command
+            # line to click; a long list (every block, every layout) is one
+            # to type from, not a row of buttons
+            return (list(req.options)
+                    if len(req.options) <= MAX_ANSWER_CHIPS else [])
+        return list(getattr(req, "extra_options", ()) or ())
+
+    def keyword_default(self):
+        """The keyword chip Enter would give, to mark as the default."""
+        req = self.request
+        if isinstance(req, OptionReq) and req.default in self.keyword_chips():
+            return req.default
+        return None
+
+    def option_chips(self) -> list:
+        """[(name, current_value)] for the active request's options."""
+        req = self.request
+        if req is None or not getattr(req, "choices", None):
+            return []
+        return [(n, self.command_options.get(n, v[0] if v else ""))
+                for n, v in req.choices.items()]
+
+    def prompt_text(self) -> str:
+        if self.request is None:
+            return "Command"
+        base = format_prompt(self.request, self.ctx)
+        if isinstance(self.request, SelectReq):
+            n = len(self._select_buffer)
+            if n:
+                base += f"  [{n} selected — Enter to accept]"
+        return base

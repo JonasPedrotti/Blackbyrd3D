@@ -1,0 +1,4126 @@
+"""Blackbyrd3D main application."""
+
+from __future__ import annotations
+
+import contextlib
+import os
+import signal
+import sys
+
+import numpy as np
+from PySide6.QtCore import (
+    QEvent, QObject, QPoint, QProcess, Qt, QTimer, Signal,
+)
+from PySide6.QtGui import QAction, QIcon, QKeySequence
+from PySide6.QtWidgets import (
+    QApplication, QDialog, QDockWidget, QFileDialog, QInputDialog, QMainWindow,
+    QLineEdit, QMenu, QMessageBox, QPlainTextEdit,
+    QStackedWidget, QStatusBar, QTabBar, QTextEdit, QToolBar, QVBoxLayout,
+    QWidget,
+)
+
+from . import commands as cmd_pkg
+from . import fileio
+from .commands.base import (
+    CommandContext, CommandProcessor, FileReq, OptionReq, PointReq, SelectReq,
+    TextReq, resolve,
+)
+from .core.history import History
+from .core.layout import sheet_label
+from .core.scene import Scene
+from .core.selection import SelectionManager
+from .ui import dock_release, theme
+from .ui.command_line import CommandLine
+from .ui.dialogs import untether
+from .ui.display_panel import DisplaySettingsDialog
+from .ui.layers_panel import LayersPanel
+from .ui.properties import PropertiesPanel, SubjectTitleBar
+from .ui.dock_title import TabbedTitleBar
+from .ui.sheets_panel import SheetsPanel
+from .ui.view_strip import ViewStrip, strip_over
+from .ui.icons import panel_icon
+from .ui.viewport import Viewport, set_default_gl_format
+
+_UNLIMITED = 16777215        # Qt's QWIDGETSIZE_MAX: "no maximum"
+_LISTS_GAP = 40              # px between a layer's properties and Layers
+
+PANEL_WIDTH = 280            # what a fresh window gives Properties/Layers
+PANEL_SHARE = 0.3            # ... and the most a restored one may hold
+_SETTLE_MS = 200             # how long a window resize keeps rearranging
+# what a button may run in the middle of another command's pick
+_TRANSPARENT = ("ortho", "gridsnap", "undoview", "redoview", "zoomextents",
+                "zoomselected")
+
+
+def clamp_panel_width(width, window_width):
+    """The right-hand column's width, restored within reason.
+
+    A panel dragged wide in a maximised window is saved at that width and
+    comes back into a window that is not maximised, where the same number
+    is half the screen. The width someone chose is still honoured; it just
+    may not outgrow a share of the window it is being restored into, and
+    never shrinks below what a fresh window would have given it.
+    """
+    if not width:
+        return width
+    floor = min(PANEL_WIDTH, window_width // 2)
+    return min(width, max(int(window_width * PANEL_SHARE), floor))
+
+
+APP_TITLE = "Blackbyrd3D"
+
+
+
+class MainWindow(QMainWindow):
+    # emitted from the background update-check thread; handled on the main
+    # thread so the notice is shown Qt-safely
+    updateAvailable = Signal(object)
+
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle(APP_TITLE)
+        from .ui.title_bar import FramelessFrame, TitleBar
+        self._title_bar = TitleBar(
+            self, lambda: self._file_new(), lambda: self.recent_files(),
+            lambda path: self._open_recent(path),
+            lambda: not self.scene.all() and not self.ctx.current_path)
+        self._frame = FramelessFrame(self, self._title_bar)
+        self.resize(1440, 900)
+        self.setAcceptDrops(True)
+        self._importing_file = False
+        self._pending_import_paths = []
+
+        # core state
+        self._pending_update = None
+        self.updateAvailable.connect(self._on_update_available)
+        from .utils.config import Config
+        self.cfg = Config()
+        self.scene = Scene()
+        from .utils.units import UNITS
+        default_units = self.cfg.get("default_units", default="mm")
+        if default_units in UNITS:
+            self.scene.units = default_units
+        self.selection = SelectionManager(self.scene)
+        self.history = History(self.scene)
+
+        # widgets
+        self.viewport = Viewport(self.scene, self.selection, config=self.cfg)
+        self.space_tabs = _SpaceTabs()
+        self.space_tabs.setExpanding(False)
+        self.space_tabs.setDrawBase(False)
+        self.space_tabs.setStyleSheet(
+            "QTabBar { background: transparent; }"
+            "QTabBar::tab { padding: 4px 14px; background: #2b2c30;"
+            " border: 1px solid #1b1c1f; border-bottom: none; }"
+            "QTabBar::tab:selected { background: #4a3f28; color: #f0d9a8; }")
+        self._tabs_updating = False
+        self.space_tabs.currentChanged.connect(self._space_tab_changed)
+        self.space_tabs.setContextMenuPolicy(
+            Qt.ContextMenuPolicy.CustomContextMenu)
+        self.space_tabs.customContextMenuRequested.connect(
+            self._space_tab_menu)
+        # None until _balance_docks has run: a resize before then has no
+        # settled panel width to hold, and holding one would fight it.
+        self._panel_width = None
+        self._settling = False
+        self._settled_width = None
+        self.aux_viewports: list = []           # Top/Front/Right in quad mode
+        self.aux_docks: list = []               # their dock wrappers
+        self.dock_viewports: list = []          # user-created dockable panes
+        self._active_vp = self.viewport
+        # Which pane is filling the window, and the dock layout to put back
+        # when it stops. The layout is held as saveState bytes rather than a
+        # list of sizes because splitters the user dragged are part of it.
+        self._maximized_vp = None
+        self._maximized_state = None
+        # Every viewport lives in a dock, so any of them — the main one
+        # included — can be dragged out to float or re-docked. They dock
+        # into a window of their own, filling this one's middle, rather
+        # than into this one: an arrangement of panes is then a thing that
+        # can be saved and put back by itself, which is what a space tab
+        # hands over, and Properties and Layers stay out of it. Qt's state
+        # is one blob per window, so panes and panels sharing a window
+        # would mean every tab carrying its own opinion of where the
+        # panels go, and moving one would move it back on the next switch.
+        self.viewport_area = QMainWindow()
+        self.viewport_area.setDockNestingEnabled(True)
+        self.viewport_area.setWindowFlags(Qt.WindowType.Widget)
+        self.setDockNestingEnabled(True)
+        self._central_stub = QWidget()
+        self._central_stub.setFixedSize(0, 0)
+        self.viewport_area.setCentralWidget(self._central_stub)
+        self._central_stub.hide()   # visible, it still reserves layout space
+        self.setCentralWidget(self.viewport_area)
+        # The arrangement of panes each space tab last had, as saveState
+        # bytes: splitters the user dragged are part of an arrangement, and
+        # nothing shorter than the blob remembers those.
+        self.space = "model"
+        self._space_states: dict = {}
+        self._primary_dock = self._dock_viewport(
+            self.viewport, "Perspective", closable=False)
+        self.viewport_area.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea,
+                                         self._primary_dock)
+
+        from .ui.osnap_bar import OsnapBar
+        from .ui.command_workspace import CommandWorkspace
+        self.command_line = CommandLine()
+        self.osnap_bar = OsnapBar(self.viewport, self.cfg)
+        self.command_workspace = CommandWorkspace(
+            self, self.command_line, self.osnap_bar)
+        # The space tabs float over the bottom-left corner of the drawing
+        # rather than taking a strip of their own.
+        self._space_tab_row = self._build_space_tab_row()
+        self._space_tab_row.setParent(self.viewport_area)
+        from .ui.command_workspace import LastMessage, StatusLine
+        self._status_line = StatusLine()
+        self.osnap_bar.set_trailing(self._status_line)
+        self.last_message = LastMessage(self.command_line,
+                                        self.command_workspace.show_history)
+        self.statusBar().addPermanentWidget(self.last_message, 1)
+        # The window's foot rather than a dock: it spans the full width with
+        # no resize grip above it, and takes the height its panes ask for.
+        bar = self._cmd_bar = _FootBar(self)
+        bar.setObjectName("commandBar")
+        bar.setSizeGripEnabled(False)
+        bar.setStyleSheet("QStatusBar { border: none; padding: 0px;"
+                          " background: #202226; }"
+                          " QStatusBar::item { border: none; }")
+        bar.addPermanentWidget(self.command_workspace, 1)
+        self.setStatusBar(bar)
+
+        # however the drawing is saved, its panes go with it
+        self.scene.before_save = self.store_view_settings
+        self.properties = PropertiesPanel(
+            self.scene, self.selection, self.history,
+            # a sheet's selection belongs to whichever pane is showing it
+            viewport_source=lambda: self.active_viewport,
+            # the model panes a clipping plane lists among its views
+            panes_source=self._clip_pane_choices,
+            viewports_source=self._model_panes)
+        self.properties.modelTextChanged.connect(
+            self._model_text_changed_from_properties)
+        self.properties.textTypographyChanged.connect(
+            self._text_typography_changed_from_properties)
+        self.properties.lookAtTextRequested.connect(self._look_at_text)
+        self.properties.hatchPatternsRequested.connect(
+            self._run_hatch_patterns)
+        self.properties.viewCommandRequested.connect(self.run_command)
+        self._prop_dock = QDockWidget("Properties", self)
+        self._prop_dock.setObjectName("propertiesDock")
+        dock_release.watch(self._prop_dock)
+        self._prop_dock.setWidget(self.properties)
+        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea,
+                           self._prop_dock)
+
+        self.layers_panel = LayersPanel(self.scene, self.history,
+                                        selection=self.selection)
+        # Layers and Sheets share the dock under Properties, a tab each in
+        # its title (#38): the set is a list of its own, not the bottom strip.
+        self.sheets_panel = SheetsPanel(self.scene, self.history,
+                                        make_sheet=self._new_sheet,
+                                        delete_sheet=self.delete_layout)
+        self.sheets_panel.openRequested.connect(self.switch_space)
+        self.sheets_panel.printRequested.connect(self.print_sheets)
+        self._lists = QStackedWidget()
+        self._lists.addWidget(self.layers_panel)
+        self._lists.addWidget(self.sheets_panel)
+        self._layer_dock = QDockWidget("Layers", self)
+        self._layer_dock.setObjectName("layersDock")
+        dock_release.watch(self._layer_dock)
+        self._layer_dock.setWidget(self._lists)
+        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea,
+                           self._layer_dock)
+        self._lists_title = TabbedTitleBar(
+            [(panel_icon("layers"), "Layers"),
+             (panel_icon("sheets"), "Sheets")],
+            self._lists, self._layer_dock)
+        self._layer_dock.setTitleBarWidget(self._lists_title)
+        self._lists_title.close_only_when_floating()
+        # Properties shows the layers or sheets picked there too, with a
+        # tab in its title for each subject once two are live.
+        self.properties.follow_layers(self.layers_panel)
+        self.properties.follow_sheets(self.sheets_panel)
+        # The view strip rides on top of the Properties title.
+        self._prop_title = SubjectTitleBar(self.properties, self._prop_dock)
+        self._prop_title.close_only_when_floating()
+        self.view_strip = ViewStrip(self.run_command)
+        self._prop_dock.setTitleBarWidget(
+            strip_over(self.view_strip, self._prop_title))
+
+        # Display controls belong to the viewport title menu. Create their
+        # modeless window only when requested, leaving this column for
+        # Properties and Layers.
+        self._display_settings = None
+        self.wyrm = None
+        self._wyrm_dock = None
+
+        # The panels a field's Enter must stay in, and whose splitter the
+        # user drags: see eventFilter.
+        self._panel_docks = (self._prop_dock, self._layer_dock)
+        for dock in self._panel_docks:
+            dock.installEventFilter(self)
+        self.viewport_area.installEventFilter(self)
+        self._space_tab_row.installEventFilter(self)
+        # proportions are set post-show in _balance_docks (a pre-show
+        # resizeDocks gets redistributed once the layout is realised)
+        QTimer.singleShot(0, self, self._balance_docks)
+        # The chrome first, then the layout. The toolbar takes its width off
+        # the left of the panes and the menu bar its height off the top, so
+        # sizes restored into a window still missing them are laid out for a
+        # window nobody will see — and every pane moves again the moment they
+        # arrive. The toolbar is also in the saved state by name, and
+        # restoreState can only put back a toolbar that already exists.
+        self._build_toolbar()
+        self._build_menus()
+        self._restore_window()              # last session's layout, if any
+
+        # command engine
+        self.ctx = CommandContext(self.scene, self.selection, self.history,
+                                  viewport=self.viewport, window=self)
+        self.ctx.current_path = None
+        self.processor = CommandProcessor(self.ctx)
+        self._cursor_preview = None
+        self._file_picker_open = False
+        self._form_dialog_open = False
+        self._offered_form = None
+        self.ctx.add_echo_listener(self.command_line.echo)
+        self.processor.add_listener(self._sync_command_state)
+        self.processor.add_listener(self._resume_dropped_imports)
+        self.processor.add_listener(self._after_hatch_patterns)
+
+        # wiring
+        self.command_line.submitted.connect(self._on_submit)
+        self.command_line.cancelled.connect(self._cancel)
+        self.command_line.optionClicked.connect(self._on_option_chip)
+        self.command_line.keywordClicked.connect(self._on_keyword_chip)
+        self.command_line.tabPressed.connect(self._toggle_direction_lock)
+        self.command_line.input.textEdited.connect(self._live_preview)
+        self.layers_panel.said.connect(self.command_line.echo)
+        self._wire_viewport(self.viewport)
+        self.scene.add_listener(self._update_status)
+        self.selection.add_listener(self._update_status)
+        self._points_wanted: set[str] = set()
+        # curves picked by a click on them, the only ones that show points
+        self._clicked_curves: set[str] = set()
+        self.selection.add_listener(self._show_selected_points)
+        self.scene.add_listener(self._refresh_space_tabs)
+        self._refresh_space_tabs()
+        # A plane added, paused or switched off in a view starts or stops
+        # it cutting a pane, which the pane's title says.
+        self.scene.add_listener(self._refresh_viewport_titles,
+                                kinds=("objects",))
+
+        self._user_shortcuts: list = []
+        self.apply_user_aliases()
+        self.apply_user_shortcuts()
+
+        # autosave every N seconds (config), crash recovery in main()
+        from .utils.autosave import AutosaveManager, DEFAULT_INTERVAL_SEC
+        autosave_dir = os.environ.get("BYRD3D_AUTOSAVE_DIR")
+        self.autosave = (AutosaveManager(self.scene, autosave_dir)
+                         if autosave_dir else AutosaveManager(self.scene))
+        self._saved_revision = self.scene.revision
+        interval = int(self.cfg.get("autosave_interval_sec",
+                                    default=DEFAULT_INTERVAL_SEC))
+        if interval > 0:
+            self._autosave_timer = QTimer(self)
+            self._autosave_timer.setInterval(interval * 1000)
+            self._autosave_timer.timeout.connect(self._autosave_tick)
+            self._autosave_timer.start()
+
+        # the session journal: every resolved input, written as it happens,
+        # so `byrd3d replay` can re-execute the session (core/journal.py)
+        from .core.journal import SessionJournal, JOURNAL_DIR
+        self.journal = SessionJournal.maybe(
+            os.environ.get("BYRD3D_JOURNAL_DIR") or JOURNAL_DIR)
+        if self.journal is not None:
+            self.journal.attach(self.processor, self.scene, self.history)
+            # idle edits settle on a quiet moment, not on every mouse move
+            self._journal_timer = QTimer(self)
+            self._journal_timer.setSingleShot(True)
+            self._journal_timer.setInterval(800)
+            self._journal_timer.timeout.connect(self.journal.flush)
+            self.scene.add_listener(
+                lambda: self._journal_timer.start(), ("objects",))
+
+        # Holding Ctrl swaps the gumball on held parts for push/pull or
+        # fillet, wherever the keyboard focus is, so its state is watched
+        # rather than waited for in one widget's key events.
+        self._ctrl_was = False
+        self._ctrl_watch = QTimer(self)
+        self._ctrl_watch.setInterval(60)
+        self._ctrl_watch.timeout.connect(self._watch_ctrl)
+        self._ctrl_watch.start()
+
+        from .ui.spacemouse import SpaceMouseNavigator
+        self.spacemouse = SpaceMouseNavigator(self)
+
+        self._update_status()
+        self.command_line.focus()
+        self.command_workspace.restore_settings()
+
+    @staticmethod
+    def _pane_alive(vp) -> bool:
+        """Not explicitly hidden, and its dock (if any) not closed.
+        Unlike isVisible this stays true in headless/never-shown windows."""
+        parent = vp.parentWidget()
+        return not vp.isHidden() and (parent is None
+                                      or not parent.isHidden())
+
+    @property
+    def active_viewport(self):
+        vp = self._active_vp
+        if not self._pane_alive(vp):
+            # Its dock was closed. The primary is the usual answer, but on a
+            # sheet's tab the primary is the pane that got put away, so fall
+            # back to something the user can actually see.
+            alive = self.all_viewports()
+            self._active_vp = (self.viewport if self.viewport in alive
+                               else alive[0] if alive else self.viewport)
+        return self._active_vp
+
+    def _align_in(self, vp, how: str):
+        """An align bar button: line the pick up on that pane's plane."""
+        if self.processor.busy:
+            return
+        self._set_active_viewport(vp)
+        self.run_command(f"align {how}")
+
+    def _set_active_viewport(self, vp):
+        if vp is self._active_vp:
+            return
+        self._active_vp = vp
+        self.ctx.viewport = vp                   # commands act on this pane
+        self.properties.refresh()                # and so does the panel
+
+    def _dock_viewport(self, vp, title: str, closable: bool = True,
+                       name: str | None = None):
+        """Wrap a viewport in a floatable/movable QDockWidget so it can be
+        torn off. Not closable for the primary — there's always one view."""
+        dock = QDockWidget(title, self.viewport_area)
+        dock_release.watch(dock)
+        if name is None:
+            self._dock_seq = getattr(self, "_dock_seq", 0) + 1
+            name = f"viewportDock{self._dock_seq}"
+        # A sheet's pane is named after the sheet, so the arrangement saved
+        # for that tab still finds it in a later session.
+        dock.setObjectName(name)
+        feats = (QDockWidget.DockWidgetFeature.DockWidgetMovable
+                 | QDockWidget.DockWidgetFeature.DockWidgetFloatable)
+        if closable:
+            feats |= QDockWidget.DockWidgetFeature.DockWidgetClosable
+        dock.setFeatures(feats)
+        # The title is the pane's menu: what it is showing, and the way to
+        # change it. A custom title bar takes Qt's own close button with it,
+        # so the bar puts one back when the dock is closable.
+        dock.setTitleBarWidget(_ViewportTitleBar(self, vp, dock, closable))
+        from PySide6.QtWidgets import QSizePolicy
+        vp.setSizePolicy(QSizePolicy.Policy.Expanding,   # claim the leftover
+                         QSizePolicy.Policy.Expanding)   # space, not the panels
+        vp.setMinimumSize(200, 150)   # a hint-less GL widget collapses to 0px
+        dock.setWidget(vp)
+        return dock
+
+    def _balance_docks(self):
+        """Give the primary viewport the bulk of the window and keep the
+        side panels + command strip compact. Runs once after show, when the
+        dock layout is realised — unless last session's layout was restored,
+        in which case the user already chose their widths and re-imposing
+        280 px would undo them every launch (GitHub #5)."""
+        if not getattr(self, "_docks_restored", False):
+            self._set_panel_width(PANEL_WIDTH)
+            # 280 is the width our own font's columns need. A machine
+            # whose sans-serif is wider needs more, and the layers panel
+            # is the one that can say how much: its name column is what
+            # runs out of room, and a cut-short layer name is worse than
+            # a few pixels off the drawing.
+            short = self.layers_panel.width_short_by()
+            if short:
+                self._set_panel_width(PANEL_WIDTH + short)
+        else:
+            saved = self._keep_panel_width()
+            kept = clamp_panel_width(saved, self.width())
+            if kept != saved:
+                self._set_panel_width(kept)
+            else:
+                self._panel_width = saved
+        self._put_lists_under_layer_page()
+        # again once the opening window has its final size
+        self._lists_height_due = True
+        self._repaint_panes()
+
+    def _repaint_panes(self):
+        """Every pane draws itself again, at the size it has just been given.
+
+        A viewport keeps its last frame in a buffer of its own and the window
+        pastes that in wherever the pane now is. Both of the layout passes
+        that matter run off a zero-timer, after the window is already up, so
+        a pane that is moved and not asked to redraw is pasted in torn — the
+        old picture at the new rectangle, spilling over its edges and under
+        the toolbar. Asking costs one frame each, once, at startup.
+        """
+        for vp in self.all_viewports():
+            vp.update()
+
+    # -------------------------------------------------- keeping the panels put
+
+    def _panel_column(self) -> list:
+        """The docks making up the right-hand column, if it is there at all.
+        A floating panel is its own window and says nothing about how much of
+        this one the column should hold."""
+        return [d for d in self._panel_docks
+                if d.isVisibleTo(self) and not d.isFloating()]
+
+    def _keep_panel_width(self):
+        column = self._panel_column()
+        return column[0].width() if column else None
+
+    def _set_panel_width(self, width):
+        """Make the right-hand column this wide, then let go of it again.
+
+        resizeDocks is a request the dock layout may round or ignore: asking
+        for 280 here landed on 237, and asking again after a window resize
+        did nothing at all. A momentary fixed width is not a request — the
+        layout has to honour it, and the column keeps it once released, so
+        the splitter still drags afterwards.
+        """
+        column = self._panel_column()
+        if not column or not width:
+            return
+        for dock in column:
+            dock.setFixedWidth(width)
+        self.layout().activate()
+        for dock in column:
+            dock.setMinimumWidth(0)
+            dock.setMaximumWidth(_UNLIMITED)
+        self._panel_width = width
+
+    def _put_lists_under_layer_page(self):
+        """Move the line between Properties and Layers to a little under
+        where a picked layer's properties end."""
+        page_top = self.properties.mapTo(self, QPoint(0, 0)).y()
+        top = page_top + self.properties.layer_page_height() + _LISTS_GAP
+        bottom = self._layer_dock.geometry().bottom() + 1
+        self._set_lists_height(bottom - top)
+
+    def _set_lists_height(self, height):
+        """Make the Layers and Sheets dock this tall when it sits under
+        Properties in the column, held the same way as the column's width.
+        The dock's minimum and the one Properties needs may win over it."""
+        dock = self._layer_dock
+        if (not height or dock.isFloating() or not dock.isVisibleTo(self)
+                or not self._prop_dock.isVisibleTo(self)
+                or self._prop_dock.isFloating()
+                or self.tabifiedDockWidgets(dock)
+                or self.dockWidgetArea(dock)
+                != self.dockWidgetArea(self._prop_dock)):
+            return
+        props = self._prop_dock
+        spare = props.height() - max(props.minimumHeight(),
+                                     props.minimumSizeHint().height())
+        lowest = dock.minimumHeight()
+        dock.setFixedHeight(max(min(height, dock.height() + spare), lowest))
+        self.layout().activate()
+        dock.setMinimumHeight(lowest)
+        dock.setMaximumHeight(_UNLIMITED)
+
+    def resizeEvent(self, event):
+        """Hand a resized window's new width to the viewports, not the panel.
+
+        Properties and Layers are fixed-content columns — the fields are no
+        better for being 900 px wide — but Qt handed them every pixel a
+        maximise gained, so the drawing came out no bigger at all. By the
+        time this runs the layout has already done that, which is why the
+        width to keep is the one recorded before the resize rather than one
+        read here.
+        """
+        super().resizeEvent(event)
+        QTimer.singleShot(0, self, self._align_composer)
+        self._settling = True
+        if self._panel_width:
+            QTimer.singleShot(0, self, self._hold_panel_width)
+        QTimer.singleShot(_SETTLE_MS, self, self._settled)
+
+    def _align_composer(self):
+        ws = self.command_workspace
+        column = self._panel_column()
+        inset = 0
+        if column and ws.isVisible():
+            ws_right = ws.mapTo(self, QPoint(ws.width(), 0)).x()
+            inset = ws_right - min(d.geometry().left() for d in column)
+        ws.set_right_inset(inset)
+
+    def _settled(self):
+        """The window has stopped moving: the docks are the user's again."""
+        self._settling = False
+        self._settled_width = self.width()
+        self._hold_panel_width()
+        if getattr(self, "_lists_height_due", False):
+            self._lists_height_due = False
+            self._put_lists_under_layer_page()
+
+    def _hold_panel_width(self):
+        if self._panel_width:
+            self._set_panel_width(self._panel_width)
+
+    def eventFilter(self, obj, event):
+        """The things watched from outside the widget they happen in.
+
+        A click in a pane makes it the active one — the pane commands act
+        on, and the pane the panels are showing. There is one filter and
+        not several because a class only keeps the last method of a name,
+        and two `eventFilter`s meant one of these had never run.
+
+        An Enter in a panel field stops at its dock, so the Enter that
+        repeats the last command is only ever the viewport's or the empty
+        command line's.
+
+        The last is the user dragging the panel splitter, so the width
+        held across the next window resize is the one they chose. Only a
+        dock resized with the window at the size it last came to rest at
+        counts. Neither half of that is spare. A maximise lays the docks
+        out half a millisecond *before* the window is told it has resized,
+        so waiting to be told is too late — but the window is already its
+        new size by then, which is what gives it away. The rearranging
+        afterwards takes a couple of hundred milliseconds more, and only
+        the flag covers that.
+        """
+        if isinstance(obj, Viewport):
+            if event.type() in (QEvent.Type.DragEnter, QEvent.Type.DragMove):
+                self.dragEnterEvent(event)
+                return True
+            if event.type() == QEvent.Type.Drop:
+                self._set_active_viewport(obj)
+                self.dropEvent(event)
+                return True
+        if event.type() == QEvent.Type.MouseButtonPress \
+                and isinstance(obj, Viewport):
+            self._set_active_viewport(obj)
+            # Copy asks the history before it asks the drawing, so a
+            # selection left lying in the history would be what Copy meant
+            # for the rest of the session. Going back to a pane ends it.
+            self.command_line.clear_history_selection()
+        # QLineEdit leaves its Return event ignored (command_line.py says
+        # why that matters), so a panel field's Enter would climb to
+        # keyPressEvent and repeat the last command on top of the edit.
+        if (event.type() == QEvent.Type.KeyPress
+                and obj in self._panel_docks
+                and event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter)):
+            event.accept()
+            return True
+        if (event.type() in (QEvent.Type.Resize, QEvent.Type.LayoutRequest,
+                             QEvent.Type.ChildAdded)
+                and obj in (self.viewport_area,
+                            getattr(self, "_space_tab_row", None))):
+            QTimer.singleShot(0, self, self._place_space_tabs)
+        if (obj in self._panel_docks and event.type() in (
+                QEvent.Type.Resize, QEvent.Type.Move,
+                QEvent.Type.Show, QEvent.Type.Hide)):
+            QTimer.singleShot(0, self, self._align_composer)
+        if (event.type() == QEvent.Type.Resize
+                and obj in self._panel_docks
+                and not getattr(self, "_settling", False)
+                and self.width() == self._settled_width
+                and not obj.isFloating() and obj.isVisibleTo(self)):
+            self._panel_width = event.size().width()
+        return super().eventFilter(obj, event)
+
+    def new_viewport_dock(self, area: str = "Right", space: str = "model"):
+        """A fully live extra viewport in a dockable/floatable panel."""
+        vp = Viewport(self.scene, self.selection, self.cfg)
+        vp.cplane = self.viewport.cplane
+        vp.camera.azimuth = self.viewport.camera.azimuth + 0.4
+        vp.camera.elevation = self.viewport.camera.elevation
+        vp.camera.target = self.viewport.camera.target.copy()
+        vp.camera.distance = self.viewport.camera.distance
+        self._wire_viewport(vp)
+        self.dock_viewports.append(vp)
+        dock = self._dock_viewport(vp, "Viewport", closable=True)
+        vp.view_key = dock.objectName()       # its own, to a clipping plane
+        kept = self._apply_kept_settings(vp)
+        areas = {"Right": Qt.DockWidgetArea.RightDockWidgetArea,
+                 "Left": Qt.DockWidgetArea.LeftDockWidgetArea,
+                 "Top": Qt.DockWidgetArea.TopDockWidgetArea,
+                 "Bottom": Qt.DockWidgetArea.BottomDockWidgetArea}
+        self.viewport_area.addDockWidget(
+            areas.get(area, Qt.DockWidgetArea.RightDockWidgetArea), dock)
+        if area == "Floating":
+            dock.setFloating(True)
+            dock.resize(860, 620)
+        if space != "model":
+            vp.set_space(space)
+        self._update_viewport_dock_title(vp)
+        if not kept:
+            vp.zoom_extents()
+        self._set_active_viewport(vp)
+        return vp
+
+    def _clip_pane_choices(self) -> list:
+        """(key, name) of the viewports a clipping plane can cut: the four
+        standard ones always, whichever panes the layout shows, then any
+        other model pane. Each is named by the view it shows now, so a pane
+        turned to Left is ticked as Left."""
+        panes = {vp.view_key: vp for vp in self.all_viewports()
+                 if vp.space == "model"}
+        out = []
+        for key in ("perspective", "top", "front", "right", *panes):
+            if any(k == key for k, _name in out):
+                continue
+            vp = panes.get(key)
+            out.append((key, vp._view_name.capitalize() if vp is not None
+                        else key.capitalize()))
+        return out
+
+    def _model_panes(self) -> list:
+        """Every model pane the window has made, shown or not."""
+        return [vp for vp in [self.viewport, *self.aux_viewports,
+                              *self.dock_viewports] if vp.space == "model"]
+
+    def _apply_kept_settings(self, vp) -> bool:
+        """Give a pane what the drawing kept for it; True when that put
+        its camera somewhere."""
+        settings = self.scene.view_settings
+        pane = settings.panes.get(vp.view_key, {})
+        vp.apply_pane_settings(
+            pane, settings.background if settings.for_all else None)
+        return bool(pane.get("camera"))
+
+    def store_view_settings(self):
+        """Write each model pane into the drawing, for saving it."""
+        settings = self.scene.view_settings
+        for vp in self._model_panes():
+            settings.panes[vp.view_key] = vp.pane_settings()
+
+    def apply_view_settings(self) -> bool:
+        """Every pane as the drawing kept it. True when the primary pane's
+        camera came from the drawing, so nothing needs to frame it."""
+        placed = False
+        for vp in self._model_panes():
+            kept = self._apply_kept_settings(vp)
+            placed = placed or (kept and vp is self.viewport)
+        self.properties.refresh_view_page()
+        return placed
+
+    def show_ai_panel(self):
+        """Reveal the conversation without changing the input destination."""
+        return self.command_workspace.show_assistant()
+
+    def show_wyrm(self):
+        """Wyrm's graph editor, floating beside the model like a viewport
+        torn off. Made on first use, then shown and hidden. The first
+        opening starts on the recent graphs; closed with its X it is only
+        hidden, and comes back as it was left."""
+        opening = self._wyrm_dock is None
+        if self._wyrm_dock is None:
+            from .ui.wyrm import WyrmEditor
+            self.wyrm = WyrmEditor(self)
+            from .ui.icons import wyrm_icon
+            dock = QDockWidget("Wyrm", self)
+            dock.setObjectName("wyrmDock")
+            dock_release.watch(dock)
+            dock.setWindowIcon(wyrm_icon())
+            # Wyrm's menu row is its title: dragged there, it docks and floats
+            dock.setTitleBarWidget(self.wyrm.head)
+            dock.setWidget(self.wyrm)
+            self.wyrm.set_path(self.wyrm.path)    # its file in the title
+            # Where it was last time, docked or floating: made after the
+            # window's layout was put back, it has to ask for its own place.
+            if not self.restoreDockWidget(dock):
+                self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea,
+                                   dock)
+                dock.setFloating(True)
+                dock.resize(1000, 600)
+            # closed, its preview goes with it; tabbed behind a panel, not
+            dock.visibilityChanged.connect(
+                lambda shown: self.wyrm.set_active(not dock.isHidden()))
+            self._wyrm_dock = dock
+        self._wyrm_dock.show()
+        self._wyrm_dock.raise_()
+        if opening:
+            self.wyrm.show_start()
+        return self.wyrm
+
+    def _viewport_title(self, vp) -> str:
+        """What a pane is showing, in the order you would say it: the view,
+        then how it is drawn, then whether a clipping plane cuts it. A
+        layout says which sheet instead of the view, since a sheet has no
+        camera to name.
+
+        A hidden plane still cuts, as in Rhino, with nothing on screen to
+        show it, so a model missing a part says why where you look first,
+        and the title's menu lists the planes."""
+        if vp.space == "model":
+            place = vp._view_name.capitalize()
+        else:
+            lay = next((l for l in self.scene.layouts if l.id == vp.space),
+                       None)
+            place = lay.name if lay else "Layout"
+        title = f"{place} · {vp.display_mode.capitalize()}"
+        return f"{title} · Cut" if vp.is_cut() else title
+
+    def _refresh_viewport_titles(self):
+        """Every pane's title again: a change to the drawing can start or
+        stop a clipping plane cutting one."""
+        for vp in self.all_viewports():
+            self._update_viewport_dock_title(vp)
+
+    def _update_viewport_dock_title(self, vp):
+        dock = vp.parentWidget()
+        if not isinstance(dock, QDockWidget):
+            return
+        # The window title still matters: it is what a floated pane's own
+        # window frame shows, and what tabbed docks label their tabs with.
+        dock.setWindowTitle(self._viewport_title(vp))
+        bar = dock.titleBarWidget()
+        if isinstance(bar, _ViewportTitleBar):
+            bar.refresh()
+
+    def _viewport_menu(self, vp, into=None):
+        """The menu on a viewport's title bar.
+
+        Every entry acts on `vp`, not on the active viewport — a menu you
+        opened on a pane that then changed a different one would be worse
+        than no menu. The checkmarks make it a readout as well: this is the
+        only place that says which of the eight display modes a given pane
+        is in.
+        """
+        menu = QMenu(self) if into is None else into
+
+        def toggle(label, checked, fn):
+            act = menu.addAction(label)
+            # Only the current one is checkable, so the menu shows two ticks
+            # rather than sixteen empty boxes. Qt still reserves the check
+            # column, so the labels stay in line.
+            if checked:
+                act.setCheckable(True)
+                act.setChecked(True)
+            act.triggered.connect(lambda _checked=False: fn())
+            return act
+
+        # On a sheet the views turn a detail, the one you are in or the one
+        # picked, so they tick its view, and with none to turn or one locked
+        # there is nothing for them to do (#131).
+        current, turnable = vp._view_name, True
+        if vp.space != "model":
+            from .core.layout import detail_view_name
+            det = vp.layout_view.view_target()
+            current = (detail_view_name(det) or "").lower() if det else None
+            turnable = det is not None and not det.locked
+        # All eight, in opposing pairs. Back, Left and Bottom have no
+        # function key and are not in the View menu; this is where they live.
+        for label, name in (("Perspective", "perspective"),
+                            ("Isometric", "isometric"),
+                            ("Top", "top"), ("Bottom", "bottom"),
+                            ("Front", "front"), ("Back", "back"),
+                            ("Right", "right"), ("Left", "left")):
+            toggle(label, current == name,
+                   lambda n=name: vp.go_to_view(n)).setEnabled(turnable)
+        menu.addSeparator()
+        for mode in vp.DISPLAY_MODES:
+            toggle(mode.capitalize(), vp.display_mode == mode,
+                   lambda m=mode: vp.set_display_mode(m))
+        self._action(menu, "Display settings…", None,
+                     lambda: self._show_display_settings(vp))
+        self._clip_planes_menu(vp, menu)
+        if self.scene.layouts:
+            # A space tab swaps the whole arrangement, but a space is still
+            # a property of one pane underneath, and this is where you say
+            # so: a sheet in this pane and the model in the next one, which
+            # is the arrangement Rhino has no way to make. Nothing to
+            # choose between until there is a sheet, so nothing is offered.
+            menu.addSeparator()
+            toggle("Model", vp.space == "model",
+                   lambda: self.set_pane_space(vp, "model"))
+            for lay in self.scene.layouts:
+                toggle(lay.name, vp.space == lay.id,
+                       lambda i=lay.id: self.set_pane_space(vp, i))
+        menu.addSeparator()
+        self._action(menu, "Maximize Viewport", None,
+                     lambda: self.toggle_maximized_viewport(vp))
+        self._action(menu, "Four Viewports", None,
+                     lambda: self.run_command("4view"))
+        return menu
+
+    def _clip_planes_menu(self, vp, menu):
+        """Which clipping planes cut this pane, each one a tick to switch
+        it off or on here and nowhere else (core/clipping.py). Inside a
+        detail it is the detail that is cut; on bare paper, or with no
+        planes to list, there is nothing to offer.
+
+        A hidden plane cuts too, so it is listed, said to be hidden, and
+        Show Hidden Planes brings every one of them back in sight."""
+        from .core import clipping
+        view = vp.clip_view()
+        planes = clipping.planes_of(self.scene)
+        if view is None or not planes:
+            return
+        # Made with its parent rather than by addMenu(title), whose menu
+        # PySide6 deletes with the Python name for it, here at the return.
+        sub = QMenu("Clipping Planes", menu)
+        menu.addMenu(sub)
+        for obj in planes:
+            act = sub.addAction(clipping.label(self.scene, obj))
+            act.setCheckable(True)
+            act.setChecked(clipping.chosen(obj.clip_plane, view))
+            act.triggered.connect(
+                lambda on, i=obj.id: self.set_clip_view(i, view, on))
+        hidden = [o.id for o in planes if clipping.hidden(self.scene, o)]
+        if hidden:
+            sub.addSeparator()
+            act = sub.addAction("Show Hidden Planes")
+            act.triggered.connect(
+                lambda _on=False, ids=tuple(hidden):
+                self.show_clipping_planes(ids))
+
+    def show_clipping_planes(self, plane_ids) -> int:
+        """Bring hidden clipping planes back in sight, as one undo step:
+        each plane, and its layer and the layers above that. Returns how
+        many came back."""
+        from .core import clipping
+        scene = self.scene
+        planes = [scene.get(i) for i in plane_ids]
+        planes = [o for o in planes
+                  if o is not None and clipping.hidden(scene, o)]
+        if not planes:
+            return 0
+        self.history.checkpoint("show clipping planes")
+        layers = scene.layers
+        with scene.batched():
+            for obj in planes:
+                if not obj.visible:
+                    scene.update(obj.id, visible=True)
+                for layer in [layers.get(obj.layer_id),
+                              *layers.ancestors(obj.layer_id)]:
+                    if not layer.visible:
+                        layers.set_visible(layer.id, True)
+            scene.notify()
+        return len(planes)
+
+    def set_clip_view(self, plane_id: str, view: str, on: bool) -> bool:
+        """Switch one clipping plane on or off in one view, as one undo
+        step. Returns whether anything changed."""
+        from .core import clipping
+        return clipping.switch(
+            self.scene, plane_id, view, on,
+            before=lambda: self.history.checkpoint("clipping plane views"))
+
+    def _show_display_settings(self, vp):
+        """Open one set of controls for the pane whose menu was used."""
+        dialog = self._display_settings
+        if dialog is not None and dialog.viewport is not vp:
+            dialog.close()
+            dialog = None
+        if dialog is None:
+            dialog = DisplaySettingsDialog(vp, self)
+            self._display_settings = dialog
+
+            def forget(_result):
+                if self._display_settings is dialog:
+                    self._display_settings = None
+
+            dialog.finished.connect(forget)
+        dialog.panel.refresh()
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+
+    def _wire_viewport(self, vp):
+        # Object snaps belong to the drawing, including while a command moves
+        # between panes. The index caches world geometry; each query supplies
+        # its own camera and pending picks, so every pane can share it.
+        vp.snaps = self.viewport.snaps
+        vp.setAcceptDrops(True)
+        vp.installEventFilter(self)
+        vp.displayModeChanged.connect(self._update_status)
+        # a selected clipping plane lists the panes by the view they show
+        vp.viewChanged.connect(
+            lambda _name: self.properties.refresh_clip_views())
+        vp.layoutSelectionChanged.connect(self._update_status)
+        vp.layoutSelectionChanged.connect(self.properties.refresh)
+        vp.cameraMoved.connect(
+            lambda pane=vp: pane is self._active_vp
+            and self.properties.camera_moved())
+        vp.history = self.history
+        vp.objectClicked.connect(
+            lambda obj_id, mods, pane=vp: self._on_object_clicked(
+                obj_id, mods, pane))
+        vp.emptyClicked.connect(self._on_empty_clicked)
+        vp.boxSelected.connect(self._on_box_selected)
+        vp.alignRequested.connect(
+            lambda how, pane=vp: self._align_in(pane, how))
+        vp.pointPicked.connect(self._on_point_picked)
+        vp.detailEntered.connect(self._on_detail_entered)
+        vp.textEditRequested.connect(
+            lambda obj_id, pane=vp: self._edit_model_text_in_viewport(
+                pane, obj_id))
+        vp.paperTextEditRequested.connect(
+            lambda note_id, pane=vp: self._edit_paper_text_in_viewport(
+                pane, note_id))
+        vp.mouseWorldMoved.connect(self._on_mouse_world)
+        vp.cvEditBegan.connect(
+            lambda: self.history.checkpoint("edit control point"))
+        vp.escapePressed.connect(self._cancel)
+        vp.tabPressed.connect(self._toggle_direction_lock)
+        vp.enterShortcut.connect(self._rmb_enter)
+        vp.popupRequested.connect(self._show_mmb_popup)
+        vp.chordActivated.connect(self.run_command)
+
+    def _show_palette(self):
+        from .ui.palette import CommandPalette
+        CommandPalette.popup(self, self.command_line.run_command)
+
+    def _show_mmb_popup(self):
+        from PySide6.QtGui import QCursor
+        self._mmb_menu().exec(QCursor.pos())
+
+    def _mmb_menu(self) -> QMenu:
+        """Middle-click popup: Join and Explode side by side, then up to
+        twelve recent commands and the staples (Rhino-style)."""
+        from PySide6.QtWidgets import QHBoxLayout, QToolButton, QWidgetAction
+        from .ui.icons import command_icon
+        menu = QMenu(self)
+
+        def run(name):
+            menu.close()
+            self.command_line.run_command(name)
+
+        row = QWidget(menu)
+        row.setObjectName("popupButtons")
+        layout = QHBoxLayout(row)
+        layout.setContentsMargins(4, 4, 4, 4)
+        layout.setSpacing(4)
+        for label, name in (("Join", "join"), ("Explode", "explode")):
+            button = QToolButton(row)
+            button.setObjectName(f"popup_{name}")
+            button.setText(label)
+            button.setIcon(command_icon(name))
+            button.setToolButtonStyle(
+                Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+            button.setProperty("framed", True)
+            button.clicked.connect(lambda _=False, n=name: run(n))
+            layout.addWidget(button)
+        layout.addStretch(1)
+        pair = QWidgetAction(menu)
+        pair.setDefaultWidget(row)
+        menu.addAction(pair)
+        menu.addSeparator()
+        recent = self.command_line.recent_commands()
+        for name in recent:
+            menu.addAction(name, lambda n=name: run(n))
+        if recent:
+            menu.addSeparator()
+        for name in ("line", "circle", "extrude", "move", "zoomextents"):
+            if name not in recent:
+                menu.addAction(name, lambda n=name: run(n))
+        menu.addSeparator()
+        menu.addAction("Command palette…", self._show_palette)
+        return menu
+
+    def flash_objects(self, ids):
+        """Light what a command just made, in every pane that shows it."""
+        for vp in self.all_viewports():
+            vp.flash(ids)
+
+    def all_viewports(self) -> list:
+        """Every pane you can see. The primary is asked the same question
+        as the rest of them: on a sheet's tab it is the one put away."""
+        alive = ([v for v in [self.viewport] if self._pane_alive(v)]
+                 + [v for v in self.aux_viewports if self._pane_alive(v)]
+                 + [v for v in self.dock_viewports if self._pane_alive(v)])
+        return alive or [self.viewport]
+
+    def set_view_layout(self, mode: str):
+        """'single' or 'quad' (Top / Front / Right alongside Perspective).
+
+        Every viewport is a dock you can close, float or drag onto another
+        into a tab stack, so asking for a layout has to be able to undo all
+        three. It lays the 2x2 out from scratch every time rather than only
+        the first time: a pane you shut with the x on its title bar came
+        back no other way, and the arrangement is saved between sessions, so
+        a window left in a state you did not want came back into it on every
+        launch.
+        """
+        # Asking for a layout outright settles the question a maximise was
+        # holding open. Keeping the old one would make the next Ctrl+M put
+        # back a layout from before this call.
+        self._maximized_vp = self._maximized_state = None
+        fresh = []
+        if mode == "quad" and not self.aux_docks:
+            for title, view in (("Top", "top"), ("Front", "front"),
+                                ("Right", "right")):
+                aux = Viewport(self.scene, self.selection, self.cfg)
+                # the view names its own drawing plane; handing it the
+                # primary's world XY back is what left Front and Right
+                # looking straight down the plane they had to pick on
+                aux.set_view(view)                 # named orthographic view
+                # and the pane a clipping plane knows it by, whatever it
+                # is turned to later (core/clipping.py)
+                aux.view_key = view
+                aux.camera.target = self.viewport.camera.target.copy()
+                aux.camera.distance = self.viewport.camera.distance
+                self._wire_viewport(aux)
+                if self._apply_kept_settings(aux):
+                    fresh.append(aux)
+                self.aux_viewports.append(aux)
+                self.aux_docks.append(self._dock_viewport(aux, title))
+        if mode == "quad":
+            top, front, right = self.aux_docks
+            for dock in (self._primary_dock, top, front, right):
+                # only where it is needed: re-docking or re-showing a pane
+                # that is already in place resets the sizes around it
+                if dock.isFloating():
+                    dock.setFloating(False)   # back into the window it left
+                if not dock.isVisibleTo(self.viewport_area):
+                    dock.show()
+            # Splitting is what takes a pane out of a tab stack, so these run
+            # whether or not the panes were built just now.
+            va = self.viewport_area
+            va.splitDockWidget(self._primary_dock, top,
+                               Qt.Orientation.Horizontal)     # persp | top
+            va.splitDockWidget(self._primary_dock, front,
+                               Qt.Orientation.Vertical)       # persp / front
+            va.splitDockWidget(top, right,
+                               Qt.Orientation.Vertical)       # top   / right
+            for aux in self.aux_viewports:
+                aux.show()
+                if aux not in fresh:
+                    aux.zoom_extents()
+            # split builds the 2x2 structure but leaves lopsided sizes;
+            # even them out once the layout is realised
+            QTimer.singleShot(0, self, self._equalize_quad)
+        else:
+            for dock in self.aux_docks:
+                dock.hide()
+            # the one pane a single view is has to be one you can see
+            if self._primary_dock.isFloating():
+                self._primary_dock.setFloating(False)
+            if not self._primary_dock.isVisibleTo(self.viewport_area):
+                self._primary_dock.show()
+        self.viewport.update()
+
+    @property
+    def maximized_viewport(self):
+        """The pane filling the window on its own, or None."""
+        return self._maximized_vp
+
+    def _viewport_docks(self) -> list:
+        """Every dock holding a viewport, hidden ones included.
+
+        Not built from `all_viewports`, which drops hidden panes — the whole
+        job here is to find the panes that were put away so they can be
+        brought back.
+        """
+        docks = [self._primary_dock] + list(self.aux_docks)
+        for vp in self.dock_viewports:
+            dock = vp.parentWidget()
+            if isinstance(dock, QDockWidget) and dock not in docks:
+                docks.append(dock)
+        return docks
+
+    def _restore_panels(self, state) -> bool:
+        """Put the window's own docks back, leaving the panes where they are.
+
+        A layout saved before the panes had an area of their own names them
+        as the window's docks, and Qt 6.12 looks for a saved dock among every
+        widget inside a window, not just its own. Restoring that layout moved
+        the panes into the window's left dock area, leaving their own area
+        empty in the middle to soak up whatever width was spare: a gap
+        between panes and panels that maximising made wide. Qt knows a dock
+        by its name, so the panes go without theirs for the moment it looks.
+        """
+        panes = self._viewport_docks()
+        names = [dock.objectName() for dock in panes]
+        for dock in panes:
+            dock.setObjectName("")
+        try:
+            return self.restoreState(state)
+        finally:
+            for dock, name in zip(panes, names):
+                dock.setObjectName(name)
+
+    def show_perspective_alone(self):
+        """How a new document opens: Perspective maximised, with Top, Front
+        and Right behind it, so a double-click on its title or Ctrl+M brings
+        the four panes back."""
+        if self.space != "model":
+            return
+        self.set_view_layout("quad")
+        self.toggle_maximized_viewport(self.viewport)
+
+    def toggle_maximized_viewport(self, vp=None) -> bool:
+        """Give one pane the whole window, or hand the layout back.
+
+        `vp` is the pane a title bar or menu is speaking for; the keyboard
+        and the command have no such pane in mind and mean the active one.
+        Returns whether a pane ended up maximised.
+        """
+        if self._maximized_vp is not None:
+            state, self._maximized_state = self._maximized_state, None
+            self._maximized_vp = None
+            if state is not None:
+                self.viewport_area.restoreState(state)
+            return False
+
+        vp = vp if vp is not None else self.active_viewport
+        dock = vp.parentWidget()
+        if not isinstance(dock, QDockWidget):
+            return False
+        others = [d for d in self._viewport_docks()
+                  if d is not dock and not d.isHidden()]
+        if not others:
+            # Already the only pane on show, as when the window opens the
+            # way it was left: there is nothing to maximise, so the toggle
+            # goes the other way and brings the four panes back. Taking the
+            # state anyway would leave a maximise that the next press
+            # "restores" into the layout that is on screen already.
+            self.set_view_layout("quad")
+            return False
+
+        self._maximized_state = self.viewport_area.saveState()
+        self._maximized_vp = vp
+        for other in others:
+            other.hide()
+        self._set_active_viewport(vp)
+        return True
+
+    def _equalize_quad(self):
+        """Make the quad an even 2x2 — equal columns and equal rows."""
+        if len(self.aux_docks) != 3:
+            return
+        top, front, right = self.aux_docks
+        h = Qt.Orientation.Horizontal
+        v = Qt.Orientation.Vertical
+        va = self.viewport_area
+        va.resizeDocks([self._primary_dock, top], [1000, 1000], h)  # columns
+        va.resizeDocks([front, right], [1000, 1000], h)
+        va.resizeDocks([self._primary_dock, front], [1000, 1000], v)  # rows
+        va.resizeDocks([top, right], [1000, 1000], v)
+        # Asking four panes for 1000 px each in a smaller window squeezes
+        # the side panel down to its minimum on the way past, so put it back.
+        self._set_panel_width(self._panel_width)
+        self._repaint_panes()
+
+    # ------------------------------------------------------------ UI assembly
+
+    def _build_toolbar(self):
+        from .ui.tool_palette import wyrm_button, tool_strip
+        bar = QToolBar("Tools")
+        bar.setObjectName("toolPalette")
+        bar.setOrientation(Qt.Orientation.Vertical)
+        bar.setMovable(False)
+        groups = [
+            [("Move", "move", ("Copy", "copy")), ("Rotate", "rotate", ("Rotate 3D", "rotate3d")),
+             ("Scale", "scale"), ("Mirror", "mirror"),
+             ("Orient: from 2 points", "orient",
+              ("from 3 points", "orient3pt")),
+             ("Set points", "setpt")],
+            [("Point", "point", ("Multiple points", "points")),
+             ("Line", "line"), ("Polyline", "polyline"),
+             ("Curve", "curve", ("Curve through points", "interpcrv")),
+             ("Circle: center, radius", "circle",
+              ("through 3 points", "circle 3point")),
+             ("Ellipse from center", "ellipse",
+              ("from a diameter", "ellipse diameter")),
+             ("Arc: center, start, end", "arc",
+              ("ends first, point on arc", "arc endsfirst")),
+             ("Rectangle", "rectangle",
+              ("from 3 points", "rectangle 3point"))],
+            [("Trim", "trim"), ("Split", "split", ("Split with points", "splitpoints")),
+             ("Offset", "offset"),
+             ("Fillet", "fillet")],
+            [("Plane, corner to corner", "plane"),
+             ("Plane from 3 points", "plane3pt"),
+             ("Surface from 3 or 4 corners", "srfpt")],
+            [("Extrude", "extrude"), ("Revolve", "revolve"),
+             ("Loft", "loft"),
+             ("Sweep along 1 rail", "sweep1", ("along 2 rails", "sweep2"))],
+            [("Box", "box"), ("Sphere", "sphere"), ("Cylinder", "cylinder")],
+            [("Boolean union", "booleanunion",
+              ("Union and merge coplanar faces", "booleanunionmerge")),
+             ("Boolean difference", "booleandifference",
+              ("Boolean difference, deleting the input",
+               "booleandifference DeleteInput=Yes")),
+             ("Boolean intersection", "booleanintersection"),
+             ("Boolean split", "booleansplit")],
+            [("Join", "join"), ("Explode", "explode")],
+        ]
+        # One widget rather than thirty-two actions: a toolbar hides the
+        # actions it has no room for behind a chevron, where the palette
+        # sizes the tools to the height it has and keeps them all in sight.
+        bar.addWidget(tool_strip(groups, self.run_command, bar))
+        # below the strip, which takes all the height it is given, so Wyrm
+        # sits at the very bottom however tall the window is
+        bar.addWidget(wyrm_button(lambda: self.run_command("wyrm"), bar))
+        self.addToolBar(Qt.ToolBarArea.LeftToolBarArea, bar)
+        self._tools_toolbar = bar
+
+    def menuBar(self):
+        return self._title_bar.menu_bar
+
+    def nativeEvent(self, event_type, message):
+        result = self._frame.native_event(event_type, message)
+        if result is not None:
+            return True, result
+        return super().nativeEvent(event_type, message)
+
+    def _build_menus(self):
+        mb = self.menuBar()
+        self._shortcut_actions = {}
+
+        m_file = mb.addMenu("&File")
+        self._action(m_file, "New", "Ctrl+N", lambda: self._file_new())
+        self._action(m_file, "Open...", "Ctrl+O", self._file_open)
+        self._recent_menu = m_file.addMenu("Open Recent")
+        self._rebuild_recent_menu()
+        m_file.addSeparator()
+        self._action(m_file, "Save", "Ctrl+S", self._file_save)
+        self._action(m_file, "Save As...", "Ctrl+Shift+S",
+                     lambda: self._file_save(force_dialog=True))
+        m_file.addSeparator()
+        self._action(m_file, "Import...", None, self._file_import)
+        self._action(m_file, "Export...", None, self._file_export)
+        m_file.addSeparator()
+        self._action(m_file, "Quit", "Ctrl+Q", self.close)
+
+        m_edit = mb.addMenu("&Edit")
+        self._action(m_edit, "Undo", "Ctrl+Z", lambda: self.run_command("undo"))
+        self._action(m_edit, "Redo", "Ctrl+Y", lambda: self.run_command("redo"))
+        m_edit.addSeparator()
+        self._action(m_edit, "Copy", "Ctrl+C", self._copy_selected)
+        self._action(m_edit, "Paste", "Ctrl+V", self._paste)
+        m_edit.addSeparator()
+        self._action(m_edit, "Delete", None, self._delete_selected,
+                     binding="delete")
+        self._action(m_edit, "Select All", "Ctrl+A",
+                     lambda: self.run_command("selall"))
+        self._action(m_edit, "Select None", None,
+                     lambda: self.run_command("selnone"))
+        self._action(m_edit, "Invert Selection", None,
+                     lambda: self.run_command("invert"))
+        m_edit.addSeparator()
+        for label, command in (
+                ("Group", "group"), ("Ungroup", "ungroup"),
+                ("Hide", "hide"), ("Show all", "show"),
+                ("Lock", "lock"), ("Unlock all", "unlockall"),
+                ("Trim", "trim"), ("Join", "join")):
+            self._action(m_edit, label, None,
+                         lambda c=command: self.run_command(c), binding=command)
+        m_edit.addSeparator()
+        self._action(m_edit, "Control Points On", "F10",
+                     lambda: self.run_command("pointson"))
+        self._action(m_edit, "Control Points Off", "F11",
+                     lambda: self.run_command("pointsoff"))
+
+        m_view = mb.addMenu("&View")
+        self._action(m_view, "Top", "F1", lambda: self.run_command("top"))
+        self._action(m_view, "Front", "F2", lambda: self.run_command("front"))
+        self._action(m_view, "Right", "F3", lambda: self.run_command("right"))
+        self._action(m_view, "Perspective", "F4",
+                     lambda: self.run_command("perspective"))
+        self._action(m_view, "Isometric", "F5",
+                     lambda: self.run_command("isometric"))
+        m_view.addSeparator()
+        self._action(m_view, "Zoom Extents", "Ctrl+E",
+                     lambda: self.run_command("zoomextents"))
+        for label, command in (("Zoom Window", "zoomwindow"),
+                               ("Undo View", "undoview"),
+                               ("Redo View", "redoview")):
+            self._action(m_view, label, None,
+                         lambda c=command: self.run_command(c), binding=command)
+        m_view.addSeparator()
+        self._action(m_view, "Wireframe", None,
+                     lambda: self.run_command("wireframe"))
+        self._action(m_view, "Shaded", None,
+                     lambda: self.run_command("shaded"))
+        self._action(m_view, "Ghosted", None,
+                     lambda: self.run_command("ghosted"))
+        self._action(m_view, "Rendered", None,
+                     lambda: self.run_command("rendered"))
+        self._action(m_view, "Plaster", None,
+                     lambda: self.run_command("plaster"))
+        self._action(m_view, "Plaster Color", None,
+                     lambda: self.run_command("plastercolor"))
+        self._action(m_view, "Technical", None,
+                     lambda: self.run_command("technical"))
+        m_view.addSeparator()
+        self._action(m_view, "AI Assistant", "Ctrl+Shift+A",
+                     self.show_ai_panel)
+        self._action(m_view, "Wyrm", None,
+                     lambda: self.run_command("wyrm"))
+        tools_toolbar_action = self._tools_toolbar.toggleViewAction()
+        tools_toolbar_action.setText("Tools Toolbar")
+        m_view.addAction(tools_toolbar_action)
+        m_view.addSeparator()
+        # Four Viewports was two levels down and went unfound (GitHub #5
+        # asked for a layout that had shipped), so it sits in View itself.
+        # What stays in the submenu is the rarer business of adding panes.
+        self._action(m_view, "Maximize Viewport", "Ctrl+M",
+                     self.toggle_maximized_viewport)
+        self._action(m_view, "Four Viewports", None,
+                     lambda: self.run_command("4view"))
+        self._action(m_view, "Single Viewport", None,
+                     lambda: self.run_command("1view"))
+        m_ports = m_view.addMenu("More Viewports")
+        self._action(m_ports, "New Viewport...", None,
+                     lambda: self.run_command("newviewport"))
+        self._action(m_ports, "Floating Viewport", None,
+                     lambda: self.run_command("floatviewport"))
+        m_view.addSeparator()
+        self._action(m_view, "Toggle Grid", "F7",
+                     lambda: self.run_command("grid"))
+
+        m_draft = mb.addMenu("&Drafting")
+        self._action(m_draft, "New Layout...", None,
+                     lambda: self.run_command("layout"))
+        self._action(m_draft, "Place Detail View...", None,
+                     lambda: self.run_command("detail"))
+        self._action(m_draft, "Text...", None,
+                     lambda: self.run_command("text"))
+        self._action(m_draft, "Linear Dimension...", None,
+                     lambda: self.run_command("dim"))
+        m_draft.addSeparator()
+        self._action(m_draft, "Make2D", None,
+                     lambda: self.run_command("make2d"))
+        self._action(m_draft, "Technical Display", None,
+                     lambda: self.run_command("technical"))
+        m_draft.addSeparator()
+        self._action(m_draft, "Export PDF...", "Ctrl+P",
+                     lambda: self.run_command("exportpdf"))
+        m_draft.addSeparator()
+        self._action(m_draft, "Toggle Ortho", None,
+                     lambda: self.run_command("ortho"), binding="ortho")
+        self._action(m_draft, "Toggle Grid Snap", None,
+                     lambda: self.run_command("gridsnap"), binding="gridsnap")
+
+        m_tools = mb.addMenu("&Tools")
+        self._action(m_tools, "Command Palette...", "Ctrl+Shift+P",
+                     self._show_palette)
+        self._action(m_tools, "Script Editor", "Ctrl+`",
+                     self._toggle_console)
+        self._action(m_tools, "Settings...", "Ctrl+,", self._show_settings)
+
+        self._plugins_menu = mb.addMenu("&Plugins")
+        self._action(self._plugins_menu, "Plugin folder...", None,
+                     self._open_plugin_dir)
+        self._plugins_menu.addSeparator()
+
+        m_help = mb.addMenu("&Help")
+        self._action(m_help, "Commands", None, self._show_commands)
+        self._action(m_help, "Command Reference", None, self.show_help_browser)
+        self._action(m_help, "Check for Updates…", None,
+                     self._check_updates_manual)
+        self._action(m_help, "Open .byrd and .wyrm Files with Blackbyrd3D",
+                     None, self._make_default_app)
+        if sys.platform.startswith("linux") and os.environ.get("APPIMAGE"):
+            self._action(m_help, "Remove Blackbyrd3D from the App Menu",
+                         None, self._remove_from_desktop)
+        self._action(m_help, "About", None, self._about)
+        # Keep the Python menu wrappers alongside the action registry.
+        self._menus = (m_file, m_edit, m_view, m_ports, m_draft, m_tools,
+                       self._plugins_menu, m_help)
+        self._menu_actions = tuple(menu.menuAction() for menu in self._menus)
+
+    def plugin_menu_action(self, label: str, fn):
+        self._action(self._plugins_menu, label, None, fn)
+
+    def _open_plugin_dir(self):
+        from PySide6.QtCore import QUrl
+        from PySide6.QtGui import QDesktopServices
+        from .plugins import plugin_dir
+        d = plugin_dir()
+        os.makedirs(d, exist_ok=True)
+        QDesktopServices.openUrl(QUrl.fromLocalFile(d))  # portable
+
+    def _action(self, menu, label, shortcut, fn, *, binding=None):
+        from .utils.config import DEFAULT_SHORTCUTS
+        act = QAction(label, self)
+        if binding is None and shortcut:
+            binding = DEFAULT_SHORTCUTS[shortcut]
+        if binding is not None:
+            self._shortcut_actions[binding] = act
+        act.triggered.connect(lambda checked=False: fn())
+        menu.addAction(act)
+        return act
+
+    # ------------------------------------------------------------- commanding
+
+    def run_command(self, name: str):
+        # These controls have no input requests and can change during a
+        # pick. Running them through the processor would cancel that pick
+        # and replace its repeat target with the toggle.
+        control = resolve(name)
+        if (self.processor.busy and control is not None
+                and control.name in _TRANSPARENT):
+            for _ in control.fn(self.ctx):
+                pass
+            self.osnap_bar.refresh()
+            self._refresh_rubber(None)
+            self._repaint_panes()
+            self.command_line.focus()
+            return
+        self._pending_import_paths.clear()
+        self.processor.run(name)
+        self.command_line.focus()
+
+    def _on_submit(self, text: str):
+        text = text.strip()
+        if self.processor.busy:
+            self.processor.provide_text(text)
+            return
+        if not text:
+            if self.processor.last_command:
+                self.processor.run(self.processor.last_command)
+            return
+        self.processor.run(text)
+
+    def _cancel(self):
+        self._pending_import_paths.clear()
+        if self.processor.busy:
+            self.processor.cancel()
+        elif self.scene.cv_enabled - self.scene.cv_auto:
+            # Points shown only because their curve is picked go with the
+            # selection below, in one Escape.
+            # Escape gives up one thing at a time, most recent first, and
+            # points on is the state you got into last. The object stays
+            # selected: you asked to stop editing points, not to lose what
+            # you were editing, so F10 brings back what was on screen.
+            self.processor.run("pointsoff")
+        elif self.properties.subjects() == ["objects", "layers"] \
+                and self.properties.shown() == "layers":
+            # A look at a layer is the newer thing, the selection under it
+            # the older: let go of the layer and the objects come back
+            # into full gold. The next Escape clears them.
+            self.layers_panel.clear_picked()
+        elif self.properties.subjects() == ["objects", "sheets"] \
+                and self.properties.shown() == "sheets":
+            self.sheets_panel.clear_picked()       # the same, for a sheet
+        else:
+            self.selection.clear()
+        for vp in self.all_viewports():
+            vp.set_point_mode(False)
+        self.command_line.set_prompt("Command")
+
+    def show_help_browser(self):
+        from .ui.help_browser import HelpBrowser
+        if getattr(self, "_help_browser", None) is None:
+            self._help_browser = HelpBrowser(self)
+        self._help_browser.show()
+        self._help_browser.raise_()
+
+    def _rmb_enter(self):
+        """Right-click acts as Enter (Rhino-style): if a command is typed at
+        the prompt it runs that; mid-command it commits the typed value; on an
+        empty prompt it repeats the last command.
+
+        Every click, including the first one after a command ends. That one
+        used to be swallowed on the grounds that it was the habitual click
+        that finishes a command rather than a request for anything — but the
+        click that finishes a command is taken by the command, and the one
+        after it is a gesture somebody made on an idle prompt, where it has
+        exactly one meaning.
+        """
+        # Route through the command line so a typed name/value is submitted
+        # exactly as Enter would (history, clear, then run/provide/repeat).
+        self.command_line.submit_input()
+
+    def _on_option_chip(self, name: str):
+        self.processor.set_option(name)
+        self._live_preview(self.command_line.input.text(), use_cursor=True)
+        self.command_line.focus()
+
+    def _on_keyword_chip(self, word: str):
+        """A keyword chip answers the prompt outright, as typing it would."""
+        self.processor.provide_text(word)
+        self.command_line.focus()
+
+    def _toggle_direction_lock(self):
+        """Tab while a point is wanted: freeze the direction, type a length.
+
+        Only the viewport the cursor is in has a direction to freeze, so
+        the lock belongs to that one rather than to all of them.
+        """
+        vp = self.active_viewport
+        if vp.toggle_direction_lock():
+            self.command_line.echo("Direction locked (Tab to release)")
+        else:
+            self.command_line.echo("Direction released")
+        vp.update()
+
+    def _standing_ghost(self):
+        """The ghost a question shows before anything is typed, or None.
+
+        A point's ghost follows the mouse and a number's what is typed; a
+        question asked after the picking is done, like mirror's "Keep
+        original?", has neither, and with no ghost the result it is waiting
+        to make looks like nothing happened at all.
+        """
+        req = self.processor.request
+        if isinstance(req, OptionReq) and req.preview_fn is not None:
+            return self.processor.preview_for(req.default)
+        return None
+
+    def _live_preview(self, text: str, *, use_cursor=False):
+        req = self.processor.request
+        # Typing supersedes the cursor, even when the text is invalid or
+        # cleared. An option chip alone can reuse the current mouse point.
+        if not use_cursor:
+            self._cursor_preview = None
+        if req is not None and getattr(req, "preview_fn", None) and \
+                text.strip():
+            shape = self.processor.preview_shape(text)
+        elif (use_cursor and self._cursor_preview is not None
+              and self._cursor_preview[0] is req):
+            if getattr(req, "draft_fn", None):
+                self._show_draft(req, self._cursor_preview[1])
+                return
+            shape = self.processor.preview_for(self._cursor_preview[1])
+        else:
+            shape = self._standing_ghost()
+        # every pane. A ghost is a shape in the world, not a picture belonging
+        # to one view, and the pane you are drawing in is whichever one the
+        # cursor is over — so put it on the primary alone and the shape a
+        # typed number would make appears in Perspective while you work in Top.
+        for vp in self.all_viewports():
+            vp.set_ghost(shape)
+
+    def _sync_command_state(self):
+        busy = self.processor.busy
+        req = self.processor.request
+        if (self._cursor_preview is not None
+                and self._cursor_preview[0] is not req):
+            self._cursor_preview = None
+        if req is not getattr(self, "_lock_request", None):
+            # A held direction is for the point it was taken for. A command
+            # that never moves its base (points) would keep it otherwise,
+            # and every point after an elevator would be stuck on its axis.
+            self._lock_request = req
+            for vp in self.all_viewports():
+                vp.dir_lock = None
+                vp._lock_owner = None
+        model_text = self._placing_model_text()
+        self.properties.set_model_text_command_active(model_text)
+        if model_text and isinstance(req, PointReq):
+            req.prompt = "Text position (baseline anchor)"
+        self.command_line.set_prompt(self.processor.prompt_text())
+        self.command_line.set_options(self.processor.option_chips())
+        self.command_line.set_keywords(self.processor.keyword_chips(),
+                                       self.processor.keyword_default())
+        # every pane, because a ghost is set on every pane: clearing one of
+        # them leaves a preview on the others that no command owns any more
+        ghost = self._standing_ghost()
+        for vp in self.all_viewports():
+            vp.set_ghost(ghost)
+        # Let a new request show its first pointer preview immediately.
+        self._ghost_timer = None
+        self._ghost_cost_ms = 0.0
+        self.command_line.point_pending = isinstance(req, PointReq)
+        # Space submits like Enter everywhere but a free-text prompt
+        self.command_line.text_pending = isinstance(req, TextReq)
+        # Only guess at command names at the "Command" prompt; mid-command the
+        # words belong to the command, not to the registry.
+        self.command_line.awaiting_command = not busy
+        if isinstance(req, PointReq):
+            base = req.rubber_from
+            if base is None and req.rubber_pts:
+                base = req.rubber_pts[-1]
+            pending = list(req.rubber_pts or [])
+            picked = list(self.processor.picked_points)
+            if req.newest_snaps and picked:
+                picked.append(picked[-1])   # the snaps leave out the last one
+            # On a sheet the same pixel is both paper millimetres and a model
+            # point seen through a detail; which one it is depends on what the
+            # command asked for, so the registry's answer travels with it.
+            active = self.processor.active
+            space = active.space if active is not None else "model"
+            if self.ctx.paper_points:
+                space = "paper"
+            for vp in self.all_viewports():
+                vp.set_point_mode(True)
+                vp.snap_base = base
+                vp.point_axis = req.axis_lock
+                vp.point_plane = req.pick_plane
+                # a prompt that drags out sides is a frame, which ortho
+                # squares rather than flattening onto an axis
+                vp.point_frame = req.rubber_sides is not None
+                vp.pending_points = pending
+                vp.picked_points = picked
+                vp.snap_on = req.snap_on
+                vp.point_space = space
+            self._refresh_rubber(None)
+        else:
+            for vp in self.all_viewports():
+                vp.set_point_mode(False)
+                vp.snap_base = None
+                vp.point_axis = None
+                vp.point_plane = None
+                vp.point_frame = False
+                vp.pending_points = []
+                vp.picked_points = []
+                vp.snap_on = None
+                vp.point_space = "model"
+                vp.set_preview(None)
+        self.osnap_bar.refresh()
+        self._update_status()
+        self._offer_file_picker(req)
+        self._offer_text_editor(req)
+        self._offer_form(req)
+
+    def model_text_frame(self, anchor):
+        """Model lettering lies on the active CPlane, through its anchor."""
+        from .core.cplane import CPlane
+
+        current = self.active_viewport.active_cplane()
+        return CPlane(anchor, normal=current.normal, xdir=current.xdir,
+                      name=current.name).basis_matrix()
+
+    def _placing_model_text(self) -> bool:
+        """Whether `text` is running and writes in the model, not on paper."""
+        active = self.processor.active
+        return (active is not None and active.name == "text"
+                and getattr(self.processor.ctx.viewport, "space",
+                            "model") == "model")
+
+    def _look_at_text(self):
+        """Face the selected label without editing the model. Undo View
+        (Home) goes back to the view before, as after any other."""
+        from .core.text import TextShape
+        obj = self.properties._selected()
+        if obj is None or not isinstance(obj.shape, TextShape):
+            return
+        pane = self.active_viewport
+        origin = np.asarray(obj.shape.origin, float)
+        normal = np.asarray(obj.shape.plane_normal, float)
+        pane.camera.target = origin.copy()
+        pane.camera.elevation = float(np.arcsin(np.clip(normal[2], -1., 1.)))
+        if abs(normal[2]) > 0.999:
+            # Looking straight down (or up) the camera takes its up from
+            # its azimuth, which the normal leaves open: turn it so the
+            # lettering's own up is up on screen, and it reads level.
+            up = obj.shape.frame[:3, 1] * np.sign(normal[2])
+            pane.camera.azimuth = float(np.arctan2(-up[1], -up[0]))
+        else:
+            pane.camera.azimuth = float(np.arctan2(normal[1], normal[0]))
+        pane.update()
+
+    def _offer_text_editor(self, req):
+        from .commands.base import TextEditorReq
+        if (not isinstance(req, TextEditorReq) or self.processor.headless
+                or getattr(self, "_text_editor_open", False)
+                or self.processor.request is not req):
+            return
+        from .ui.text_editor import default_typography
+        values = default_typography(req.values)
+        # Properties edits arrive through MainWindow while this closure owns
+        # the creation values. Keep both names on the same mapping so later
+        # content edits and the final command answer retain live typography.
+        req.values = values
+        pane = self.active_viewport
+        paper = req.paper_layout
+        self._text_editor_open = True
+
+        def changed(text):
+            values["text"] = text
+            if not text.strip():
+                return
+            if paper is not None:
+                note = next((item for item in paper.notes
+                             if item.id == req.target_id), None)
+                if note is None:
+                    from .core.layout import TextNote
+                    note = TextNote(x=req.anchor[0], y=req.anchor[1],
+                                    **values)
+                    paper.notes.append(note)
+                    req.target_id = note.id
+                    pane._inline_text_id = note.id
+                    pane.layout_view.selected = [("note", note)]
+                    self.properties.begin_live_text(note.id)
+                    pane.layoutSelectionChanged.emit()
+                else:
+                    for name, value in values.items():
+                        setattr(note, name, value)
+                    note.style = ""
+                self.scene.notify("layouts")
+                return
+            if req.shape_fn is None:
+                return
+            shape = req.shape_fn(values)
+            if req.target_id is None:
+                obj = self.scene.add(shape, name="Text")
+                req.target_id = obj.id
+                pane._inline_text_id = obj.id
+                self.properties.begin_live_text(obj.id)
+                self.selection.set([obj.id])
+            else:
+                self.scene.replace_shape(req.target_id, shape)
+
+        def finished():
+            pane.end_inline_text()
+            self._text_editor_open = False
+            if req.target_id is not None:
+                self.properties.end_live_text(req.target_id)
+            if self.processor.request is not req:
+                return
+            if req.target_id is None or not values["text"].strip():
+                self.processor.cancel()
+                return
+            self.processor.provide(
+                dict(values, **self.properties.model_text_output()))
+
+        pane.begin_inline_text(None, values["text"], req.anchor,
+                               changed, finished)
+
+    def _edit_paper_text_in_viewport(self, pane, note_id):
+        """Edit a rendered layout note where it sits on the sheet."""
+        lay = pane.layout_view.layout
+        note = (next((item for item in lay.notes if item.id == note_id), None)
+                if lay is not None else None)
+        if self.processor.busy or note is None:
+            return
+        self.history.checkpoint("edit text")
+        start_revision = self.scene.revision
+        pane.layout_view.selected = [("note", note)]
+        pane.layoutSelectionChanged.emit()
+        self.properties.begin_live_text(note.id)
+
+        def changed(text):
+            if text.strip() and text != note.text:
+                note.text = text
+                note.style = ""
+                self.scene.notify("layouts")
+
+        def finished():
+            pane.end_inline_text()
+            self.properties.end_live_text(note.id)
+            if self.scene.revision == start_revision:
+                self.history.discard_checkpoint()
+
+        pane.begin_inline_text(note.id, note.text,
+                               (note.x, note.y, 0.), changed, finished)
+
+    def _edit_model_text_in_viewport(self, pane, obj_id):
+        from .core.text import TextShape
+        obj = self.scene.get(obj_id)
+        if (self.processor.busy or obj is None
+                or not isinstance(obj.shape, TextShape)):
+            return
+        self.history.checkpoint("edit text")
+        start_revision = self.scene.revision
+        self.selection.set([obj.id])
+        self.properties.begin_live_text(obj.id)
+
+        def changed(text):
+            current = self.scene.get(obj.id)
+            if (current is not None and text.strip()
+                    and text != current.shape.text):
+                self.scene.replace_shape(
+                    obj.id, current.shape.edited(text=text))
+
+        def finished():
+            pane.end_inline_text()
+            self.properties.end_live_text(obj.id)
+            if self.scene.revision == start_revision:
+                self.history.discard_checkpoint()
+
+        pane.begin_inline_text(obj.id, obj.shape.text, obj.shape.origin,
+                               changed, finished)
+
+    def _model_text_changed_from_properties(self, obj_id, text):
+        from .commands.base import TextEditorReq
+        req = self.processor.request
+        if isinstance(req, TextEditorReq) and req.target_id == obj_id:
+            req.values["text"] = text
+        for pane in self.all_viewports():
+            pane.set_inline_text(obj_id, text)
+
+    def _text_typography_changed_from_properties(self, obj_id, values):
+        from .commands.base import TextEditorReq
+        req = self.processor.request
+        if isinstance(req, TextEditorReq) and req.target_id == obj_id:
+            req.values.update(values)
+        for pane in self.all_viewports():
+            pane.set_inline_text_typography(obj_id, values)
+
+    def _offer_form(self, req):
+        """Show a running command's form as one popup (#45).
+
+        The processor is already asking the first field as an ordinary
+        prompt, so a command stays answerable by typing if this never
+        runs; what the popup adds is seeing the answers together. OK
+        answers the whole form, Cancel cancels the command, as closing a
+        file picker does.
+
+        It opens on the next turn of the event loop, not from in here.
+        `hatch Solid` feeds its answer straight after the command starts,
+        and a popup opened now would be up before the answer arrived,
+        showing the layer's pattern for OK to make instead. Waiting lets
+        typed answers win: one that moves the form on, or finishes it,
+        means someone is typing, and the rest is asked at the prompt.
+        """
+        form = self.processor.form
+        if (form is None or form is self._offered_form
+                or self.processor.headless or not self.processor.busy
+                or self.processor.request is not req):
+            return
+        self._offered_form = form
+        QTimer.singleShot(0, self, lambda: self._show_form(form, req))
+
+    def _show_form(self, form, req):
+        """The popup `_offer_form` waited a turn to open."""
+        if (self.processor.form is not form or self.processor.request is not req
+                or self._form_dialog_open or not self.processor.busy):
+            return
+        from .ui.form_dialog import FormDialog
+        self._form_dialog_open = True
+        try:
+            dialog = FormDialog(form, parent=self,
+                                changed=lambda values: self._ghost_form(
+                                    form, values))
+            accepted = dialog.exec() == QDialog.DialogCode.Accepted
+            values = dialog.values() if accepted else None
+        finally:
+            self._form_dialog_open = False
+            if form.preview_fn is not None:
+                for vp in self.all_viewports():
+                    vp.set_ghost(None)
+        if self.processor.form is not form:
+            return                      # answered another way meanwhile
+        if values is None:
+            self.processor.cancel()
+        else:
+            self.processor.provide_form(values)
+
+    def _run_hatch_patterns(self, action: str):
+        """Load or Delete patterns… from a pattern list in Properties. A
+        load that brings patterns switches that list to the first of them
+        once the command is over, so the pick that asked for the file gets
+        what was in it."""
+        before = self.scene.loaded_patterns
+        self._patterns_awaited = before if action == "Load" else None
+        self.run_command(f"hatchpatterns {action}")
+
+    def _after_hatch_patterns(self):
+        before = getattr(self, "_patterns_awaited", None)
+        if before is None or self.processor.busy:
+            return
+        self._patterns_awaited = None
+        loaded = self.scene.loaded_patterns
+        if loaded is not before:
+            self.properties.use_loaded_pattern(loaded)
+
+    def _ghost_form(self, form, values):
+        """What a popup's answers would make, ghosted in every pane while
+        it is open: a hatch's pattern, spacing and angle are seen on the
+        region before OK, not after."""
+        if form.preview_fn is None:
+            return
+        try:
+            shape = form.preview_fn(values)
+        except Exception:                                  # noqa: BLE001
+            shape = None
+        for vp in self.all_viewports():
+            vp.set_ghost(shape)
+
+    def _offer_file_picker(self, req):
+        """Let a live command's pending FileReq use the window chooser."""
+        if (not isinstance(req, FileReq) or self.processor.headless
+                or self._file_picker_open or not self.processor.busy):
+            return
+        self._file_picker_open = True
+        try:
+            path = self._pick_file(
+                save=req.save, title=req.title,
+                name=os.path.expanduser(req.default or ""),
+                filters=req.filters)
+        finally:
+            self._file_picker_open = False
+        if path:
+            self.processor.provide_text(path)
+        elif self.processor.busy and self.processor.request is req:
+            self.processor.cancel()
+
+    def _on_object_clicked(self, obj_id: str, modifiers, pane=None):
+        req = self.processor.request
+        if isinstance(req, SelectReq):
+            at = None
+            px = getattr(pane, "last_click_px", None)
+            if req.want_point and px is not None:
+                at = pane.point_on(obj_id, *px)
+            self.processor.click_object(obj_id, at=at)
+            return
+        additive = bool(modifiers & (Qt.KeyboardModifier.ShiftModifier
+                                     | Qt.KeyboardModifier.ControlModifier))
+        ids = self.scene.expand_group_ids([obj_id])
+        if not additive:
+            self._clicked_curves = {obj_id}
+        elif self.selection.is_selected(obj_id):
+            self._clicked_curves.discard(obj_id)
+        else:
+            self._clicked_curves.add(obj_id)
+        if additive:
+            if self.selection.is_selected(obj_id):
+                self.selection.set([i for i in self.selection.ids
+                                    if i not in ids])
+            else:
+                self.selection.set(self.selection.ids
+                                   + [i for i in ids
+                                      if i not in self.selection.ids])
+        else:
+            self.selection.set(ids)
+
+    def _on_empty_clicked(self, modifiers):
+        if isinstance(self.processor.request, SelectReq):
+            return
+        additive = bool(modifiers & (Qt.KeyboardModifier.ShiftModifier
+                                     | Qt.KeyboardModifier.ControlModifier))
+        if not additive:
+            self.selection.clear()
+
+    def _on_box_selected(self, ids, modifiers):
+        if isinstance(self.processor.request, SelectReq):
+            self.processor.box_objects(ids)
+            return
+        ids = self.scene.expand_group_ids(ids)
+        if modifiers & Qt.KeyboardModifier.ControlModifier:
+            remaining = [i for i in self.selection.ids if i not in ids]
+            self.selection.set(remaining)
+        elif modifiers & Qt.KeyboardModifier.ShiftModifier:
+            merged = self.selection.ids + [i for i in ids
+                                           if i not in self.selection.ids]
+            self.selection.set(merged)
+        else:
+            self.selection.set(ids)
+
+    def _on_point_picked(self, point):
+        if isinstance(self.processor.request, PointReq):
+            self.ctx.last_point = point
+            self.processor.provide(point)
+
+    def _on_detail_entered(self, detail):
+        """A click stepped into a detail instead of placing a point."""
+        self.ctx.echo("Now drawing inside the detail "
+                      f"({detail.scale_text(self.scene.units)})"
+                      " — pick again to place the point.")
+        self._update_status()
+
+    def _on_mouse_world(self, point):
+        # whichever pane the cursor is in, which is not the same as the one
+        # last clicked in: the whole point of picking across panes is that
+        # you can leave the one you started in without clicking on the way
+        self._refresh_rubber(point, source=self.sender())
+        req = self.processor.request
+        if isinstance(req, PointReq) and getattr(req, "draft_fn", None):
+            # a draft is cheap enough to follow every move
+            self._cursor_preview = (req, point)
+            self._show_draft(req, point)
+            return
+        if isinstance(req, PointReq) and getattr(req, "preview_fn", None):
+            self._cursor_preview = (req, point)
+            # A cheap ghost follows every move. An expensive one is capped
+            # at ~30Hz, and the move it skipped is drawn once the gap is up,
+            # or it is left behind where the cursor stopped.
+            from PySide6.QtCore import QElapsedTimer, QTimer
+            timer = getattr(self, "_ghost_timer", None)
+            gap = 33 if getattr(self, "_ghost_cost_ms", 0.0) > 4.0 else 0
+            due = timer is None or timer.elapsed() >= gap
+            if timer is None:
+                timer = self._ghost_timer = QElapsedTimer()
+            trail = getattr(self, "_ghost_trail", None)
+            if trail is None:
+                trail = self._ghost_trail = QTimer(self)
+                trail.setSingleShot(True)
+                trail.timeout.connect(self._trailing_ghost)
+            if getattr(self, "_ghost_cost_ms", 0.0) > 60.0:
+                # Too slow to follow the cursor without holding it up: the
+                # ghost waits until the cursor rests.
+                trail.start(120)
+                return
+            if due:
+                trail.stop()
+                timer.restart()
+                self._show_cursor_ghost(point)
+            else:
+                trail.start(max(1, gap - timer.elapsed()))
+
+    def _watch_ctrl(self):
+        from PySide6.QtWidgets import QApplication
+        down = bool(QApplication.keyboardModifiers()
+                    & Qt.KeyboardModifier.ControlModifier)
+        if down == self._ctrl_was:
+            return
+        self._ctrl_was = down
+        if getattr(self.selection, "subobjects", None):
+            for vp in self.all_viewports():
+                vp.update()
+
+    def _show_draft(self, req, point):
+        try:
+            ghost = req.draft_fn(point)
+        except Exception:                                  # noqa: BLE001
+            ghost = None
+        for vp in self.all_viewports():
+            vp.set_ghost(ghost)
+
+    def _show_cursor_ghost(self, point):
+        from time import perf_counter
+        start = perf_counter()
+        ghost = self.processor.preview_for(point)
+        for vp in self.all_viewports():
+            vp.set_ghost(ghost)
+        self._ghost_cost_ms = (perf_counter() - start) * 1000.0
+
+    def _trailing_ghost(self):
+        pending = self._cursor_preview
+        if pending is not None and pending[0] is self.processor.request:
+            self._ghost_timer = None
+            self._show_cursor_ghost(pending[1])
+
+    def _refresh_rubber(self, cursor, source=None):
+        """`source` is the pane the cursor is in, and gets the number."""
+        req = self.processor.request
+        if not isinstance(req, PointReq):
+            return
+        markers = []
+        segs = []
+        pts = list(req.rubber_pts or [])
+        if req.rubber_from is not None:
+            pts = [req.rubber_from]
+        sides = req.rubber_sides
+        labels = []
+        if pts:
+            markers = list(pts)
+            labels = [""] * len(pts)
+            chain = pts + ([cursor] if cursor is not None else [])
+            # A band is a line drawn to say where the next one goes. When what
+            # is being dragged out is a frame, the ghost has already drawn it
+            # and the band can only be its diagonal — a slash across the middle
+            # of the shape it was meant to help place. The number it carried is
+            # still wanted, so it is asked for as sides instead of a length.
+            if len(chain) >= 2 and sides is None and req.rubber_band:
+                arr = np.asarray(chain, float)
+                segs = np.stack([arr[:-1], arr[1:]], axis=1)
+        guides = (req.guide_fn(cursor)
+                  if req.guide_fn is not None and cursor is not None else ())
+        for line in guides or ():
+            if len(line) < 2:
+                continue
+            arr = np.asarray(line, float)
+            more = np.stack([arr[:-1], arr[1:]], axis=1)
+            segs = np.concatenate([segs, more]) if len(segs) else more
+        for at, text in req.marks or ():
+            markers.append(at)
+            labels.append(text)
+        # in every pane, for the same reason the picked points already are:
+        # world points with a line between them, and each pane knows how to
+        # look at those from where it stands. Named on the primary alone, the
+        # band ran in Perspective however far from it you were drawing.
+        reading = source if source in self.all_viewports() else self._active_vp
+        for vp in self.all_viewports():
+            vp.set_readout_visible(vp is reading)
+            vp.set_preview(segs if len(segs) else None, markers, labels)
+            if sides is not None:
+                vp.set_frame_readout(
+                    sides(cursor) if cursor is not None else None, cursor)
+
+    def _is_curve(self, obj_id) -> bool:
+        obj = self.scene.get(obj_id)
+        return obj is not None and obj.kind == "curve"
+
+    def _delete_selected(self):
+        lv = self.ctx.sheet_view()
+        if lv is not None:
+            # On bare paper the pick is the layout's own, not the scene's.
+            # Inside a detail it is the model's, seen through the detail,
+            # by the same rule Copy and the commands go by (#93).
+            if lv.delete_selected():
+                lv.vp.update()
+                self._update_status()
+            return
+        # A held control point, face or curve segment is as much a pick as
+        # a whole object, and Delete means whichever of them you are
+        # holding. A solid's edge is not one of them: there is no segment
+        # of it to take away.
+        held = any(kind in ("cv", "face")
+                   or (kind == "edge" and self._is_curve(oid))
+                   for (oid, kind, _) in self.selection.subobjects)
+        if (self.selection.ids or held) and not self.processor.busy:
+            self.run_command("delete")
+
+    def _copy_selected(self):
+        """Copy asks where you are, because what is meant is in doubt.
+
+        A sheet has two things on it a command could mean, and the same rule
+        that decides that for `move`, `delete` and `copy` decides it here.
+        """
+        echo = self.command_line.echo_view
+        if echo.textCursor().hasSelection():
+            # Text picked out of the history is asked about first, because
+            # nothing else would ever ask: typing goes to the command line
+            # wherever you clicked, so the history never holds the keyboard
+            # focus and never sees the key itself. A cursor hands lines back
+            # separated by U+2029, which pastes as one long line.
+            QApplication.clipboard().setText(
+                echo.textCursor().selectedText().replace(" ", "\n"))
+            return
+        import copy as _copy
+        lv = self.ctx.sheet_view()
+        if lv is not None:
+            lv._prune()
+            if not lv.selected:
+                return
+            self._clipboard = ("sheet", [(k, _copy.deepcopy(o))
+                                         for k, o in lv.selected])
+            self._claim_clipboard(len(lv.selected), "sheet item")
+            self.ctx.echo(f"Copied {len(lv.selected)} sheet item(s).")
+            return
+        objs = self.selection.objects()
+        items = [(o.name, o.shape, o.layer_id) for o in objs]
+        parts = 0
+        if getattr(self.selection, "subobjects", None):
+            # a held part copies as an object of its own
+            from .commands.transform import _detached_parts
+            pieces = _detached_parts(self.ctx, self.ctx.held_parts())
+            items += [(src.name, shape, src.layer_id) for shape, src in pieces]
+            parts = len(pieces)
+        if not items:
+            return
+        self._clipboard = ("model", items)
+        self._claim_clipboard(len(items), "object")
+        if parts:
+            self.ctx.echo(f"Copied {len(objs)} object(s) and {parts} part(s) "
+                          "as objects of their own.")
+        else:
+            self.ctx.echo(f"Copied {len(objs)} object(s).")
+
+    def _claim_clipboard(self, count: int, noun: str):
+        """Make a copy of objects what the system clipboard holds.
+
+        Paste pastes text when the clipboard holds text (#37), so a copy of
+        objects has to take the clipboard over, or text copied before it
+        would win. It does so in words, which is also what survives a
+        clipboard manager that keeps only text. Words and nothing else: a
+        QMimeData made here and left on the clipboard segfaults PySide6 as
+        the interpreter shuts down, so quitting after a copy crashed.
+        """
+        plural = "" if count == 1 else "s"
+        self._clipboard_words = f"{count} {noun}{plural} copied in Blackbyrd3D"
+        QApplication.clipboard().setText(self._clipboard_words)
+
+    def _copied_objects_are_on_the_clipboard(self, mime) -> bool:
+        return (mime is not None
+                and mime.text() == getattr(self, "_clipboard_words", None))
+
+    def _paste(self):
+        """Paste asks the clipboard, because what it holds is not in doubt.
+
+        Only where to put it is, and there is one answer: model objects go to
+        the model wherever you are standing, sheet items go onto the sheet
+        that is showing — which need not be the one they were copied from,
+        and that is the point of it.
+        """
+        mime = QApplication.clipboard().mimeData()
+        rhino = _rhino_clipboard_format(mime)
+        if rhino is not None:
+            self._paste_from_rhino(bytes(mime.data(rhino)))
+            return
+        if (mime is not None and mime.hasText() and mime.text()
+                and not self._copied_objects_are_on_the_clipboard(mime)):
+            # Text was copied last, from anywhere: it goes where you type,
+            # as right-click Paste in the command line puts it, and as
+            # Rhino's Paste does with text (#37).
+            if self.command_workspace.mode == "ai":
+                field = self.command_workspace.assistant.input
+            else:
+                field = self.command_line.input
+            field.setFocus()
+            field.paste()
+            return
+        clip = getattr(self, "_clipboard", None)
+        if not clip:
+            return
+        kind, items = clip
+        if kind == "sheet":
+            self._paste_on_sheet(items)
+            return
+        from .core import geometry as g
+        self.history.checkpoint("paste")
+        pasted = []
+        live = {la.id for la in self.scene.layers.all()}
+        # One notification for the paste, not one per object — see
+        # Scene.batched. The clipboard holds whatever was selected, which on
+        # a survey drawing is thousands of things.
+        with self.scene.batched():
+            for name, shape, layer_id in items:
+                lid = layer_id if layer_id in live else None
+                pasted.append(self.scene.add(g.copy_shape(shape),
+                                             layer_id=lid))
+        self.selection.set([o.id for o in pasted])
+        where = "" if self.viewport.space == "model" else " into the model"
+        self.ctx.echo(f"Pasted {len(pasted)} object(s){where}.")
+
+    def _paste_from_rhino(self, data: bytes):
+        """Objects copied in Rhino: it puts a whole .3dm on the clipboard,
+        which comes in as Import would bring the file, layers and units
+        and all, and arrives picked."""
+        import tempfile
+        from . import fileio
+        fd, path = tempfile.mkstemp(suffix=".3dm")
+        try:
+            with os.fdopen(fd, "wb") as fh:
+                fh.write(data)
+            before = {o.id for o in self.scene.all()}
+            notes = []
+            self.history.checkpoint("paste")
+            try:
+                fileio.import_file(self.scene, path, notes=notes)
+            except Exception as exc:                       # noqa: BLE001
+                self.history.discard_checkpoint()
+                self.ctx.echo(f"Could not paste from Rhino: {exc}")
+                return
+        finally:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+        pasted = [o.id for o in self.scene.all() if o.id not in before]
+        if not pasted:
+            self.history.discard_checkpoint()
+            self.ctx.echo("Nothing on the clipboard from Rhino could be "
+                          "pasted.")
+            return
+        self.selection.set(pasted)
+        where = "" if self.viewport.space == "model" else " into the model"
+        said = f" ({'; '.join(notes)})" if notes else ""
+        self.ctx.echo(f"Pasted {len(pasted)} object(s) from Rhino"
+                      f"{where}{said}.")
+
+    def _paste_on_sheet(self, items):
+        """Put copied sheet items onto whichever sheet is showing."""
+        lv = self.viewport.layout_view
+        lay = lv.layout if self.viewport.space != "model" else None
+        if lay is None:
+            self.ctx.echo(f"{len(items)} sheet item(s) on the clipboard — "
+                          "switch to a sheet to paste them.")
+            return
+        from .core.layout import copy_sheet_item
+        self.history.checkpoint("paste")
+        pasted = [(k, copy_sheet_item(lay, k, o)) for k, o in items]
+        pasted = [(k, o) for k, o in pasted if o is not None]
+        # Picked where they land, so they can be moved into place at once —
+        # they arrive exactly on top of what they were copied from, and being
+        # picked is what shows they arrived at all.
+        lv.selected = pasted
+        lv.corners = []
+        self.scene.notify("layouts")
+        self.viewport.update()
+        self.ctx.echo(f"Pasted {len(pasted)} sheet item(s) onto {lay.name}.")
+
+    # ------------------------------------------------------------ file dialogs
+
+    # Filters come from fileio so the chooser can never drift from what we can
+    # actually read/write (GitHub #2), and so Open stops offering export-only
+    # formats.
+
+    def _file_new(self):
+        if not self._save_changes_first():
+            return
+        self.history.checkpoint("new")
+        self.scene.clear()
+        self.apply_view_settings()
+        self.show_perspective_alone()
+        self.ctx.current_path = None
+        self.command_line.echo("New document.")
+        self.mark_saved()
+
+    def start_new(self, units: str = "mm"):
+        """Fresh document in the given units (no confirm) — used by the
+        welcome screen."""
+        self.history.checkpoint("new")
+        self.scene.clear()
+        self.apply_view_settings()
+        self.show_perspective_alone()
+        self.scene.units = units
+        self.scene.notify()
+        self.ctx.current_path = None
+        self.mark_saved()
+        self.command_line.echo(f"New model ({units}).")
+
+    def _pick_file(self, *, save: bool, title: str, name: str = "",
+                   filters: str = "") -> str:
+        """A file chooser that behaves. On Linux the native GNOME chooser gets
+        glued to the main window and fills the screen under
+        attach-modal-dialogs, so use Qt's own dialog as a normal, resizable,
+        sensibly sized window (NORMAL window type dodges the attach). Native
+        elsewhere."""
+        import sys
+        if not filters:
+            filters = (fileio.export_filter() if save
+                       else fileio.import_filter())
+        dlg = QFileDialog(self, title, "", filters)
+        if save:
+            dlg.setAcceptMode(QFileDialog.AcceptMode.AcceptSave)
+            # Export dispatches on the extension, so a typed "part" must come
+            # back as "part.stl" — follow whichever format is selected.
+            def _suffix(f):
+                dlg.setDefaultSuffix(fileio.suffix_for_filter(f))
+            _suffix(dlg.selectedNameFilter())
+            dlg.filterSelected.connect(_suffix)
+            if name:
+                dlg.selectFile(name)
+        else:
+            dlg.setFileMode(QFileDialog.FileMode.ExistingFile)
+        if sys.platform.startswith("linux"):
+            dlg.setOption(QFileDialog.Option.DontUseNativeDialog, True)
+            dlg.resize(900, 580)
+        untether(dlg)
+        if dlg.exec() and dlg.selectedFiles():
+            path = dlg.selectedFiles()[0]
+            # Some formats mean more than an extension — "Rhino 6 (*.3dm)"
+            # carries the version — so the caller can ask what was picked.
+            self._picked_filter = dlg.selectedNameFilter()
+            return (fileio.ensure_suffix(path, dlg.selectedNameFilter())
+                    if save else path)
+        self._picked_filter = ""
+        return ""
+
+    def _file_open(self):
+        path = self._pick_file(save=False, title="Open")
+        if path and (not _opens_as_new(path) or self._save_changes_first()):
+            self._open_path(path)
+
+    def _import_showing_progress(self, path: str, scene=None,
+                                 replace: bool = False,
+                                 notes: list | None = None) -> int:
+        """Import `path`, showing what it is doing and offering a way out.
+
+        A set-design .3dm is minutes of work; with no dialog the window simply
+        stops repainting and the only exit is killing the app, which is what
+        happened with a 921 MB file. The dialog waits before appearing so
+        ordinary files don't flash one up, and updates are throttled because
+        repainting per face would cost more than the import itself.
+        """
+        from .ui.progress_card import ProgressCard
+        # A drawing of our own says so straight away: reading and unpacking
+        # it reports nothing until its objects come in, so a card held back
+        # half a second never came at all and the window just sat there.
+        own = path.lower().endswith((".byrd", ".serp"))
+        dlg = ProgressCard(self, f"Opening {os.path.basename(path)}",
+                           delay=0.0 if own else 0.5)
+
+        def report(fraction, message):
+            dlg.setLabelText(message)
+            dlg.setValue(int(fraction * 100))
+            QApplication.processEvents()
+            return not dlg.wasCanceled()
+
+        # The journal waits for the file: reading it pumps events, and its
+        # quiet-period timer would write the drawing half in as edits.
+        paused = (self.journal.pause() if self.journal is not None
+                  else contextlib.nullcontext())
+        try:
+            with paused:
+                return fileio.import_file(scene or self.scene, path,
+                                          progress=fileio.throttled(report),
+                                          replace=replace, notes=notes)
+        finally:
+            dlg.finish()
+
+    def _export_showing_progress(self, path: str, **kwargs):
+        """export_file behind the same card an import shows: a .3dm of a
+        survey converts every hidden object and writes thousands more,
+        and with no card the window looked hung."""
+        from .ui.progress_card import ProgressCard
+        if "thumbnail" not in kwargs:
+            # the picture the welcome screen shows of it
+            from .commands.file import _thumbnail
+            kwargs["thumbnail"] = _thumbnail(self.ctx)
+        dlg = ProgressCard(self, f"Saving {os.path.basename(path)}",
+                           title="Saving")
+
+        def report(fraction, message):
+            dlg.setLabelText(message)
+            dlg.setValue(int(fraction * 100))
+            QApplication.processEvents()
+            return not dlg.wasCanceled()
+
+        paused = (self.journal.pause() if self.journal is not None
+                  else contextlib.nullcontext())
+        try:
+            with paused:
+                return fileio.export_file(self.scene, path,
+                                          progress=fileio.throttled(report),
+                                          **kwargs)
+        finally:
+            dlg.finish()
+
+    def _open_path(self, path: str):
+        """Open a file by path (shared by the dialog, Recent menu and the
+        welcome screen)."""
+        if path.lower().endswith(".wyrm"):
+            # a graph, not a model: it opens in Wyrm beside the model
+            self.show_wyrm().open_path(path)
+            return
+        cleared = False
+        try:
+            self.history.checkpoint("open")
+            notes = []
+            if _opens_as_new(path):
+                # A Rhino file opens as the document it is, as Rhino opens
+                # it, and so in its own units; Import is there to add one.
+                self.scene.clear()
+                self.ctx.current_path = None
+                cleared = True
+            self._import_showing_progress(path, replace=True, notes=notes)
+            if self.journal is not None:
+                self.journal.note_load(path)
+            from .examples import is_example
+            example = is_example(path)
+            if path.endswith(".byrd") and not example:
+                self.ctx.current_path = path
+            elif example:
+                # a copy to work on: Save asks where, the shipped file stays
+                self.ctx.current_path = None
+            elif path.lower().endswith(".serp"):
+                # a Serpentine3D file is read, never written back: Save asks
+                self.ctx.current_path = None
+            self.command_line.echo(
+                f"Opened {path}: {len(self.scene.all())} object(s)"
+                + "".join(f", {note}" for note in notes) + ".")
+            if not self.apply_view_settings():
+                self.viewport.zoom_extents()
+            self.mark_saved()
+            if not example:
+                self.add_recent(path)
+        except fileio.Cancelled:
+            # the user's own decision, not a failure — no alert. Cancel
+            # leaves the scene as it was: untouched, or put back.
+            self._abandon_open(cleared)
+            self.command_line.echo("Open cancelled.")
+        except Exception as exc:                              # noqa: BLE001
+            self._abandon_open(cleared)
+            QMessageBox.warning(self, "Open failed", str(exc))
+
+    def _abandon_open(self, cleared: bool):
+        """Drop an open that did not finish: what it cleared comes back."""
+        if cleared:
+            self.history.revert_checkpoint()
+        else:
+            self.history.discard_checkpoint()
+
+    # -- recent files (MRU) --
+    def recent_files(self) -> list:
+        """Recently opened/saved paths, most recent first, existing only."""
+        return [p for p in self.cfg.get("recent_files", default=[])
+                if os.path.exists(p)]
+
+    def add_recent(self, path: str):
+        from .utils.config import push_recent
+        self.cfg.set("recent_files",
+                     push_recent(self.cfg.get("recent_files", default=[]),
+                                 path))
+        self._rebuild_recent_menu()
+
+    def _rebuild_recent_menu(self):
+        menu = getattr(self, "_recent_menu", None)
+        if menu is None:
+            return
+        menu.clear()
+        files = self.recent_files()
+        if not files:
+            act = menu.addAction("(no recent files)")
+            act.setEnabled(False)
+            return
+        for p in files:
+            menu.addAction(os.path.basename(p),
+                           lambda checked=False, path=p: self._open_recent(path))
+        menu.addSeparator()
+        menu.addAction("Clear Recent", self._clear_recent)
+
+    def _save_changes_first(self) -> bool:
+        """Offer to save unsaved work before it is replaced; False when the
+        user cancels, or cancels the save."""
+        if not (self.dirty and self.scene.all()):
+            return True
+        from .ui import save_prompt
+        path = getattr(self.ctx, "current_path", None)
+        ret = save_prompt.ask_save_changes(
+            self, os.path.basename(path) if path else "untitled")
+        if ret == save_prompt.CANCEL:
+            return False
+        if ret == save_prompt.SAVE:
+            self._file_save()
+            return not self.dirty
+        return True
+
+    def _open_recent(self, path: str):
+        if os.path.exists(path):
+            if self._save_changes_first():
+                self._open_path(path)
+        else:
+            QMessageBox.warning(self, "Open", f"File no longer exists:\n{path}")
+            self._rebuild_recent_menu()      # prune it from the menu
+
+    def _clear_recent(self):
+        self.cfg.set("recent_files", [])
+        self._rebuild_recent_menu()
+
+    def _file_save(self, force_dialog: bool = False):
+        path = self.ctx.current_path
+        if force_dialog or not path:
+            # Rhino formats sit beside the native one: round-tripping a .3dm
+            # should not require finding Export (#5). _pick_file already
+            # gives a typed bare name the chosen filter's extension.
+            path = self._pick_file(
+                save=True, title="Save", name="untitled.byrd",
+                filters="Blackbyrd3D (*.byrd);;Rhino 8 (*.3dm);;"
+                        "Rhino 7 (*.3dm);;Rhino 6 (*.3dm);;Rhino 5 (*.3dm)")
+            if not path:
+                return
+            self._save_rhino_version = fileio.rhino_version_from_filter(
+                getattr(self, "_picked_filter", ""))
+        try:
+            self._export_showing_progress(
+                path, rhino_version=getattr(self, "_save_rhino_version", 8))
+            self.ctx.current_path = path
+            if path.lower().endswith(".3dm"):
+                # Honest about the trade before anyone loses a sheet to it.
+                self.command_line.echo(
+                    f"Saved {path} — Rhino format; layouts and history "
+                    "are kept only in .byrd")
+            else:
+                self.command_line.echo(f"Saved {path}")
+            self.mark_saved()
+            self.add_recent(path)
+        except fileio.Cancelled:
+            self.command_line.echo("Save cancelled.")
+        except Exception as exc:                              # noqa: BLE001
+            QMessageBox.warning(self, "Save failed", str(exc))
+
+    def _file_import(self):
+        if self._importing_file:
+            return
+        path = self._pick_file(save=False, title="Import",
+                               filters=fileio.import_filter(pictures=True))
+        if not path:
+            return
+        self._pending_import_paths.clear()
+        self._import_path(path)
+
+    def _dropped_files(self, event):
+        """Every local file in the drop, whatever its format.
+
+        A file we cannot read is still a file someone dropped, and it is
+        answered rather than ignored (#21): refusing the drag means the
+        drop never arrives and the window stays silent, which reads as a
+        broken feature. A web link or a folder is not a file and is still
+        refused outright, since there is nothing to answer for.
+        """
+        if (self._importing_file or self._pending_import_paths
+                or not event.possibleActions() & Qt.DropAction.CopyAction):
+            return []
+        return [url.toLocalFile() for url in event.mimeData().urls()
+                if url.isLocalFile() and os.path.isfile(url.toLocalFile())]
+
+    @staticmethod
+    def _can_import(path) -> bool:
+        return (os.path.splitext(path)[1].lower()
+                in (fileio.IMPORT_EXTS | fileio.PICTURE_EXTS))
+
+    def _dropped_import_paths(self, event):
+        """Only local files supported by the normal Import dialog qualify."""
+        return [p for p in self._dropped_files(event) if self._can_import(p)]
+
+    def _say_what_was_not_opened(self, paths):
+        """Name the files that went nowhere, and why.
+
+        A DWG is the one worth advising on: it is Autodesk's own binary
+        format, which Blackbyrd3D does not read, and every CAD program
+        that writes it also writes DXF, which Blackbyrd3D does read.
+        """
+        if not paths:
+            return
+        names = ", ".join(os.path.basename(p) for p in paths)
+        exts = {os.path.splitext(p)[1].lower() for p in paths}
+        exts.discard("")
+        spelled = ", ".join(sorted(exts)) or "those"
+        self.command_line.echo(
+            f"Cannot open {names}: Blackbyrd3D does not read "
+            f"{spelled} files.")
+        if ".dwg" in exts:
+            self.command_line.echo(
+                "Save it as DXF in the program that wrote it and drop that "
+                "instead.")
+        self.command_line.echo(
+            "Import reads " + ", ".join(
+                name for name, _exts in fileio.IMPORT_FORMATS) + ".")
+
+    def dragEnterEvent(self, event):
+        if self._dropped_files(event):
+            event.setDropAction(Qt.DropAction.CopyAction)
+            event.accept()
+        else:
+            event.ignore()
+
+    def dragMoveEvent(self, event):
+        self.dragEnterEvent(event)
+
+    def dropEvent(self, event):
+        files = self._dropped_files(event)
+        if not files:
+            event.ignore()
+            return
+        event.setDropAction(Qt.DropAction.CopyAction)
+        event.accept()
+        paths = [p for p in files if self._can_import(p)]
+        self._say_what_was_not_opened([p for p in files
+                                       if not self._can_import(p)])
+        if not paths:
+            return
+        if self.processor.busy:
+            self.processor.cancel()
+        paper_drop = None
+        if self.ctx.on_bare_paper():
+            lv = self.ctx.viewport.layout_view
+            pos = event.position()
+            px, py = lv.screen_to_paper(pos.x(), pos.y())
+            paper_drop = (lv.layout.id, px, py)
+        self._pending_import_paths = [(path, paper_drop) for path in paths]
+        self._continue_dropped_imports()
+
+    def _resume_dropped_imports(self):
+        if self._pending_import_paths and not self.processor.busy:
+            # Finish command/history cleanup before starting another picture.
+            QTimer.singleShot(0, self._continue_dropped_imports)
+
+    def _continue_dropped_imports(self):
+        while (self._pending_import_paths and not self.processor.busy
+               and not self._importing_file):
+            path, paper_drop = self._pending_import_paths.pop(0)
+            if (paper_drop is None and _opens_as_new(path)
+                    and not self.scene.all()):
+                # A Rhino file dropped on an empty drawing is opened, not
+                # added: in its own units, with its own views.
+                self._open_path(path)
+                continue
+            self._import_path(path, paper_drop=paper_drop)
+
+    def _import_path(self, path, paper_drop=None):
+        """Share Import's undo, progress and error handling with file drops."""
+        if self._importing_file:
+            return
+        if self.processor.busy:
+            self.processor.cancel()
+        if os.path.splitext(path)[1].lower() in fileio.PICTURE_EXTS:
+            # Feed the known path as one value, preserving spaces and avoiding
+            # another chooser. The command owns placement, undo and Escape.
+            self.processor.run("import --headless")
+            self.processor.provide(path)
+            self.command_line.focus()
+            return
+        # Progress callbacks process Qt events; another drop must not nest an
+        # import (and its history checkpoint) inside the one already running.
+        self._importing_file = True
+        try:
+            self.history.checkpoint("import")
+            ext = os.path.splitext(path)[1].lower()
+            if paper_drop is not None and ext in {".dxf", ".svg"}:
+                layout_id, px, py = paper_drop
+                layout = next((lay for lay in self.scene.layouts
+                               if lay.id == layout_id), None)
+                if layout is None:
+                    raise ValueError("The target layout is no longer available.")
+                imported = Scene()
+                imported.units = self.scene.units
+                n = self._import_showing_progress(path, scene=imported)
+                objects = imported.all()
+                if not objects:
+                    self.history.discard_checkpoint()
+                    self.command_line.echo("Imported 0 object(s).")
+                    return
+                boxes = np.asarray([obj.bbox() for obj in objects], float)
+                centre = (boxes[:, 0].min(axis=0)
+                          + boxes[:, 1].max(axis=0)) / 2
+                offset = np.asarray((px, py, 0.0), float) - centre
+                from .core import geometry
+                for source in objects:
+                    paper = layout.add(
+                        geometry.translate(source.shape, tuple(offset)),
+                        name=source.name)
+                    layer = imported.layers.get(source.layer_id)
+                    paper.color = source.color or layer.color
+                    paper.linetype = (layer.linetype
+                                      if source.linetype == "ByLayer"
+                                      else source.linetype)
+                    if layer.print_width > 0:
+                        paper.lineweight = layer.print_width
+                self.scene.notify("layouts")
+                self.command_line.echo(f"Imported {n} object(s).")
+                return
+            notes = []
+            n = self._import_showing_progress(path, notes=notes)
+            if self.journal is not None:
+                self.journal.note_import(path)
+            self.command_line.echo(
+                f"Imported {n} object(s)"
+                + "".join(f", {note}" for note in notes) + ".")
+            self.viewport.zoom_extents()
+        except fileio.Cancelled:
+            self.history.discard_checkpoint()
+            self.command_line.echo("Import cancelled.")
+        except Exception as exc:                              # noqa: BLE001
+            self.history.discard_checkpoint()
+            QMessageBox.warning(self, "Import failed", str(exc))
+        finally:
+            self._importing_file = False
+
+    # STL export mesh-quality presets, shown in the export prompt.
+    _STL_QUALITY = [("Draft — coarse, small file", "draft"),
+                    ("Standard", "standard"),
+                    ("Fine — smooth curves (recommended)", "fine"),
+                    ("Ultra fine — maximum detail", "ultra")]
+
+    def _file_export(self):
+        """The Export command: what is picked goes straight to the file
+        chooser, and with nothing picked it asks for objects first."""
+        self.run_command("export")
+
+    def _pick_stl_quality(self) -> str | None:
+        """STL quality picker. Built as an instance (not QInputDialog.getItem)
+        so it can be untethered from the main window. Returns a QUALITY key,
+        or None if cancelled."""
+        labels = [lbl for lbl, _ in self._STL_QUALITY]
+        dlg = QInputDialog(self)
+        dlg.setWindowTitle("STL mesh quality")
+        dlg.setLabelText(
+            "Finer meshes print smoother curves but make larger files:")
+        dlg.setComboBoxItems(labels)
+        dlg.setComboBoxEditable(False)
+        dlg.setTextValue(labels[2])            # default to "Fine" for printing
+        untether(dlg, over=self)
+        if not dlg.exec():
+            return None
+        return dict(self._STL_QUALITY)[dlg.textValue()]
+
+    # ------------------------------------------------------------- autosave
+
+    @property
+    def dirty(self) -> bool:
+        return self.scene.revision != self._saved_revision
+
+    def mark_saved(self):
+        self._saved_revision = self.scene.revision
+        self.autosave.set_doc_path(getattr(self.ctx, "current_path", None))
+        if self.journal is not None:
+            # a save is a moment the user believed in — anchor the replay
+            self.journal.write_fingerprint()
+        self._update_status()
+
+    def _autosave_tick(self):
+        if self.autosave.maybe_autosave():
+            self.statusBar().showMessage("Autosaved.", 2500)
+
+    def _restore_window(self):
+        """Come back the way the window was left: geometry, dock sizes and
+        the quad layout all reset every launch, which read as "no standard
+        configuration" (GitHub #5). Restored state also means _balance_docks
+        must keep its hands off the panel widths the user chose.
+        """
+        from PySide6.QtCore import QByteArray
+        self._docks_restored = False
+        geometry = self.cfg.get("window", "geometry", default="")
+        if geometry:
+            self.restoreGeometry(QByteArray.fromBase64(geometry.encode()))
+        # Quad unless last session ended in a single view; see the config
+        # defaults for why that is the way round it is.
+        if self.cfg.get("window", "layout", default="quad") == "quad":
+            # Before restoreState, so the aux docks exist to restore onto.
+            self.set_view_layout("quad")
+        state = self.cfg.get("window", "state", default="")
+        if state and self._restore_panels(QByteArray.fromBase64(state.encode())):
+            self._docks_restored = True
+        # Panels and panes are saved apart because they are put back apart:
+        # the panels belong to the window and the panes to whichever space
+        # tab was showing them.
+        panes = self.cfg.get("window", "panes", default="")
+        if panes and self.viewport_area.restoreState(
+                QByteArray.fromBase64(panes.encode())):
+            self._docks_restored = True
+        if not any(d.isVisibleTo(self.viewport_area)
+                   for d in self._viewport_docks()):
+            # A session that ended with every pane shut is restored exactly,
+            # and a window that opens with nowhere to draw is no use at all.
+            self.set_view_layout(
+                self.cfg.get("window", "layout", default="quad"))
+
+    def _remember_window(self):
+        self.command_workspace.save_settings()
+        self.cfg.set("window", "geometry",
+                     bytes(self.saveGeometry().toBase64()).decode())
+        self.cfg.set("window", "state",
+                     bytes(self.saveState().toBase64()).decode())
+        # The model arrangement, not whichever sheet happens to be open, so
+        # a session that ended on a layout still opens on the model panes.
+        model = (self.viewport_area.saveState() if self.space == "model"
+                 else self._space_states.get("model"))
+        if model is not None:
+            self.cfg.set("window", "panes",
+                         bytes(model.toBase64()).decode())
+        self.cfg.set("window", "layout",
+                     "quad" if self.aux_docks
+                     and self.aux_docks[0].isVisibleTo(self.viewport_area)
+                     else "single")
+        self.cfg.save()
+
+    def closeEvent(self, ev):
+        # a scale restart saved or handed the work over already —
+        # restart_app sets the flag so the prompt cannot double-ask
+        if (not getattr(self, "_restarting", False)
+                and not self._save_changes_first()):
+            ev.ignore()
+            return
+        # Only a window somebody actually saw: a headless one (tests, a
+        # crashed pre-show launch) closing would overwrite the layout the
+        # user chose with default-constructed geometry.
+        if self.isVisible():
+            self._remember_window()
+        if self.command_workspace.console is not None:
+            self.command_workspace.console.shutdown()
+        if self.command_workspace.assistant is not None:
+            self.command_workspace.assistant.shutdown()
+        if self.wyrm is not None:
+            self.wyrm.shutdown()
+        self.autosave.clean_exit()
+        if self.journal is not None:
+            self.journal.write_fingerprint()
+            self.journal.close()
+        super().closeEvent(ev)
+
+    def offer_recovery(self):
+        """Restore the newest crashed session, if any (called at startup)."""
+        if os.environ.get("BYRD3D_NO_RECOVER") == "1":
+            # automation: never block startup on a modal recovery prompt
+            return
+        candidates = self.autosave.find_recoverable()
+        if not candidates:
+            return
+        entry = candidates[0]
+        if os.environ.get("BYRD3D_AUTORESTORE") != "1":
+            import datetime
+            when = datetime.datetime.fromtimestamp(
+                entry["mtime"]).strftime("%H:%M")
+            doc = entry.get("doc_path") or "an unsaved document"
+            ret = QMessageBox.question(
+                self, "Recover unsaved work?",
+                f"Blackbyrd3D did not close cleanly last time.\n\n"
+                f"An autosave of {doc} from {when} was found. Restore it?",
+                QMessageBox.StandardButton.Yes
+                | QMessageBox.StandardButton.No)
+            if ret != QMessageBox.StandardButton.Yes:
+                self.autosave.discard(entry)
+                return
+        try:
+            doc_path = self.autosave.recover(entry)
+            self.ctx.current_path = doc_path
+            self.autosave.set_doc_path(doc_path)
+            self.command_line.echo(
+                f"Recovered {len(self.scene.all())} object(s) from the "
+                "previous session's autosave.")
+            self.viewport.zoom_extents()
+            self._update_status()
+        except Exception as exc:                              # noqa: BLE001
+            QMessageBox.warning(self, "Recovery failed", str(exc))
+
+    def offer_handoff(self):
+        """Offer back unsaved work a scale restart handed over that no
+        session took up (the new one never got going). Called once the
+        command line's file is open, which is where a restart that worked
+        has already spent it."""
+        if os.environ.get("BYRD3D_NO_RECOVER") == "1":
+            return
+        entry = self.autosave.waiting_handoff()
+        if entry is None:
+            return
+        import datetime
+        when = datetime.datetime.fromtimestamp(
+            entry["mtime"]).strftime("%H:%M")
+        doc = entry["doc_path"] or "an unsaved document"
+        ret = QMessageBox.question(
+            self, "Recover unsaved work?",
+            f"A restart at {when} kept unsaved changes to {doc}, but they "
+            "were never reopened.\n\nRestore them?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        if ret != QMessageBox.StandardButton.Yes:
+            self.autosave.discard_handoff()
+            return
+        try:
+            fileio.import_file(self.scene, entry["path"], replace=True)
+            self.ctx.current_path = entry["doc_path"]
+            self.autosave.set_doc_path(entry["doc_path"])
+            self.autosave.discard_handoff()
+            self.command_line.echo(
+                f"Recovered {len(self.scene.all())} object(s) a restart "
+                "had kept.")
+            if not self.apply_view_settings():
+                self.viewport.zoom_extents()
+            self._update_status()
+        except Exception as exc:                              # noqa: BLE001
+            QMessageBox.warning(self, "Recovery failed", str(exc))
+
+    # ---------------------------------------------------------- space tabs
+
+    def _build_space_tab_row(self):
+        """The bottom space-tab strip: Model / sheet tabs plus a '+' button to
+        add a new sheet — click adds A3, the dropdown picks a size or opens the
+        full 'layout' options (custom size, portrait)."""
+        from PySide6.QtWidgets import QHBoxLayout, QMenu, QToolButton, QWidget
+        row = QWidget()
+        row.setObjectName("spaceTabRow")
+        row.setStyleSheet("QWidget#spaceTabRow { background: transparent; }")
+        hl = QHBoxLayout(row)
+        hl.setContentsMargins(0, 0, 0, 0)
+        hl.setSpacing(3)
+        hl.addWidget(self.space_tabs)
+
+        add = QToolButton()
+        # the strip is built after the first refresh, so it starts itself
+        add.setText("+" if self.scene.layouts else "+  New layout")
+        add.setToolTip("New layout: a paper sheet to draft views on")
+        add.setAutoRaise(True)
+        # The whole button opens the menu. It used to make an A3 on click
+        # and only offer a size from the little arrow, so the size you got
+        # depended on which half of a 30-pixel button you hit, and the one
+        # question worth asking went unasked.
+        add.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        add.setStyleSheet(
+            "QToolButton { padding: 1px 8px; background: #212226;"
+            " border: 1px solid #1b1c1f; color: #b9b9bd; font-size: 14px; }"
+            "QToolButton:hover { background: #2f3035; color: #e8e8ea; }"
+            "QToolButton::menu-indicator { image: none; width: 0px; }")
+        menu = QMenu(add)
+        for size in ("A4", "A3", "A2", "A1", "Letter", "Tabloid"):
+            menu.addAction(f"New layout — {size}",
+                           lambda s=size: self._new_sheet(s))
+        menu.addSeparator()
+        menu.addAction("New layout…  (choose size / portrait)",
+                       lambda: self.run_command("layout"))
+        add.setMenu(menu)
+        self.add_space_btn = add
+
+        hl.addWidget(add)
+        hl.addStretch(1)
+        return row
+
+    def _place_space_tabs(self):
+        row = self._space_tab_row
+        row.resize(row.sizeHint())
+        row.move(0, self.viewport_area.height() - row.height())
+        row.raise_()
+        row.show()
+
+    def _new_sheet(self, paper: str = "A3", landscape: bool = True):
+        """Create a new paper-space drafting sheet and switch to it — the '+'
+        button's action, i.e. 'layout' > New in one click."""
+        from .core.layout import PAPER_SIZES, Layout
+        from .utils.units import format_paper_size
+        w, h = PAPER_SIZES.get(paper, PAPER_SIZES["A3"])
+        if not landscape:
+            w, h = h, w
+        lay = Layout(name=f"Layout {len(self.scene.layouts) + 1}",
+                     paper_w=float(w), paper_h=float(h))
+        self.scene.layouts.append(lay)
+        self.scene.notify()
+        self.switch_space(lay.id)
+        self.command_line.echo(
+            f"Created sheet '{lay.name}' "
+            f"({format_paper_size(w, h, self.scene.units)}). "
+            "Use 'detail' to place model views.")
+        return lay
+
+    def _space_below(self, space_id: str, order: list, live: list) -> str:
+        """Where a deleted sheet hands you off to: the next tab down.
+
+        Down rather than home to Model, which is only the right answer for
+        the first sheet. Deleting the third of three leaves you on the
+        second, the way closing a tab does everywhere else, and the sheet
+        you land on is the one that was next to the work you were doing.
+        Model sits at the bottom and cannot be deleted, so walking down
+        always lands somewhere.
+        """
+        if space_id in order:
+            for below in reversed(order[:order.index(space_id)]):
+                if below in live:
+                    return below
+        return "model"
+
+    def _refresh_space_tabs(self):
+        self._tabs_updating = True
+        # Read the strip before rebuilding it: the order the tabs were in
+        # is the only record of which sheet sat below a deleted one.
+        order = [self.space_tabs.tabData(i)
+                 for i in range(self.space_tabs.count())]
+        want = [("model", "Model")] + [(lay.id, sheet_label(lay))
+                                       for lay in self.scene.layouts]
+        # A drafting sheet is the one thing you would never guess was
+        # behind a `+`, so the button says so until you have made one.
+        # Runs before the strip is built, on the first call of all.
+        add = getattr(self, "add_space_btn", None)
+        if add is not None:
+            add.setText("+" if self.scene.layouts else "+  New layout")
+        while self.space_tabs.count() > len(want):
+            self.space_tabs.removeTab(self.space_tabs.count() - 1)
+        while self.space_tabs.count() < len(want):
+            self.space_tabs.addTab("")
+        live = [w[0] for w in want]
+        for stale in [s for s in list(self._space_states) if s not in live]:
+            self._forget_space(stale)
+        # A pane pointed at a deleted sheet has nothing left to draw, and a
+        # pane nobody asks to redraw keeps the last frame it drew: the sheet
+        # stays on screen after the sheet is gone. Panes are moved off it
+        # here rather than in the deleting, so undo and the `layout` command
+        # are covered along with the tab menu. set_space repaints.
+        for vp in self.all_viewports():
+            if vp.space not in live:
+                vp.set_space(self._space_below(vp.space, order, live))
+        if self.space not in live:
+            # The sheet you were standing on was deleted, by undo or by the
+            # `layout` command. Clearing the flag first: switch_space ends by
+            # calling this again, and it would otherwise find it set.
+            self._tabs_updating = False
+            self.switch_space(self._space_below(self.space, order, live))
+            return
+        current_index = 0
+        for i, (space_id, label) in enumerate(want):
+            self.space_tabs.setTabText(i, label)
+            self.space_tabs.setTabData(i, space_id)
+            if space_id == self.space:
+                current_index = i
+        self.space_tabs.setCurrentIndex(current_index)
+        self._tabs_updating = False
+
+    # ------------------------------------------- renaming / deleting a sheet
+
+    def _layout_at_tab(self, index: int):
+        """The sheet tab `index` stands for, or None if it is not a sheet."""
+        if index < 0:
+            return None
+        space_id = self.space_tabs.tabData(index)
+        return next((l for l in self.scene.layouts if l.id == space_id), None)
+
+    def _layout_tab_menu(self, index: int):
+        """The right-click menu for a sheet tab, or None where there is none.
+
+        Model is not a sheet — there is nothing to rename it to and nowhere
+        to go without it — so it gets no menu rather than a menu of words
+        greyed out. The menu closes over the layout itself, not the tab
+        number, so a sheet arriving or leaving mid-click cannot slide the
+        answer along to its neighbour.
+        """
+        lay = self._layout_at_tab(index)
+        if lay is None:
+            return None
+        menu = QMenu(self.space_tabs)
+        menu.addAction("Rename…", lambda: self.rename_layout(lay))
+        menu.addAction("Duplicate", lambda: self.duplicate_layout(lay))
+        menu.addAction("Delete", lambda: self.delete_layout(lay))
+        return menu
+
+    def _space_tab_menu(self, pos):
+        menu = self._layout_tab_menu(self.space_tabs.tabAt(pos))
+        if menu is not None:
+            menu.exec(self.space_tabs.mapToGlobal(pos))
+
+    def rename_layout(self, lay, new_name: str | None = None) -> bool:
+        """Rename a sheet, asking for the name if not given one."""
+        if new_name is None:
+            from PySide6.QtWidgets import QInputDialog
+            new_name, ok = QInputDialog.getText(
+                self, "Rename layout", "Layout name:", text=lay.name)
+            if not ok:
+                return False
+        new_name = new_name.strip()
+        if not new_name or new_name == lay.name:
+            return False
+        self.history.checkpoint("rename layout")
+        lay.name = new_name
+        self.scene.notify("layouts")
+        self.command_line.echo(f"Renamed layout to '{new_name}'.")
+        return True
+
+    def duplicate_layout(self, lay):
+        """Copy a sheet, drawing and all, and open the copy.
+
+        Opening it follows the `+` button rather than `layout` > Duplicate,
+        which leaves you where you were: a copy you made by hand is a copy
+        you are about to change.
+        """
+        from .core import clipping
+        from .core.layout import unique_layout_name
+        self.history.checkpoint("duplicate layout")
+        dup = lay.duplicate(
+            unique_layout_name(self.scene.layouts, f"{lay.name} copy"))
+        clipping.carry_views(self.scene, lay.copied_details(dup))
+        self.scene.layouts.append(dup)
+        self.scene.notify("layouts")
+        self.switch_space(dup.id)
+        self.command_line.echo(f"Duplicated as '{dup.name}'.")
+        return dup
+
+    def _confirm_layout_delete(self, lay) -> bool:
+        reply = QMessageBox.question(
+            self, "Delete layout",
+            f"Delete '{lay.name}'?\n\nThere is work on this sheet.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No)
+        return reply == QMessageBox.StandardButton.Yes
+
+    def print_sheets(self, ids=None):
+        """Open the print dialog on these sheets (None: the open one)."""
+        from .ui.print_dialog import PrintDialog
+        PrintDialog(self, ids).exec()
+
+    def delete_layout(self, lay) -> bool:
+        """Delete a sheet, asking first if anything has been put on it.
+
+        An empty sheet is one click to make and goes on one click; a sheet
+        with drawing on it is worth a question. Both are undoable, and the
+        asking happens before the checkpoint so that answering no does not
+        spend the undo step belonging to whatever came before.
+        """
+        if not lay.is_empty() and not self._confirm_layout_delete(lay):
+            return False
+        self.history.checkpoint("delete layout")
+        self.scene.layouts.remove(lay)
+        # the refresh drops the tab, and moves anything still looking at the
+        # sheet down to the tab below it
+        self.scene.notify("layouts")
+        self.command_line.echo(f"Deleted layout '{lay.name}'.")
+        return True
+
+    def _space_exists(self, space_id: str) -> bool:
+        return space_id == "model" or any(l.id == space_id
+                                          for l in self.scene.layouts)
+
+    def _forget_space(self, space_id: str):
+        """Drop what was remembered about a sheet that has gone."""
+        self._space_states.pop(space_id, None)
+
+    def _space_tab_changed(self, index: int):
+        if self._tabs_updating or index < 0:
+            return
+        space_id = self.space_tabs.tabData(index)
+        if space_id and space_id != self.space:
+            self.switch_space(space_id)
+
+    def switch_space(self, space_id: str):
+        """Show the arrangement of panes that belongs to a space tab.
+
+        A space used to be a setting on one pane and nothing more, so
+        opening a sheet turned whichever pane happened to be active into
+        paper and left the others in model space beside it — and if that
+        pane was tabbed away behind another, pressing the button changed
+        nothing you could see. A tab is an arrangement now. The main pane
+        draws the space the tab names, the panes that were on the tab you
+        left are put away rather than repurposed, and each tab hands back
+        the arrangement you left it in, splitters and all.
+        """
+        if self.processor.busy:
+            self.processor.cancel()
+        # Nothing is remembered about a tab that has just gone: leaving the
+        # sheet you deleted would otherwise file its arrangement again on
+        # the way out, under an id no tab will ever ask for.
+        if space_id != self.space and self._space_exists(self.space):
+            self._space_states[self.space] = self.viewport_area.saveState()
+        self.space = space_id
+        self.viewport.set_space(space_id)
+        self._update_viewport_dock_title(self.viewport)
+        remembered = self._space_states.get(space_id)
+        if remembered is not None:
+            self.viewport_area.restoreState(remembered)
+        elif space_id == "model":
+            self.set_view_layout("quad" if len(self.aux_docks) == 3
+                                 else "single")
+        else:
+            # A sheet opens as the sheet, filling the area. Put a model pane
+            # beside it if you want one and the tab will keep it there.
+            self._show_only(self.viewport)
+        # Ask for the frame once the docks have stopped moving, never
+        # before: a dock put away and brought back loses the repaint it was
+        # waiting on, and a pane shown with none pending does not draw one.
+        # It blits whatever its buffer still holds, which is the space you
+        # just left. Only the panes on show — a pane put away has nowhere
+        # to draw, and gets its frame when the tab brings it back.
+        for pane in self.all_viewports():
+            pane.update()
+        self._set_active_viewport(self._pane_for_space(space_id))
+        self._refresh_space_tabs()
+        self.sheets_panel.set_open(space_id)
+        if space_id == "model":
+            self.command_line.echo("Model space.")
+        else:
+            lay = next((l for l in self.scene.layouts
+                        if l.id == space_id), None)
+            if lay:
+                self.command_line.echo(
+                    f"Layout '{lay.name}' — 'detail' places a model view, "
+                    "'text'/'dim' annotate, double-click a detail to enter "
+                    "it.")
+        self._update_status()
+        self.properties.refresh()       # different space, different selection
+
+    def _show_only(self, vp):
+        """That pane, and nothing else, filling the viewport area."""
+        keep = vp.parentWidget()
+        for dock in self._viewport_docks():
+            if dock is keep:
+                if dock.isFloating():
+                    dock.setFloating(False)
+                dock.show()
+            else:
+                dock.hide()
+
+    def _pane_for_space(self, space_id: str):
+        """Which pane the commands should be aimed at on this tab.
+
+        The main one when it is showing, since it is the one the tab just
+        pointed at the space; otherwise whatever else is drawing the space,
+        and failing that whatever you can see.
+        """
+        alive = self.all_viewports()
+        for vp in (self.viewport, *alive):
+            if vp in alive and vp.space == space_id:
+                return vp
+        return alive[0]
+
+    def set_pane_space(self, vp, space_id: str):
+        """Point one pane at a space without moving the window to it.
+
+        The tabs are workspaces, but a space is still a property of a pane
+        underneath them, so a sheet can be put in a pane beside a model
+        view. Rhino has no arrangement like it.
+        """
+        vp.set_space(space_id)
+        self._update_viewport_dock_title(vp)
+        if vp is self.active_viewport:
+            self._update_status()
+            self.properties.refresh()
+
+    # ------------------------------------------------------------- settings
+
+    def _toggle_console(self):
+        self.command_workspace.toggle_script()
+
+    def _show_settings(self):
+        from .ui.settings_dialog import SettingsDialog
+        SettingsDialog(self).exec()
+
+    def apply_user_aliases(self):
+        from .commands import base as cmd_base
+        current = self.cfg.get("aliases", default={}) or {}
+        previous = getattr(self, "_applied_aliases", {})
+        for alias in previous:
+            if alias not in current:
+                cmd_base.remove_alias(alias)
+        for alias, target in current.items():
+            cmd_base.add_alias(alias, target)
+        self._applied_aliases = dict(current)
+
+    def apply_user_shortcuts(self):
+        from PySide6.QtGui import QShortcut
+        for sc in self._user_shortcuts:
+            sc.setParent(None)
+            sc.deleteLater()
+        self._user_shortcuts = []
+        wanted = {}
+        for key, command in (self.cfg.get("shortcuts",
+                                          default={}) or {}).items():
+            seq = QKeySequence(key)
+            if seq.isEmpty():
+                continue
+            wanted[seq.toString()] = command.strip().lower()
+        # The configuration owns every keyboard binding. Menu actions own
+        # their Qt shortcuts so showing a key never installs it twice.
+        for command, act in self._shortcut_actions.items():
+            act.setShortcuts([QKeySequence(key) for key, target in wanted.items()
+                              if target == command])
+        for key_text, command in wanted.items():
+            if command in self._shortcut_actions:
+                continue
+            sc = QShortcut(QKeySequence(key_text), self)
+            sc.activated.connect(
+                lambda c=command: self._activate_shortcut(c))
+            self._user_shortcuts.append(sc)
+        self._keyboard_bindings = wanted
+
+    def _activate_shortcut(self, command):
+        action = self._shortcut_actions.get(command)
+        if action is not None:
+            action.trigger()
+        else:
+            self.run_command(command)
+
+    # ------------------------------------------------------------------ misc
+
+    def _show_commands(self):
+        names = ", ".join(c.name for c in cmd_pkg.all_commands())
+        self.command_line.echo(f"Commands: {names}")
+
+    def _make_default_app(self):
+        from .utils import file_assoc
+        _, message = file_assoc.make_default()
+        self.command_line.echo(message)
+
+    def _remove_from_desktop(self):
+        from .utils import file_assoc
+        _, message = file_assoc.remove_from_desktop()
+        self.command_line.echo(message)
+
+    def _about(self):
+        from .ui.about import AboutDialog
+        AboutDialog(self).exec()
+
+    # -- update notifier -------------------------------------------------
+    def start_update_check(self):
+        """Kick off a background check for a newer release (launch-time).
+        Non-blocking and fail-silent; skipped when turned off/headless."""
+        import os
+        if self.cfg.get("check_updates", default=True) is False:
+            return
+        if os.environ.get("BYRD3D_NO_UPDATE_CHECK") == "1":
+            return
+        from PySide6.QtWidgets import QApplication
+        if QApplication.platformName() in ("offscreen", "minimal", "vnc"):
+            return                           # headless/automation: no network
+        import platform
+        import threading
+        from . import __version__
+        from .utils.updates import check_for_update
+
+        def worker():
+            rel = check_for_update(__version__, platform.system())
+            if rel:
+                self.updateAvailable.emit(rel)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_update_available(self, rel):
+        """Main-thread slot: a newer release was found on launch."""
+        self._pending_update = rel
+        # A permanent widget: a timed message is wiped by the next status
+        # refresh or menu hover, so the notice was gone before anyone saw it.
+        if getattr(self, "_update_button", None) is None:
+            from PySide6.QtWidgets import QPushButton
+            self._update_button = QPushButton()
+            self._update_button.setFlat(True)
+            self._update_button.setCursor(Qt.CursorShape.PointingHandCursor)
+            self._update_button.clicked.connect(self._open_update_notice)
+            self.statusBar().addPermanentWidget(self._update_button)
+        self._update_button.setText(
+            f"Blackbyrd3D {rel['version']} is available")
+        self._update_button.setToolTip("Download or read the release notes")
+        self._update_button.show()
+
+    def _open_update_notice(self):
+        """The notice has done its job once clicked: the download dialog
+        says the rest, and it is not left standing in the status bar."""
+        self._update_button.hide()
+        self._check_updates_manual()
+
+    def _check_updates_manual(self):
+        """Help ▸ Check for Updates: synchronous, always reports back."""
+        import platform
+        from . import __version__
+        from .utils.updates import check_for_update
+        rel = self._pending_update or check_for_update(
+            __version__, platform.system())
+        self._show_update_result(rel)
+
+    def _show_update_result(self, rel):
+        from PySide6.QtCore import QUrl
+        from PySide6.QtGui import QDesktopServices
+        from . import __version__
+        if not rel:
+            QMessageBox.information(
+                self, "Blackbyrd3D",
+                f"You’re up to date — v{__version__} is the latest release.")
+            return
+        box = QMessageBox(self)
+        box.setWindowTitle("Update available")
+        box.setText(f"<b>Blackbyrd3D {rel['version']}</b> is available.")
+        box.setInformativeText(f"You have v{__version__}.")
+        dl = box.addButton("Download", QMessageBox.ButtonRole.AcceptRole)
+        notes = box.addButton("Release Notes",
+                              QMessageBox.ButtonRole.ActionRole)
+        box.addButton("Later", QMessageBox.ButtonRole.RejectRole)
+        box.exec()
+        clicked = box.clickedButton()
+        url = None
+        if clicked is dl:
+            url = rel.get("download") or rel.get("url")
+        elif clicked is notes:
+            url = rel.get("url")
+        if url:
+            QDesktopServices.openUrl(QUrl(url))
+
+    # Past this many picked curves, a select-all on a big import would
+    # cover the screen in markers nobody asked for.
+    AUTO_POINTS_UP_TO = 50
+
+    def _show_selected_points(self):
+        """A curve picked by a click on it shows its control points, ready
+        to pick, and they go again when the selection lets go of it. One
+        caught in a window or picked any other way shows none: a band over
+        a drawing would cover it in markers. A curve with one of its
+        points held stays on, since picking a point lets go of the curve.
+
+        Only what the selection itself changed is acted on: Escape hiding
+        the points of a curve still picked is not undone by the next notify.
+        Curves a running command picks show nothing, or the points would
+        catch the clicks meant for the next curve.
+        """
+        sel, scene = self.selection, self.scene
+        self._clicked_curves &= set(sel.ids)
+        from .core.geometry import has_control_points
+        curves = [o.id for o in sel.objects()
+                  if o.kind == "curve" and o.id in self._clicked_curves
+                  and has_control_points(o.shape)]
+        wanted = set(curves) if len(curves) <= self.AUTO_POINTS_UP_TO \
+            else set()
+        wanted.update(oid for oid, kind, _i in sel.subobjects
+                      if kind == "cv" and oid in scene.objects)
+        gained = set() if self.processor.busy \
+            else wanted - self._points_wanted
+        lost = self._points_wanted - wanted
+        self._points_wanted = wanted
+        changed = False
+        for oid in lost & scene.cv_auto:
+            scene.cv_auto.discard(oid)
+            scene.cv_enabled.discard(oid)
+            changed = True
+        for oid in gained - scene.cv_enabled:
+            scene.cv_enabled.add(oid)
+            scene.cv_auto.add(oid)
+            changed = True
+        if changed:
+            for vp in self.all_viewports():
+                vp.update()
+
+    def statusBar(self):
+        return self._status_line
+
+    def _update_status(self):
+        n = len(self.scene.all())
+        # On a sheet, what is picked lives in the layout view; a readout
+        # stuck on "0 selected" is most of why picking looked broken there.
+        sel = len(self.selection.ids)
+        if self.viewport.space != "model":
+            lv = self.viewport.layout_view
+            # Except inside a detail, which is a window into the model: what a
+            # click in there picks is a model object, and the model's count is
+            # the one to show.
+            if lv._entered() is None:
+                # A corner is a smaller thing than the detail it belongs to, so
+                # say which of the two the count is about.
+                picked = len(lv.corners)
+                sel = (f"{picked} corner{'' if picked == 1 else 's'}"
+                       if picked else len(lv.selected))
+        mode = self.viewport.display_mode
+        layer = self.scene.layers.current.name
+        filt = ""
+        if self.selection.filter_active and self.selection.filter_kinds:
+            filt = ("  ·  filter: "
+                    + ", ".join(sorted(self.selection.filter_kinds)))
+        self.statusBar().showMessage(
+            f"{n} object(s)  ·  {sel} selected  ·  layer: {layer}  ·  "
+            f"{mode}  ·  units: {self.scene.units}{filt}")
+        path = getattr(self.ctx, "current_path", None)
+        name = os.path.basename(path) if path else "untitled"
+        star = "*" if getattr(self, "autosave", None) and self.dirty else ""
+        self.setWindowTitle(f"{name}{star} — {APP_TITLE}")
+        self._title_bar.set_document_title(f"{name}{star}")
+
+    def _match_user_shortcut(self, ev) -> bool:
+        try:
+            pressed = QKeySequence(ev.keyCombination())
+        except Exception:
+            return False
+        for key, cmd in self._keyboard_bindings.items():
+            seq = QKeySequence(key)
+            if not seq.isEmpty() and seq.matches(pressed) == \
+                    QKeySequence.SequenceMatch.ExactMatch:
+                self._activate_shortcut(cmd)
+                return True
+        return False
+
+    def _text_editor_has_focus(self):
+        # This window's own focus, not the application's. In the app the
+        # two are the same widget, since a key only climbs to here from
+        # inside this window. A key sent straight to a widget, as a test
+        # sends it, is not: asking QApplication then let a field left
+        # focused in some other window swallow this one's Enter, and the
+        # viewport stopped repeating the last command.
+        field = self.focusWidget()
+        return (isinstance(field, (QLineEdit, QPlainTextEdit, QTextEdit))
+                and not field.isReadOnly()
+                and field is not getattr(
+                    getattr(self, "command_line", None), "input", None))
+
+    def keyPressEvent(self, ev):
+        # Native editor shortcuts have already had their chance. An editor's
+        # ignored key must not fall through to the model shortcut fallback.
+        # Read-only history still participates in normal window shortcuts.
+        if self._text_editor_has_focus():
+            ev.accept()
+            return
+        if self._match_user_shortcut(ev):
+            ev.accept()
+            return
+        # Alt+A answers the running command's All keyword, when it offers
+        # one: CurveBoolean's way to keep every region in one press. The
+        # word is on a clickable chip too, and typing it works the same.
+        if (ev.modifiers() & Qt.KeyboardModifier.AltModifier
+                and not ev.modifiers() & Qt.KeyboardModifier.ControlModifier
+                and ev.key() == Qt.Key.Key_A):
+            req = self.processor.request
+            if req is not None and "All" in getattr(req, "extra_options", ()):
+                self.processor.provide_text("All")
+                ev.accept()
+                return
+        # any printable key focuses the command line (Rhino behaviour)
+        text = ev.text()
+        if self.command_workspace.mode == "ai":
+            # The explicit destination also owns typing forwarded from a
+            # viewport or history. Hidden CAD drafts must never receive it.
+            field = self.command_workspace.assistant.input
+            if ev.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+                self.command_workspace.submit()
+                ev.accept()
+                return
+            if ev.key() == Qt.Key.Key_Escape:
+                field.clear()
+                ev.accept()
+                return
+            if text and text.isprintable() and not ev.modifiers() & (
+                    Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.AltModifier):
+                field.setFocus()
+                if field.isEnabled():
+                    field.insertPlainText(text)
+                ev.accept()
+                return
+        if (text and text.isprintable()
+                and not ev.modifiers() & (
+                    Qt.KeyboardModifier.ControlModifier
+                    | Qt.KeyboardModifier.AltModifier
+                    | Qt.KeyboardModifier.MetaModifier)
+                and not self.command_line.input.hasFocus()):
+            self.command_line.focus()
+            self.command_line.input.insert(text)
+            return
+        if ev.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter, Qt.Key.Key_Space):
+            if not self.processor.busy and self.processor.last_command:
+                self.run_command(self.processor.last_command)
+                return
+        super().keyPressEvent(ev)
+
+
+from PySide6.QtWidgets import QWidget
+
+
+class _SpaceTabs(QTabBar):
+    """The Model / sheet tabs, asking for no more room than the tabs need.
+
+    A tab bar's minimum width is the room its scroll buttons would want,
+    which it asks for whether or not there is anything to scroll. Holding
+    the one `Model` tab it still demanded fifty pixels more than the tab,
+    and the strip put those pixels between the tab and the `+` next to it.
+    Where the tabs are narrower than that floor there is nothing to scroll,
+    so the floor is the tabs; where they are wider the floor stands and the
+    scroll buttons still turn up when the strip runs out of room.
+    """
+
+    def minimumSizeHint(self):
+        floor = super().minimumSizeHint()
+        fits = self.sizeHint()
+        return fits if fits.width() < floor.width() else floor
+
+
+class _FootBar(QStatusBar):
+    """The window's foot, holding the command area edge to edge.
+
+    QStatusBar pads its items with spacers and deletes and rebuilds its
+    layout whenever an item comes or goes. Zeroing those spacers from
+    Python held wrappers to layout items Qt had already freed, and on
+    Linux that crashed at startup. So the widgets live in a row of our
+    own, laid over the whole bar, and Qt's layout stays empty."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        from PySide6.QtWidgets import QHBoxLayout
+        self._row = QWidget(self)
+        row = QHBoxLayout(self._row)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(0)
+
+    def addPermanentWidget(self, widget, stretch=0):
+        self._row.layout().addWidget(widget, stretch)
+        self.updateGeometry()
+
+    def sizeHint(self):
+        return self._row.sizeHint()
+
+    def minimumSizeHint(self):
+        return self._row.minimumSizeHint()
+
+    def event(self, ev):
+        if ev.type() == QEvent.Type.LayoutRequest:
+            self.updateGeometry()
+        return super().event(ev)
+
+    def resizeEvent(self, ev):
+        super().resizeEvent(ev)
+        self._row.setGeometry(self.rect())
+
+
+class _ViewportTitleBar(QWidget):
+    """A viewport's title, which is also its menu.
+
+    Four viewports and a display-mode menu had both shipped when GitHub #5
+    asked for them, which says where they were: down the View menu, acting
+    on whichever pane was last clicked. Here the title names what this pane
+    is showing and clicking it changes this pane.
+    """
+
+    def __init__(self, win, vp, dock, closable: bool):
+        super().__init__()
+        from PySide6.QtWidgets import QHBoxLayout, QToolButton
+        self._win = win
+        self._vp = vp
+        row = QHBoxLayout(self)
+        row.setContentsMargins(4, 1, 4, 1)
+        row.setSpacing(2)
+
+        self.button = QToolButton(self)
+        self.button.setAutoRaise(True)
+        self.button.setToolTip("Right-click: view, display mode and layout "
+                               "for this pane\n"
+                               "Double-click: maximize or back to four "
+                               "viewports")
+        # Qt's own menu indicator lands as a speck on the text baseline; a
+        # caret in the label reads as something to click.
+        self.button.setStyleSheet(
+            "QToolButton::menu-indicator { image: none; width: 0 }"
+            "QToolButton { padding: 1px 6px; border-radius: 4px }")
+        # Built on the way open, so the checkmarks are current rather than
+        # whatever was true when the dock was made.
+        self._menu = QMenu(self)
+        self._menu.aboutToShow.connect(self._rebuild)
+        # A right-click opens it, as on a Rhino viewport title; a left click
+        # is left free for the double-click that maximizes.
+        for widget in (self, self.button):
+            widget.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+            widget.customContextMenuRequested.connect(
+                lambda pos, w=widget: self._menu.popup(w.mapToGlobal(pos)))
+        self.button.installEventFilter(self)
+        row.addWidget(self.button)
+        # The stretch is the drag handle: a bare QWidget ignores a press, so
+        # it reaches the dock underneath and the pane still tears off.
+        row.addStretch(1)
+
+        if closable:
+            close = QToolButton(self)
+            close.setAutoRaise(True)
+            close.setText("✕")
+            close.setToolTip("Close this viewport")
+            close.clicked.connect(dock.close)
+            row.addWidget(close)
+
+        vp.viewChanged.connect(lambda _name: self.refresh())
+        vp.displayModeChanged.connect(self.refresh)
+        self.refresh()
+
+    def mouseDoubleClickEvent(self, ev):
+        """Rhino maximises a pane on a double-click of its title, and a
+        custom title bar is the only reason Qt is not floating the dock
+        instead."""
+        self._win.toggle_maximized_viewport(self._vp)
+        ev.accept()
+
+    def eventFilter(self, obj, ev):
+        if (obj is self.button
+                and ev.type() == QEvent.Type.MouseButtonDblClick
+                and ev.button() == Qt.MouseButton.LeftButton):
+            self._win.toggle_maximized_viewport(self._vp)
+            return True
+        return False
+
+    def _rebuild(self):
+        self._menu.clear()
+        self._win._viewport_menu(self._vp, into=self._menu)
+
+    def refresh(self):
+        self.button.setText(self._win._viewport_title(self._vp) + "  ▾")
+
+
+def _rhino_clipboard_format(mime) -> str | None:
+    """The clipboard format holding objects copied in Rhino, the newest
+    version offered, or None. Rhino offers a .3dm per version it can write
+    ("Rhino 7 3DM Geometry", "Rhino 6 3DM Geometry", ...)."""
+    if mime is None:
+        return None
+    import re
+    offered = []
+    for fmt in mime.formats():
+        found = re.search(r"Rhino\s*(\d+)\s*3DM", fmt, re.IGNORECASE)
+        if found:
+            offered.append((int(found.group(1)), fmt))
+    return max(offered)[1] if offered else None
+
+
+def _selftest() -> int:
+    """Verify a packaged install without opening a window: Qt platform
+    plugin, OCCT kernel, and file I/O. Windowed executables on Windows
+    have no console, so the report also goes to a file."""
+    import tempfile
+    lines = []
+    try:
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        qt_app = QApplication.instance() or QApplication([])
+        lines.append(f"qt: {qt_app.platformName()}")
+        from .core import geometry as g
+        from .core.scene import Scene
+        scene = Scene()
+        obj = scene.add(g.make_box((0, 0, 0), 10, 10, 10), name="Box")
+        scene.replace_shape(obj.id, g.fillet_edges(obj.shape, radius=1.0))
+        with tempfile.TemporaryDirectory() as tmp:
+            step = os.path.join(tmp, "selftest.step")
+            fileio.export_file(scene, step)
+            lines.append(f"step: {os.path.getsize(step)} bytes")
+        vol = g.volume(scene.all()[0].shape)
+        lines.append(f"volume: {vol:.1f}")
+        # SketchUp's reader, which a bundle can leave behind without
+        # anything else noticing; its core loads the compiled triangulator
+        import openskp
+        import openskp._core
+        lines.append(f"skp: openskp {openskp.__version__}")
+        ok = abs(vol - 975.6) < 1.0
+        lines.append("SELFTEST OK" if ok else "SELFTEST FAILED: bad volume")
+    except Exception as exc:                                  # noqa: BLE001
+        ok = False
+        lines.append(f"SELFTEST FAILED: {type(exc).__name__}: {exc}")
+    report = "\n".join(lines) + "\n"
+    try:
+        print(report, end="")
+    except Exception:                                         # noqa: BLE001
+        pass                        # windowed exe: stdout may be closed
+    path = os.path.join(tempfile.gettempdir(), "byrd3d-selftest.txt")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(report)
+    return 0 if ok else 1
+
+
+class FileOpenRelay(QObject):
+    """macOS hands a double-clicked document over as a QFileOpenEvent on
+    the application, never argv — without this relay the Finder
+    association would only ever open an empty window."""
+
+    def __init__(self, window):
+        super().__init__(window)
+        self._window = window
+
+    def eventFilter(self, obj, ev):
+        if ev.type() == QEvent.Type.FileOpen and ev.file():
+            self._window._open_path(ev.file())
+            return True
+        return super().eventFilter(obj, ev)
+
+
+def _offer_default_app(window):
+    """One launch-time ask to own .byrd files. 'Not now' asks again next
+    launch; the other two answers settle it for good."""
+    from PySide6.QtWidgets import QMessageBox
+
+    from .utils import file_assoc
+    box = QMessageBox(window)
+    box.setWindowTitle("Default application")
+    box.setText("Make Blackbyrd3D the default application "
+                "for .byrd and .wyrm files?")
+    if sys.platform.startswith("linux"):
+        box.setInformativeText("This also puts Blackbyrd3D in the app menu, "
+                               "and gives its files their icons.")
+    elif sys.platform == "win32":
+        box.setInformativeText("Windows keeps the choice in Settings — "
+                               "this opens the right page.")
+    elif sys.platform == "darwin":
+        box.setInformativeText("macOS keeps the choice in Finder — "
+                               "this shows the steps.")
+    make = box.addButton("Make default", QMessageBox.ButtonRole.AcceptRole)
+    box.addButton("Not now", QMessageBox.ButtonRole.RejectRole)
+    never = box.addButton("Don't ask again",
+                          QMessageBox.ButtonRole.DestructiveRole)
+    box.setDefaultButton(make)
+    box.exec()
+    clicked = box.clickedButton()
+    if clicked is make:
+        window.cfg.set("file_assoc", "asked", True)
+        _, message = file_assoc.make_default()
+        window.command_line.echo(message)
+    elif clicked is never:
+        window.cfg.set("file_assoc", "asked", True)
+
+
+# How long after the window is up to look for the viewport's context: long
+# enough for a slow window manager to map it and Qt to make one, short enough
+# that a blank window is explained before anybody gives up on it.
+OPENGL_CHECK_MS = 2000
+
+_OPENGL_FAILED = (
+    "Blackbyrd3D could not get OpenGL from the graphics driver, so the "
+    "drawing area cannot be shown.\n\n"
+    "If the graphics driver has just been updated, restart the computer: "
+    "the new driver only works once the old one is no longer loaded. "
+    "Otherwise, reinstall or update the graphics driver.")
+
+
+def warn_if_opengl_failed(window, splash=None) -> bool:
+    """Say so when the viewport never got an OpenGL context.
+
+    A driver that refuses a context leaves a window that never paints, the
+    windows behind it showing through, and the reason only in the system
+    log. Returns whether it failed. The box needs no OpenGL; headless, the
+    reason goes to stderr only, so nothing waits on a box nobody sees. The
+    splash goes first: it waits for the window to paint, which it never
+    will, and would sit there saying Ready.
+    """
+    if window.viewport.isValid():
+        return False
+    if splash is not None:
+        splash.close()
+    print(f"byrd3d: {_OPENGL_FAILED}", file=sys.stderr)
+    if QApplication.platformName() not in ("offscreen", "minimal", "vnc"):
+        QMessageBox.warning(window, "OpenGL could not start", _OPENGL_FAILED)
+    return True
+
+
+def run_app(app, splash=None):
+    """Build the main window and run the event loop.
+
+    `app` is an already-created QApplication; `splash` is an optional
+    SplashScreen already on screen (see blackbyrd3d.launcher, which shows
+    it before the geometry kernel imports so it covers the slow cold start).
+    """
+    app.setApplicationName(APP_TITLE)
+    # GNOME matches windows to the launcher (icon, grouping, pinning)
+    # by this name — must equal the installed blackbyrd3d.desktop
+    app.setDesktopFileName("blackbyrd3d")
+    from .ui.brand import app_icon
+    app.setWindowIcon(app_icon())
+    app.setStyleSheet(theme.stylesheet())
+    from .ui import tooltips
+    tooltips.install(app)
+    from .ui import smooth_scroll
+    smooth_scroll.install(app)
+
+    # The saved interface font, on before any window is built.
+    theme.apply_saved_interface_font(app)
+
+    if splash:
+        splash.message("Preparing workspace…", 0.7)
+    window = MainWindow()
+    if sys.platform == "darwin":
+        # Only macOS sends a QFileOpenEvent. Elsewhere the filter only cost
+        # a Python call per event, and Qt's own threads crashed in it.
+        app.installEventFilter(FileOpenRelay(window))
+
+    # RPC bridge for the MCP server (unless disabled)
+    if os.environ.get("BYRD3D_NO_RPC") != "1":
+        from .rpc import RpcServer
+        window._rpc = RpcServer(window)
+        window._rpc.start()
+
+    template = os.path.expanduser("~/.config/blackbyrd3d/template.byrd")
+    if not os.path.exists(template):
+        template = template[:-len(".byrd")] + ".serp"
+    if os.path.exists(template):
+        try:
+            fileio.import_file(window.scene, template, replace=True)
+            window.apply_view_settings()
+            window.mark_saved()
+            window.command_line.echo(
+                f"Started from {os.path.basename(template)}.")
+        except Exception:                                     # noqa: BLE001
+            pass
+
+    from .plugins import load_plugins
+    loaded = load_plugins(window)
+    if loaded:
+        window.command_line.echo("Plugins: " + ", ".join(loaded))
+
+    if splash:
+        splash.message("Ready", 1.0)
+    if window.cfg.get("window", "geometry", default=""):
+        window.show()
+    else:
+        window.showMaximized()          # first launch
+    if splash:
+        splash.finish(window)
+    QTimer.singleShot(OPENGL_CHECK_MS,
+                      lambda: warn_if_opengl_failed(window, splash))
+    window.offer_recovery()
+
+    _open_launch_args(window, app.arguments()[1:])
+    window.offer_handoff()
+    if not window.scene.all() and not getattr(window.ctx, "current_path",
+                                              None):
+        # started on nothing: a new document, and it opens as one does
+        window.show_perspective_alone()
+
+    from .ui.welcome import WelcomeScreen, should_show as _welcome
+    from .utils import file_assoc
+
+    file_assoc.follow_the_appimage()
+
+    def after_welcome():
+        if file_assoc.should_offer(window.cfg):
+            _offer_default_app(window)
+
+    if _welcome(window):
+        # Not modal: the window stays closable behind it, and takes the
+        # screen with it when it goes.
+        window._welcome = WelcomeScreen(window)
+        window._welcome.finished.connect(lambda _r: after_welcome())
+        window._welcome.show()
+    else:
+        after_welcome()
+    window.start_update_check()
+    return app.exec()
+
+
+def _opens_as_new(path: str) -> bool:
+    """Whether Open makes a new document of `path` rather than adding it."""
+    return path.lower().endswith(".3dm")
+
+
+def _open_launch_args(window, args: list[str]):
+    """Open the first existing file the command line names: a double-
+    clicked document, `byrd3d file.byrd`, or a scale restart's handoff."""
+    for arg in args:
+        if (not arg.startswith("-") and os.path.exists(arg)
+                and arg.lower().endswith(".wyrm")):
+            window.show_wyrm().open_path(arg)
+            break
+        if not arg.startswith("-") and os.path.exists(arg):
+            try:
+                # a restart handoff is taken up on arrival: reopened under
+                # the name it was handed over with, and spent
+                handoff = None
+                if os.path.abspath(arg) == os.path.abspath(
+                        window.autosave.handoff_path):
+                    handoff = window.autosave.waiting_handoff()
+                # behind the same card as File > Open: a double-clicked
+                # drawing is opened while the window is already up
+                window._import_showing_progress(arg, replace=True)
+                if handoff is not None:
+                    window.ctx.current_path = handoff["doc_path"]
+                    window.autosave.discard_handoff()
+                    window.command_line.echo(
+                        "Restarted at the new interface scale. Unsaved "
+                        "changes were kept.")
+                else:
+                    if arg.endswith(".byrd"):
+                        window.ctx.current_path = os.path.abspath(arg)
+                    window.command_line.echo(
+                        f"Opened {arg}: {len(window.scene.all())} object(s).")
+                if not window.apply_view_settings():
+                    window.viewport.zoom_extents()
+                if handoff is not None:
+                    if handoff["doc_path"]:
+                        window.add_recent(handoff["doc_path"])
+                else:
+                    # as from File → Open: what is on disk is what is
+                    # open; only a handoff's work is still unsaved
+                    window.mark_saved()
+                    window.add_recent(arg)
+            except fileio.Cancelled:
+                window.command_line.echo("Open cancelled.")
+            except Exception as exc:                          # noqa: BLE001
+                window.command_line.echo(f"Could not open {arg}: {exc}")
+            break
+
+
+def _restart_command() -> list[str]:
+    """The argv that starts this app again, wherever it runs from.
+
+    An AppImage names itself in $APPIMAGE, and re-running it reproduces
+    the whole environment. A frozen bundle without the variable is its
+    own executable. In development the interpreter runs the package
+    module directly.
+    """
+    bundle = os.environ.get("APPIMAGE")
+    if bundle:
+        return [bundle]
+    if getattr(sys, "frozen", False):
+        return [sys.executable]
+    return [sys.executable, "-m", "blackbyrd3d"]
+
+
+def restart_app(window):
+    """Restart so a new interface scale takes effect, asking nothing.
+
+    Qt reads the scale factor only as the QApplication is built, so the
+    setting lands on the next process (launcher._apply_ui_scale). The
+    document survives as it is: a clean one reopens from disk, and one
+    with unsaved changes (even an emptied one, which reopening from disk
+    would undo) is handed over through the autosave folder and reopened
+    unsaved under its own name. The question, if any, was the Settings
+    page's to ask.
+    """
+    handoff = None
+    if window.dirty:
+        try:
+            handoff = window.autosave.hand_over(window.ctx.current_path)
+        except Exception:                                     # noqa: BLE001
+            window.command_line.echo(
+                "Could not keep the unsaved work for a restart, so "
+                "Blackbyrd3D was not restarted.")
+            return
+    _relaunch(window, handoff=handoff, origin=window.ctx.current_path)
+
+
+def _relaunch(window, handoff: str | None, origin: str | None):
+    """Spawn the next session and close this one.
+
+    No unsaved-changes prompt: the work is already on disk (saved, or
+    handed over). The child starts detached, before the close, so an
+    AppImage mount vanishing under this process cannot take it down.
+    """
+    cmd = _restart_command()
+    if handoff:
+        cmd += [handoff]
+    elif origin:
+        cmd += [origin]
+    if not QProcess.startDetached(cmd[0], cmd[1:]):
+        if handoff:
+            window.autosave.discard_handoff()   # this session keeps it
+        window.command_line.echo(
+            "Could not start Blackbyrd3D again, so it was not restarted.")
+        return
+    window._restarting = True
+    window.close()
+
+
+def main():
+    """Standalone entry (tests, `python -m blackbyrd3d.app`).
+
+    Real launches go through blackbyrd3d.launcher instead, which puts the
+    splash up before this module's geometry-kernel imports load. This path
+    has no early splash — by the time it runs, the kernel is already
+    imported — so it's kept for tests and simple invocations.
+    """
+    if "--selftest" in sys.argv:
+        raise SystemExit(_selftest())
+    signal.signal(signal.SIGINT, signal.SIG_DFL)
+    set_default_gl_format()
+    app = QApplication(sys.argv)
+    return run_app(app, splash=None)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

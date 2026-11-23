@@ -1,0 +1,671 @@
+"""Programmatic API over a running Blackbyrd3D session.
+
+Used by the RPC bridge (and therefore the MCP server). Every method runs on
+the Qt main thread and returns plain JSON-serializable data.
+"""
+
+from __future__ import annotations
+
+import os
+import tempfile
+from contextlib import contextmanager
+
+from . import fileio
+from .core import geometry as g
+
+
+# What `layers(action="style")` can set, in the order it sets them, and the
+# LayerManager setter each goes through.
+_LAYER_STYLE = {
+    "linetype": "set_linetype",
+    "print_width": "set_print_width",
+    "screen_width": "set_lineweight",
+    "hatch": "set_hatch",
+    "hatch_angle": "set_hatch_angle",
+    "hatch_spacing": "set_hatch_spacing",
+    "hatch_color": "set_hatch_color",
+    "hatch_background": "set_hatch_background",
+    "cut_line_width": "set_cut_line_width",
+    "cut_line_color": "set_cut_line_color",
+}
+
+
+class ApiError(Exception):
+    pass
+
+
+class SerpApi:
+    def __init__(self, window):
+        self.window = window
+        self.scene = window.scene
+        self.selection = window.selection
+        self.history = window.history
+        self.viewport = window.viewport
+        self.processor = window.processor
+
+    @contextmanager
+    def external_operation(self, name: str, args: dict, *, source: str,
+                           summary: str | None = None):
+        """Main-thread boundary for an AI or RPC operation on the live model.
+
+        Callers wrap dispatch with this context so a pending interactive
+        command retains its prompts/selection, and the common history records
+        the origin and outcome. Read-only queries remain available.
+        """
+        readonly = (name in {"scene_info", "screenshot", "measure", "viewport_info", "prepare_script"}
+                    or (name == "layers" and args.get("action", "list") == "list"))
+        description = summary or name
+        echo = self.window.command_line.echo
+        try:
+            if self.processor.busy and not readonly:
+                raise ApiError("Finish or cancel the active CAD command before requesting another operation.")
+            echo(f"[{source}] {description}")
+            yield
+        except Exception as exc:
+            echo(f"[{source}] {description}: {exc}")
+            raise
+
+    # ------------------------------------------------------------- resolution
+
+    def prepare_script(self, source: str, title: str = "Assistant.py") -> dict:
+        """Open generated Python for review, without running it."""
+        if not isinstance(source, str) or not isinstance(title, str):
+            raise ApiError("Script source and title must be text.")
+        workspace = self.window.command_workspace
+        workspace.set_pane_visible("script", True)
+        workspace._ensure_script().new_draft(source, title or "Assistant.py")
+        return {"title": title, "status": "draft", "executed": False,
+                "message": "Ready in Script. The user can edit and choose Run to preview."}
+
+    def _obj(self, ref: str):
+        obj = self.scene.get(ref) or self.scene.find_by_name(ref)
+        if obj is None:
+            raise ApiError(f"No object named or id '{ref}'")
+        return obj
+
+    def _objs(self, refs: list[str]) -> list:
+        return [self._obj(r) for r in refs]
+
+    def _obj_info(self, obj) -> dict | None:
+        """One object as a dict, or None if it turned out not to be one.
+
+        Reading an object's shape is what converts it, and a few convert
+        to nothing and are dropped on the spot. Asking the one being read
+        about itself a moment later then has nothing to ask (#10).
+        """
+        shape = obj.shape
+        if shape is None or self.scene.get(obj.id) is None:
+            return None
+        mn, mx = g.bbox(shape)
+        row = {
+            "id": obj.id,
+            "name": obj.name,
+            "kind": obj.kind,
+            "layer": self.scene.layers.get(obj.layer_id).name,
+            "visible": obj.visible,
+            # a locked object is on screen and cannot be picked, so a script
+            # that cannot select one needs to be able to see why
+            "locked": bool(obj.locked),
+            "bbox": [list(mn), list(mx)],
+        }
+        if obj.user_text:
+            # only where there is some: most objects carry none, and a big
+            # scene would otherwise send thousands of empty ones
+            row["user_text"] = dict(obj.user_text)
+        if obj.clip_plane:
+            # whether it is paused, and the views it is switched off in:
+            # "perspective", "top", "front", "right", or a detail's id
+            row["clip_plane"] = {
+                key: list(value) if isinstance(value, list) else value
+                for key, value in obj.clip_plane.items()}
+        return row
+
+    # ------------------------------------------------------------------ info
+
+    def _layer(self, ref: str | None):
+        """The layer a caller means, by path or by plain name.
+
+        Two layers can be called Interior once layers nest, so a name on
+        its own no longer says which one: `Walls::Interior` picks one of
+        them. A plain name is still taken, because most scenes have no
+        two layers sharing one and every caller written before sublayers
+        passes one.
+        """
+        mgr = self.scene.layers
+        layer = mgr.find_by_path(ref or "") or mgr.find_by_name(ref or "")
+        if layer is None:
+            raise ApiError(f"No layer named '{ref}'")
+        return layer
+
+    def scene_info(self) -> dict:
+        # reading converts, and converting can drop an object, so the
+        # count is taken from what survived being read
+        rows = [row for row in (self._obj_info(o) for o in self.scene.all())
+                if row is not None]
+        bounds = self.scene.bbox()
+        return {
+            "object_count": len(rows),
+            "objects": rows,
+            # `path` is what tells one Interior from another once layers
+            # nest, and `visible` is the layer's own switch while `shown`
+            # is whether the branch above it lets it onto the screen.
+            "layers": [
+                {"name": layer.name, "color": list(layer.color),
+                 "path": self.scene.layers.full_path(layer.id),
+                 "parent": (self.scene.layers.full_path(layer.parent)
+                            if layer.parent else None),
+                 "visible": layer.visible,
+                 "shown": self.scene.layers.is_visible(layer.id),
+                 "locked": layer.locked,
+                 "current": layer.id == self.scene.layers.current_id,
+                 # how it is drawn: widths in px on screen and mm on paper
+                 # (0 is the printer's default), and the screen width is
+                 # worked out from the print width unless pinned
+                 "linetype": layer.linetype,
+                 "print_width": layer.print_width,
+                 "screen_width": layer.lineweight,
+                 "screen_pinned": layer.screen_pinned,
+                 "hatch": {"pattern": layer.hatch,
+                           "angle": layer.hatch_angle,
+                           "spacing": layer.hatch_spacing,
+                           "color": layer.hatch_color,
+                           "background": layer.hatch_background},
+                 # the line round a cut: mm on paper, 0 for none
+                 "cut_line": {"width": layer.cut_line_width,
+                              "color": layer.cut_line_color},
+                 "object_count": sum(1 for row in rows
+                                     if row["layer"] == layer.name)}
+                for layer in self.scene.layers.all()
+            ],
+            "bounds": ([list(bounds[0]), list(bounds[1])]
+                       if bounds else None),
+            "selected": [o.name for o in self.selection.objects()],
+            "display_mode": self.viewport.display_mode,
+        }
+
+    def _land_view_flights(self):
+        """Finish any turn in progress before reading a camera.
+
+        A pane turning to a view is a camera between two answers. Nothing
+        that reads one should have to wait a fifth of a second first, or
+        get a pose that was never asked for.
+        """
+        listing = getattr(self.window, "all_viewports", None)
+        for vp in (listing() if listing is not None else [self.viewport]):
+            land = getattr(vp, "land_flight", None)
+            if land is not None:
+                land()
+
+    def screenshot(self, path: str | None = None, width: int | None = None,
+                   height: int | None = None,
+                   full_window: bool = False) -> dict:
+        self._land_view_flights()
+        if not path:
+            fd, path = tempfile.mkstemp(suffix=".png", prefix="serp_")
+            os.close(fd)
+        if full_window:
+            from PySide6.QtWidgets import QApplication
+            target = QApplication.activeModalWidget() or self.window
+            img = target.grab().toImage()
+        else:
+            img = self.viewport.grabFramebuffer()
+        if width:
+            from PySide6.QtCore import Qt as _Qt
+            img = img.scaledToWidth(int(width),
+                                    _Qt.TransformationMode.SmoothTransformation)
+        if not img.save(path):
+            raise ApiError(f"Could not save screenshot to {path}")
+        return {"path": path, "width": img.width(), "height": img.height()}
+
+    # -------------------------------------------------------------- commands
+
+    def command(self, command: str, inputs: list | None = None) -> dict:
+        """Run a command exactly as if typed, feeding `inputs` in order."""
+        messages: list[str] = []
+        listener = messages.append
+        self.window.ctx.add_echo_listener(listener)
+        try:
+            text = command.strip()
+            if "--headless" not in (part.lower() for part in text.split()):
+                text += " --headless"
+            ok = self.processor.run(text)
+            if not ok:
+                raise ApiError(messages[-1] if messages
+                               else f"Unknown command {command}")
+            values = [",".join(str(v) for v in value)
+                      if isinstance(value, (list, tuple)) else str(value)
+                      for value in (inputs or [])]
+            answered = []
+            for text in values:
+                if not self.processor.busy:
+                    break
+                answered.append(
+                    (getattr(self.processor.request, "prompt", ""), text))
+                if _is_selection_request(self.processor):
+                    self._feed_selection(text)
+                else:
+                    self.processor.provide_text(text)
+            if self.processor.busy:
+                prompt = self.processor.prompt_text()
+                self.processor.cancel()
+                raise ApiError(
+                    f"Command needs more input: '{prompt}'. "
+                    f"Provide additional values in `inputs`.")
+            if len(answered) < len(values):
+                from .commands.base import unused_inputs_message
+                raise ApiError(unused_inputs_message(
+                    command, answered, values[len(answered):], messages))
+        except Exception:
+            # The command this call started is this call's to clean up: left
+            # at its prompt, it would refuse every later external call, undo
+            # included, until someone at the window pressed Escape.
+            if self.processor.busy:
+                self.processor.cancel()
+            raise
+        finally:
+            self.window.ctx._echo_fns.remove(listener)
+        return {"messages": messages}
+
+    def _feed_selection(self, text: str):
+        if text.strip() == "":
+            self.processor.finish_selection()
+            return
+        # try to resolve as object ref first (id or name), else keyword
+        try:
+            obj = self._obj(text.strip())
+            self.processor.click_object(obj.id)
+        except ApiError:
+            self.processor.provide_text(text)
+
+    # -------------------------------------------------------------- creation
+
+    def create_curve(self, points: list, kind: str = "interp",
+                     degree: int = 3, closed: bool = False,
+                     name: str | None = None) -> dict:
+        pts = [tuple(float(c) for c in p) for p in points]
+        self.history.checkpoint("create_curve")
+        try:
+            if kind == "interp":
+                shape = g.make_interp_curve(pts, closed=closed)
+            elif kind == "control":
+                shape = g.make_control_curve(pts, degree=degree,
+                                             closed=closed)
+            elif kind == "polyline":
+                shape = g.make_polyline(pts, closed=closed)
+            elif kind == "line":
+                shape = g.make_line(pts[0], pts[1])
+            else:
+                raise ApiError(f"Unknown curve kind '{kind}' "
+                               "(interp|control|polyline|line)")
+        except g.GeometryError as exc:
+            self.history.discard_checkpoint()
+            raise ApiError(str(exc)) from exc
+        obj = self.scene.add(shape, name=name)
+        return self._obj_info(obj)
+
+    def create_surface(self, operation: str, curves: list[str],
+                       params: dict | None = None,
+                       name: str | None = None) -> dict:
+        params = params or {}
+        objs = self._objs(curves)
+        shapes = [o.shape for o in objs]
+        self.history.checkpoint(f"create_surface:{operation}")
+        try:
+            if operation == "extrude":
+                direction = tuple(params.get("direction", (0, 0, 1)))
+                distance = float(params.get("distance", 10.0))
+                cap = bool(params.get("cap", True))
+                shape = g.extrude(shapes[0], direction, distance, cap=cap)
+            elif operation == "revolve":
+                axis_point = tuple(params.get("axis_point", (0, 0, 0)))
+                axis_dir = tuple(params.get("axis_dir", (0, 0, 1)))
+                angle = float(params.get("angle", 360.0))
+                shape = g.revolve(shapes[0], axis_point, axis_dir, angle)
+            elif operation == "loft":
+                shape = g.loft(shapes, ruled=bool(params.get("ruled", False)))
+            elif operation == "planar":
+                shape = g.planar_face(shapes[0])
+            elif operation == "sweep":
+                if len(shapes) < 2:
+                    raise ApiError("sweep needs [profile, rail]")
+                shape = g.sweep1(shapes[0], shapes[1])
+            else:
+                raise ApiError(
+                    f"Unknown operation '{operation}' "
+                    "(extrude|revolve|loft|planar|sweep)")
+        except g.GeometryError as exc:
+            self.history.discard_checkpoint()
+            raise ApiError(str(exc)) from exc
+        obj = self.scene.add(shape, name=name)
+        return self._obj_info(obj)
+
+    def boolean(self, operation: str, targets: list[str],
+                tools: list[str]) -> dict:
+        t_objs = self._objs(targets)
+        tool_objs = self._objs(tools)
+        from functools import reduce
+        self.history.checkpoint(f"boolean:{operation}")
+        try:
+            ops = {"union": g.boolean_union,
+                   "difference": g.boolean_difference,
+                   "intersection": g.boolean_intersection}
+            if operation not in ops:
+                raise ApiError("operation must be union|difference|intersection")
+            fn = ops[operation]
+            if operation == "union":
+                shapes = [o.shape for o in t_objs + tool_objs]
+                result = reduce(fn, shapes)
+            else:
+                tool_union = reduce(g.boolean_union,
+                                    [o.shape for o in tool_objs])
+                result = fn(t_objs[0].shape, tool_union)
+                for extra in t_objs[1:]:
+                    result = fn(result, tool_union)
+        except g.GeometryError as exc:
+            self.history.discard_checkpoint()
+            raise ApiError(str(exc)) from exc
+        keep = t_objs[0]
+        for o in t_objs[1:] + tool_objs:
+            self.scene.remove(o.id)
+        new = self.scene.replace_shape(keep.id, result)
+        return self._obj_info(new)
+
+    # ------------------------------------------------------------- transform
+
+    def transform(self, operation: str, targets: list[str],
+                  params: dict | None = None) -> dict:
+        params = params or {}
+        objs = self._objs(targets)
+        self.history.checkpoint(f"transform:{operation}")
+        made = []
+        try:
+            for o in objs:
+                if operation == "move":
+                    offset = tuple(params.get("offset", (0, 0, 0)))
+                    new_shape = g.translate(o.shape, offset)
+                elif operation == "copy":
+                    offset = tuple(params.get("offset", (0, 0, 0)))
+                    made.append(self.scene.add(
+                        g.translate(o.shape, offset), layer_id=o.layer_id))
+                    continue
+                elif operation == "rotate":
+                    center = tuple(params.get("center", (0, 0, 0)))
+                    axis = tuple(params.get("axis", (0, 0, 1)))
+                    angle = float(params.get("angle", 0.0))
+                    new_shape = g.rotate(o.shape, center, axis, angle)
+                elif operation == "scale":
+                    center = tuple(params.get("center", (0, 0, 0)))
+                    if "factors" in params:
+                        new_shape = g.scale(o.shape, center, 1.0,
+                                            factors=tuple(params["factors"]))
+                    else:
+                        new_shape = g.scale(o.shape, center,
+                                            float(params.get("factor", 1.0)))
+                elif operation == "mirror":
+                    point = tuple(params.get("plane_point", (0, 0, 0)))
+                    normal = tuple(params.get("plane_normal", (1, 0, 0)))
+                    new_shape = g.mirror(o.shape, point, normal)
+                    if params.get("keep_original", False):
+                        made.append(self.scene.add(new_shape,
+                                                   layer_id=o.layer_id))
+                        continue
+                else:
+                    raise ApiError(
+                        "operation must be move|copy|rotate|scale|mirror")
+                self.scene.replace_shape(o.id, new_shape)
+        except g.GeometryError as exc:
+            self.history.discard_checkpoint()
+            raise ApiError(str(exc)) from exc
+        return {
+            "transformed": [o.name for o in objs],
+            "created": [self._obj_info(o) for o in made],
+        }
+
+    # ------------------------------------------------------------- selection
+
+    def select(self, names: list[str] | None = None,
+               kind: str | None = None, layer: str | None = None,
+               mode: str = "replace") -> dict:
+        if mode == "clear":
+            self.selection.clear()
+            return {"selected": []}
+        if names:
+            ids = []
+            for ref in names:
+                # An id is one object; a name is every object that has it,
+                # since copies of one part share a name.
+                found = ([self.scene.get(ref)] if self.scene.get(ref)
+                         else [o for o in self.scene.all()
+                               if o.name.lower() == ref.lower()])
+                if not found:
+                    raise ApiError(f"No object named or id '{ref}'")
+                ids += [o.id for o in found if o.id not in ids]
+        else:
+            candidates = self.scene.visible_objects()
+            if kind:
+                candidates = [o for o in candidates if o.kind == kind]
+            if layer:
+                lay = self.scene.layers.find_by_name(layer)
+                if lay is None:
+                    raise ApiError(f"No layer '{layer}'")
+                candidates = [o for o in candidates if o.layer_id == lay.id]
+            ids = [o.id for o in candidates]
+        if mode == "add":
+            ids = self.selection.ids + [i for i in ids
+                                        if i not in self.selection.ids]
+        self.selection.set(ids)
+        return {"selected": [o.name for o in self.selection.objects()]}
+
+    # ---------------------------------------------------------------- layers
+
+    def layers(self, action: str = "list", name: str | None = None,
+               new_name: str | None = None, color: list | None = None,
+               visible: bool | None = None,
+               objects: list[str] | None = None,
+               parent: str | None = None,
+               style: dict | None = None) -> dict:
+        mgr = self.scene.layers
+        if action == "list":
+            return {"layers": self.scene_info()["layers"]}
+        if action == "create":
+            under = self._layer(parent) if parent else None
+            self.history.checkpoint("create layer")
+            layer = mgr.create(name, tuple(color) if color else None,
+                               parent=under.id if under else None)
+            self.scene.notify()
+            return {"created": mgr.full_path(layer.id)}
+        layer = self._layer(name)
+        if action == "rename":
+            self.history.checkpoint("rename layer")
+            mgr.rename(layer.id, new_name)
+        elif action == "visible":
+            self.history.checkpoint("layer visibility")
+            mgr.set_visible(layer.id, bool(visible))
+        elif action == "current":
+            mgr.current_id = layer.id
+        elif action == "color":
+            self.history.checkpoint("layer colour")
+            mgr.set_color(layer.id, tuple(color))
+        elif action == "assign":
+            self.history.checkpoint("assign layer")
+            for ref in objects or []:
+                self.scene.update(self._obj(ref).id, layer_id=layer.id)
+        elif action == "style":
+            self._style_layer(layer.id, style or {})
+        elif action == "delete":
+            self.history.checkpoint("delete layer")
+            for o in self.scene.all():
+                if o.layer_id == layer.id:
+                    self.scene.update(o.id, layer_id="default")
+            mgr.remove(layer.id)
+        else:
+            raise ApiError(f"Unknown layer action '{action}'")
+        self.scene.notify()
+        return {"ok": True}
+
+    def _style_layer(self, layer_id: str, style: dict):
+        """Set how a layer draws, as the layer page in Properties does, in
+        one undo step. A key the layer has no use for, or a value it
+        cannot draw, is refused before anything changes."""
+        from .core.layers import (HATCH_BACKGROUND_NONE, HATCH_INK,
+                                  hatch_background_token, hatch_color_token)
+        from .core.layout import pattern_named, section_fills_of
+        from .core.linetype import LINETYPES
+        unknown = sorted(set(style) - set(_LAYER_STYLE))
+        if unknown:
+            raise ApiError(f"Unknown layer style {', '.join(unknown)}; a "
+                           f"layer takes {', '.join(_LAYER_STYLE)}")
+        if "linetype" in style and style["linetype"] not in LINETYPES:
+            raise ApiError(f"Unknown linetype '{style['linetype']}'; "
+                           f"known: {', '.join(LINETYPES)}")
+        fills = section_fills_of(self.scene)
+        if "hatch" in style and str(style["hatch"]).lower() not in \
+                [f.lower() for f in fills]:
+            raise ApiError(f"Unknown hatch '{style['hatch']}'; "
+                           f"known: {', '.join(fills)}")
+        if "hatch_background" in style and \
+                hatch_background_token(style["hatch_background"]) == \
+                HATCH_BACKGROUND_NONE and \
+                str(style["hatch_background"]).lower() != \
+                HATCH_BACKGROUND_NONE:
+            raise ApiError("hatch_background is 'none', 'layer', "
+                           "'#rrggbb' or [r, g, b] in 0..1")
+        for key in ("hatch_color", "cut_line_color"):
+            if key in style and \
+                    hatch_color_token(style[key]) == HATCH_INK and \
+                    str(style[key]).lower() != HATCH_INK:
+                raise ApiError(f"{key} is 'ink', 'layer', '#rrggbb' or "
+                               "[r, g, b] in 0..1")
+        if "cut_line_width" in style:
+            try:
+                float(style["cut_line_width"])
+            except (TypeError, ValueError):
+                raise ApiError("cut_line_width is millimetres on the paper, "
+                               "0 for no line") from None
+        mgr = self.scene.layers
+        self.history.checkpoint("layer style")
+        # print width first: a screen width that follows it is worked
+        # out from it
+        for key in _LAYER_STYLE:
+            if key not in style:
+                continue
+            value = style[key]
+            if key == "hatch":
+                value = pattern_named(self.scene, value)
+            if key == "screen_width" and (
+                    value is None or str(value).lower() == "from print"):
+                mgr.follow_print(layer_id)
+            else:
+                getattr(mgr, _LAYER_STYLE[key])(layer_id, value)
+
+    # -------------------------------------------------------------- file i/o
+
+    def import_file(self, path: str, zoom_extents: bool = False) -> dict:
+        """Add a file to the scene. The view stays where the modeller left
+        it unless `zoom_extents` asks for it to fit what is there."""
+        path = os.path.abspath(os.path.expanduser(path))
+        if not os.path.exists(path):
+            raise ApiError(f"File not found: {path}")
+        self.history.checkpoint("import")
+        notes = []
+        try:
+            n = fileio.import_file(self.scene, path, notes=notes)
+        except Exception as exc:
+            self.history.discard_checkpoint()
+            raise ApiError(f"Import failed: {exc}") from exc
+        if zoom_extents:
+            self.viewport.zoom_extents()
+        return {"imported": n, **({"notes": notes} if notes else {})}
+
+    def export_file(self, path: str, selected_only: bool = False) -> dict:
+        path = os.path.abspath(os.path.expanduser(path))
+        ids = self.selection.ids if selected_only else None
+        try:
+            fileio.export_file(self.scene, path, only_ids=ids)
+        except Exception as exc:
+            raise ApiError(f"Export failed: {exc}") from exc
+        return {"path": path}
+
+    # --------------------------------------------------------------- measure
+
+    def measure(self, what: str, targets: list[str] | None = None,
+                points: list | None = None) -> dict:
+        if what == "distance":
+            if not points or len(points) != 2:
+                raise ApiError("distance needs points=[[x,y,z],[x,y,z]]")
+            d = sum((b - a) ** 2 for a, b in
+                    zip(points[0], points[1])) ** 0.5
+            return {"distance": d}
+        objs = self._objs(targets or [])
+        if not objs:
+            raise ApiError("measure needs target objects")
+        if what == "area":
+            return {"area": sum(g.surface_area(o.shape) for o in objs)}
+        if what == "volume":
+            return {"volume": sum(g.volume(o.shape) for o in objs)}
+        if what == "length":
+            return {"length": sum(g.curve_length(o.shape) for o in objs)}
+        if what == "bbox":
+            infos = [self._obj_info(o) for o in objs]
+            return {"bboxes": {i["name"]: i["bbox"] for i in infos}}
+        if what == "centroid":
+            return {"centroids": {o.name: list(g.centroid(o.shape))
+                                  for o in objs}}
+        raise ApiError("what must be distance|area|volume|length|bbox|centroid")
+
+    # ------------------------------------------------------------------ misc
+
+    def viewport_info(self, project: list | None = None) -> dict:
+        """Debug/testing helper: viewport geometry, camera pose, and
+        optional world->screen projection of points."""
+        import numpy as np
+        from PySide6.QtCore import QPoint
+        self._land_view_flights()
+        vp = self.viewport
+        origin = vp.mapToGlobal(QPoint(0, 0))
+        cam = vp.camera
+        out = {
+            "origin": [origin.x(), origin.y()],
+            "size": [vp.width(), vp.height()],
+            "camera": {
+                "target": list(map(float, cam.target)),
+                "distance": cam.distance,
+                "azimuth": cam.azimuth,
+                "elevation": cam.elevation,
+            },
+            "display_mode": vp.display_mode,
+            "selected": [o.name for o in self.selection.objects()],
+        }
+        if project:
+            pts = np.asarray(project, float)
+            scr = cam.project(pts, vp.width(), vp.height())
+            out["projected"] = [[float(p[0]), float(p[1])] for p in scr]
+        return out
+
+    def undo(self) -> dict:
+        label = self.history.undo()
+        return {"undone": label}
+
+    def redo(self) -> dict:
+        label = self.history.redo()
+        return {"redone": label}
+
+    def set_viewport(self, view: str | None = None,
+                     display_mode: str | None = None,
+                     zoom_extents: bool = False,
+                     grid: bool | None = None) -> dict:
+        if view:
+            self.viewport.set_view(view)
+        if display_mode:
+            self.viewport.set_display_mode(display_mode)
+        if grid is not None:
+            self.viewport.grid_visible = bool(grid)
+        if zoom_extents:
+            self.viewport.zoom_extents()
+        self.viewport.update()
+        return {"view": view, "display_mode": self.viewport.display_mode}
+
+
+def _is_selection_request(processor) -> bool:
+    from .commands.base import SelectReq
+    return isinstance(processor.request, SelectReq)

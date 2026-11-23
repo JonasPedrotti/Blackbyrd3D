@@ -1,0 +1,67 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    paths-ignore: ["**.md", "docs/**", "assets/**"]
+  pull_request:
+    paths-ignore: ["**.md", "docs/**", "assets/**"]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  tests:
+    if: github.repository == 'JonasPedrotti/Blackbyrd3D'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: System libraries for Qt/OpenGL
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgl1 libegl1 libxkbcommon-x11-0 \
+            libxcb-icccm4 libxcb-image0 libxcb-keysyms1 libxcb-shape0 \
+            libxcb-render-util0 libxcb-xinerama0 libxcb-cursor0 \
+            libfontconfig1 libdbus-1-3
+      - uses: astral-sh/setup-uv@v5
+      - name: Install
+        run: uv sync --extra dev --locked --python 3.12
+      - name: Unit tests
+        env:
+          QT_QPA_PLATFORM: offscreen
+        # -n auto: the tests are independent and each one brings its own
+        # settings, journal and autosave directories, so they run one per
+        # core. Memory is the limit, not cores: each worker can pass 2 GB,
+        # which the standard runner's four cores and 16 GB hold.
+        run: uv run pytest tests/ -q -n auto --ignore=tests/e2e_dod.py
+
+  headless-smoke:
+    if: github.repository == 'JonasPedrotti/Blackbyrd3D'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: |
+          sudo apt-get update && sudo apt-get install -y libgl1 libegl1 \
+            libfontconfig1
+      - uses: astral-sh/setup-uv@v5
+      - name: Install
+        run: uv sync --locked --python 3.12
+      - name: byrd3d-batch smoke test
+        run: |
+          cat > smoke.py << 'PY'
+          doc.add(geo.make_box((0, 0, 0), 10, 10, 10), name="Box")
+          doc.run("filletedge", ["Box", "", "1"])
+          doc.export("out.step")
+          doc.export("out.glb")
+          print("volume:", round(doc.volume("Box"), 1))
+          PY
+          uv run byrd3d-batch smoke.py
+          test -s out.step && test -s out.glb

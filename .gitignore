@@ -1,0 +1,23 @@
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+*.byrd
+!blackbyrd3d/examples/*.byrd
+# downloadable sample scenes are site assets, not user data
+*.step
+*.stp
+*.obj
+!tests/fixtures/*
+screenshots/
+.tokensave/
+packaging/windows/Output/
+# generated at build time from blackbyrd3d.__version__
+packaging/windows/file_version_info.txt
+*.dmg
+packaging/macos/*.icns
+packaging/macos/*.iconset/
+

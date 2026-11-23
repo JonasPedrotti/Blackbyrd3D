@@ -1,0 +1,1766 @@
+"""Transform commands: move, copy, rotate, scale, mirror, array."""
+
+from ..core import geometry as g
+from ..core.tessellate import copies_of
+from .base import (
+    IntReq, NumberReq, OptionReq, PointReq, SelectReq, command,
+)
+
+
+def _ghost(objs, fn):
+    """Compound preview of every object transformed by fn(shape)."""
+    from ..core.picture import PictureShape
+    from ..core.text_object import TextPreview, TextShape
+    shapes = [fn(o.shape) for o in objs]
+    if len(shapes) == 1 and isinstance(shapes[0], (PictureShape, TextShape)):
+        return shapes[0]
+    compound = g.make_compound([s.face() if isinstance(s, PictureShape)
+                                else s for s in shapes])
+    texts = [s for s in shapes if isinstance(s, TextShape)]
+    return TextPreview(compound, texts) if texts else compound
+
+
+def _sheet_ghost(ctx, picks, matrix, size: float = 1.0):
+    """What `picks` on a sheet would look like put through `matrix`, as one
+    shape to ghost: paper geometry as its shape, everything else as the
+    lines it stands on (see `sheet_item_linework`). Worked out on copies,
+    so nothing on the sheet moves to show it."""
+    import copy
+    from types import SimpleNamespace
+
+    from ..core.layout import sheet_item_linework, transform_sheet_item
+    from ..core.picture import PictureShape
+    shapes = []
+    for kind, obj in picks:
+        if kind == "object":
+            stand_in = SimpleNamespace(shape=obj.shape)
+            transform_sheet_item(kind, stand_in, matrix, size, ctx.scene)
+            shape = stand_in.shape
+            shapes.append(shape.face() if isinstance(shape, PictureShape)
+                          else shape)
+            continue
+        dup = copy.deepcopy(obj)
+        transform_sheet_item(kind, dup, matrix, size, ctx.scene)
+        for points, closed in sheet_item_linework(kind, dup, ctx.scene):
+            pts = [(float(p[0]), float(p[1]), 0.0) for p in points]
+            if len(pts) > 1:
+                shapes.append(g.make_polyline(pts, closed=closed))
+    return g.make_compound(shapes) if shapes else None
+
+
+def _what_to_transform(ctx, prompt, **kw):
+    """(held parts, objects) — whichever of the two is being used.
+
+    Holding part of an object is a way of saying which part you mean, so
+    when something is held it is what the command is for and there is
+    nothing left to ask: putting the select prompt up anyway would throw it
+    away, since a select prompt clears the selection to take its answer.
+    That is what used to happen to everything except control points, and it
+    left the whole object transformed instead of the part (#29).
+    """
+    held = ctx.held_parts()
+    objs = [] if held else (yield SelectReq(prompt, keep=True, **kw))
+    return held, objs
+
+
+def _detached_parts(ctx, held):
+    """[(shape, source object)]: what is held, each part as an object of
+    its own, for a copy. A face becomes a surface (the faces held on one
+    object a polysurface), an edge or a curve segment a curve, a corner
+    or a control point a point, a mesh's triangles a mesh of them."""
+    import numpy as np
+    from ..core.mesh import MeshShape
+    out = []
+
+    def _source(obj_id):
+        return ctx.scene.get(obj_id)
+
+    for obj_id, idxs in (held.get("face") or {}).items():
+        obj = _source(obj_id)
+        if obj is None:
+            continue
+        faces = g.faces_of(obj.shape)
+        picked = [g.copy_shape(faces[i]) for i in idxs if 0 <= i < len(faces)]
+        if len(picked) > 1:
+            try:
+                out.append((g.join_surfaces(picked), obj))
+                continue
+            except g.GeometryError:
+                pass
+        out += [(face, obj) for face in picked]
+    for kind in ("edge", "segment"):
+        for obj_id, idxs in (held.get(kind) or {}).items():
+            obj = _source(obj_id)
+            if obj is None:
+                continue
+            edges = g.edges_of(obj.shape)
+            out += [(g.copy_shape(edges[i]), obj) for i in idxs
+                    if 0 <= i < len(edges)]
+    for kind, read in (("point", g.vertex_points),
+                       ("curve_point", g.curve_points)):
+        for obj_id, idxs in (held.get(kind) or {}).items():
+            obj = _source(obj_id)
+            if obj is None:
+                continue
+            pts = read(obj.shape)
+            out += [(g.make_point(pts[i]), obj) for i in idxs
+                    if 0 <= i < len(pts)]
+    for obj_id, idxs in (held.get("cv") or {}).items():
+        obj = _source(obj_id)
+        if obj is None:
+            continue
+        try:
+            pts = (g.surface_control_points(obj.shape)[0]
+                   if obj.kind == "surface"
+                   else g.get_control_points(obj.shape))
+        except g.GeometryError:
+            continue
+        out += [(g.make_point(pts[i]), obj) for i in idxs if 0 <= i < len(pts)]
+    for obj_id, entries in (held.get("mesh") or {}).items():
+        obj = _source(obj_id)
+        if obj is None:
+            continue
+        mesh = obj.shape
+        tris = [i for kind, i in entries if kind == "face"]
+        if tris:
+            corners = np.asarray(mesh.vertices)[mesh.triangles[tris]]
+            out.append((MeshShape(corners.reshape(-1, 3),
+                                  np.arange(len(tris) * 3).reshape(-1, 3),
+                                  faceted=mesh.faceted), obj))
+        points = mesh.points()
+        for kind, i in entries:
+            if kind == "edge":
+                a, b = mesh.part_points("edge", i)
+                out.append((g.make_line(tuple(points[a]), tuple(points[b])),
+                            obj))
+            elif kind in ("cv", "vertex"):
+                out.append((g.make_point(tuple(points[i])), obj))
+    return out
+
+
+def _held_entries(held):
+    """The held parts as the selection names them, (obj_id, kind, index)."""
+    named = {"face": "face", "edge": "edge", "segment": "edge",
+             "point": "vertex", "curve_point": "vertex", "cv": "cv"}
+    out = []
+    for bucket, kind in named.items():
+        for obj_id, idxs in (held.get(bucket) or {}).items():
+            out += [(obj_id, kind, i) for i in idxs]
+    for obj_id, entries in (held.get("mesh") or {}).items():
+        out += [(obj_id, kind, i) for kind, i in entries]
+    return out
+
+
+def _transform_piece(shape, fn):
+    """`fn` for a detached piece, which may be a mesh."""
+    from ..core.mesh import MeshShape
+    if isinstance(shape, MeshShape):
+        return shape.points_moved(range(len(shape.points())),
+                                  lambda p: g.transform_points([tuple(p)], fn)[0])
+    return fn(shape)
+
+
+def _add_pieces(ctx, pieces, fn):
+    """Add each detached piece put through `fn` as an object of its own,
+    on its source's layer; the new objects."""
+    return [ctx.scene.add_from(_transform_piece(shape, fn), source)
+            for shape, source in pieces]
+
+
+# While a draft is asked for, _preview_of draws the moving edges instead of
+# rebuilding the faces: (draft maker, matrix reader) for the held parts.
+_DRAFTING: list = []
+
+
+def _drafted(ctx, held, preview):
+    """A draft_fn for a command whose preview_fn goes through _preview_of:
+    the same transform, shown as the edges of the held parts that move,
+    fast enough to follow the cursor. None when nothing it can draft is
+    held."""
+    maker = _parts_draft(ctx, held, lambda matrix: matrix) if held else None
+    if maker is None:
+        return None
+    read = _matrix_of(held, ctx)
+
+    def draft(p):
+        _DRAFTING.append((maker, read))
+        try:
+            return preview(p)
+        finally:
+            _DRAFTING.pop()
+    return draft
+
+
+def _preview_of(ctx, held, objs, fn, action=None):
+    """Rebuild the pending parents without changing the scene or selection.
+
+    Every candidate starts from the scene's unchanged shapes. Parts sharing
+    a parent are combined in the same order as completion, and a refused
+    parent is quietly left out of the ghost.
+    """
+    if held and _DRAFTING:
+        maker, read = _DRAFTING[-1]
+        return maker(read(fn))
+    if not held:
+        return _ghost(objs, fn)
+    shapes = dict(ctx._moved_control_points(held.get("cv", {}), fn))
+    shapes.update(ctx.moved_mesh_parts(held.get("mesh", {}), fn))
+    segments = held.get("segment") or {}
+    curve_points = held.get("curve_point") or {}
+    at = _point_map(fn)
+    for obj_id in dict.fromkeys(list(segments) + list(curve_points)):
+        obj = ctx.scene.get(obj_id)
+        if obj is None:
+            continue
+        try:
+            shapes[obj_id] = g.transform_segments(
+                shapes.get(obj_id, obj.shape), segments.get(obj_id, []), at,
+                vertices=curve_points.get(obj_id, []))
+        except g.GeometryError:
+            continue
+    faces = held.get("face") or {}
+    edges = held.get("edge") or {}
+    points = held.get("point") or {}
+    for obj_id in dict.fromkeys(list(faces) + list(edges) + list(points)):
+        obj = ctx.scene.get(obj_id)
+        if obj is None:
+            continue
+        try:
+            shape = shapes.get(obj_id, obj.shape)
+            if action and action[0] == "move":
+                # OCC can adjust input tolerances while drafting. A
+                # preview must leave the scene's original BRep untouched.
+                shape = g.copy_shape(shape)
+            shapes[obj_id] = _solid_parts_shape(
+                shape, faces.get(obj_id, []),
+                edges.get(obj_id, []), fn, action,
+                vidx=points.get(obj_id, []))
+        except g.GeometryError:
+            continue
+    return _ghost_of(list(shapes.values()))
+
+
+def _parts_draft(ctx, held, matrix_at):
+    """What a transform shows while the cursor moves over held faces, edges
+    and corners of surfaces and solids, as Rhino does: only the edges that
+    move, the held ones carried and their neighbours drawn along, and the
+    corners that move marked where they go, worked out from the edges
+    already on screen. Rebuilding the faces is left to the click.
+
+    `matrix_at(point)` is the transform the cursor stands for, as a 3x4
+    affine matrix, or None for nothing to show. Gives None when something
+    else is held, which keeps its own preview."""
+    if not held or not set(held) <= {"face", "edge", "point"}:
+        return None
+    import numpy as np
+    from ..core.tessellate import DisplayMesh
+    owners = list(dict.fromkeys([i for kind in ("face", "edge", "point")
+                                 for i in held.get(kind, {})]))
+    parts = []
+
+    def _held(obj_id):
+        return tuple(list(held.get(kind, {}).get(obj_id, []))
+                     for kind in ("face", "edge", "point"))
+
+    def _parts():
+        for obj_id in owners:
+            obj = ctx.scene.get(obj_id)
+            if obj is None:
+                continue
+            faces, edges, corners_held = _held(obj_id)
+            mesh = obj.mesh
+            points = np.asarray(mesh.edge_segments, float)
+            if not len(points):
+                continue
+            ids = np.repeat(np.asarray(mesh.edge_of_segment)[:, None], 2, axis=1)
+            try:
+                shares = g.setpt_edge_shares(obj.shape, faces, edges, points,
+                                             ids, vertices=corners_held)
+                corners = g.setpt_moving_corners(obj.shape, faces, edges,
+                                                 vertices=corners_held)
+            except g.GeometryError:
+                continue
+            # only what moves: the object itself still shows the rest
+            moving = shares.max(axis=1) > 0
+            if moving.any():
+                parts.append((points[moving], shares[moving][..., None],
+                              corners))
+
+    def draft(point):
+        matrix = matrix_at(point)
+        if matrix is None:
+            return None
+        if not parts:
+            _parts()
+        if not parts:
+            return None
+        matrix = np.asarray(matrix, float).reshape(3, 4)
+        linear, shift = matrix[:, :3], matrix[:, 3]
+        moved, dots = [], []
+        for points, shares, corners in parts:
+            mapped = points @ linear.T + shift
+            moved.append(points + shares * (mapped - points))
+            # the corners that move, where they go
+            dots.append(corners @ linear.T + shift)
+        mesh = DisplayMesh()
+        mesh.place(edge_segments=np.concatenate(moved),
+                   points=np.concatenate(dots))
+        return mesh
+
+    # Worked out once, as the command starts, so no move waits for it; but
+    # only from edges already drawn, since meshing an object for the first
+    # time is not something a command that may be refused should leave on it.
+    if all(ctx.scene.get(i) is None or ctx.scene.get(i).mesh_ready
+           for i in owners):
+        _parts()
+    return draft
+
+
+def _matrix_of(held, ctx):
+    """A function giving the affine matrix of a shape transform, read near
+    the held parts, for _parts_draft."""
+    import numpy as np
+    at = []
+    for kind, pick in (("face", g.faces_of), ("edge", g.edges_of)):
+        for obj_id, idxs in (held.get(kind) or {}).items():
+            obj = ctx.scene.get(obj_id)
+            if obj is not None:
+                subs = pick(obj.shape)
+                at += [g.centroid(subs[i]) for i in idxs if 0 <= i < len(subs)]
+    for obj_id, idxs in (held.get("point") or {}).items():
+        obj = ctx.scene.get(obj_id)
+        if obj is not None:
+            pts = g.vertex_points(obj.shape)
+            at += [pts[i] for i in idxs if 0 <= i < len(pts)]
+    near = tuple(np.mean(np.asarray(at, float), axis=0)) if at else (0, 0, 0)
+
+    def of(fn):
+        return None if fn is None else g.affine_of(fn, near)
+    return of
+
+
+def _ghost_of(shapes):
+    """One shape to ghost: a compound of Breps, or, with a mesh among them,
+    one mesh, since a mesh cannot go in a compound."""
+    from ..core.mesh import MeshShape, merge, mesh_from_brep
+    if not shapes:
+        return None
+    meshes = [s for s in shapes if isinstance(s, MeshShape)]
+    if not meshes:
+        return g.make_compound(shapes)
+    for shape in shapes:
+        if not isinstance(shape, MeshShape):
+            try:
+                meshes.append(mesh_from_brep(shape))
+            except Exception:                      # noqa: BLE001
+                continue       # a curve has nothing to mesh; the rest shows
+    return meshes[0] if len(meshes) == 1 else merge(meshes)
+
+
+def _point_map(fn):
+    """`fn`, written for shapes, as the map it makes of bare positions."""
+    return lambda p: g.transform_points([tuple(p)], fn)[0]
+
+
+def _do(ctx, held, objs, fn, verb, tail="", action=None):
+    """Apply `fn` to what is held, or to the objects, and say what happened.
+
+    `fn` transforms a shape, which is all a whole object or a control point
+    needs. A face or an edge of a solid is reshaped rather than carried, so
+    those need to know which transform this is: `action` says, as
+    ("move", delta), ("rotate", point, axis, degrees) or ("scale", factor).
+    Without one they are left alone and said so, which beats transforming
+    the whole solid behind your back.
+    """
+    if held:
+        _do_to_parts(ctx, held, fn, verb, tail, action)
+        return
+    for o in objs:
+        ctx.scene.replace_shape(o.id, fn(o.shape))
+    ctx.select_result(objs)
+    ctx.echo(f"{verb} {len(objs)} object(s){tail}.")
+
+
+def _do_to_parts(ctx, held, fn, verb, tail, action):
+    """What is rebuilt is let go of, what is not stays held.
+
+    A rebuilt solid or curve renumbers its faces and edges, so holding the
+    old index afterwards would leave you holding something else. Anything
+    refused was not touched, so it is still there to try another way on,
+    which is the whole point of saying no rather than doing something else.
+    """
+    done, refused, keep = [], [], []
+    kind = action[0] if action else None
+
+    cvs = held.get("cv")
+    if cvs:
+        n = ctx.apply_to_control_points(cvs, fn)
+        done.append(f"{n} control point(s)")
+
+    # a mesh's parts keep their numbers through any transform, so they stay
+    # held, to be nudged again
+    meshes = held.get("mesh")
+    if meshes:
+        n = 0
+        for obj_id, mesh in ctx.moved_mesh_parts(meshes, fn):
+            ctx.scene.replace_shape(obj_id, mesh)
+            n += len(meshes[obj_id])
+            keep += [(obj_id, kind, i) for kind, i in meshes[obj_id]]
+        if n:
+            done.append(f"{n} mesh part(s)")
+
+    segments = held.get("segment") or {}
+    curve_points = held.get("curve_point") or {}
+    if segments or curve_points:
+        n = m = 0
+        at = _point_map(fn)
+        for obj_id in dict.fromkeys(list(segments) + list(curve_points)):
+            obj = ctx.scene.get(obj_id)
+            if obj is None:
+                continue
+            idxs = segments.get(obj_id, [])
+            vidx = curve_points.get(obj_id, [])
+            try:
+                ctx.scene.replace_shape(
+                    obj_id, g.transform_segments(obj.shape, idxs, at,
+                                                 vertices=vidx))
+                n += len(idxs)
+                m += len(vidx)
+            except g.GeometryError as exc:
+                refused.append(f"{obj.name}: {exc}")
+                keep += [(obj_id, "edge", i) for i in idxs]
+                keep += [(obj_id, "vertex", i) for i in vidx]
+        if n:
+            done.append(f"{n} curve segment(s)")
+        if m:
+            done.append(f"{m} curve point(s)")
+
+    # A solid's held faces and edges are one change, not a sequence: moving
+    # one part tilts the faces beside it and carries the next some of the
+    # way, so moving them in turn double counts (four rim edges up 5 made
+    # a box 20 high). geometry.move_parts asks which corners move instead.
+    faces = held.get("face") or {}
+    edges = held.get("edge") or {}
+    points = held.get("point") or {}
+    doing = verb.lower().rstrip("d")
+    for obj_id in dict.fromkeys(list(faces) + list(edges) + list(points)):
+        obj = ctx.scene.get(obj_id)
+        if obj is None:
+            continue
+        fidx = list(faces.get(obj_id, []))
+        eidx = list(edges.get(obj_id, []))
+        vidx = list(points.get(obj_id, []))
+        hold = ([(obj_id, "face", i) for i in fidx]
+                + [(obj_id, "edge", i) for i in eidx]
+                + [(obj_id, "vertex", i) for i in vidx])
+        try:
+            shape = _solid_parts_shape(obj.shape, fidx, eidx, fn,
+                                       action, doing, vidx=vidx)
+            ctx.scene.replace_shape(obj_id, shape)
+            if kind != "setpt" and fidx and len(fidx) == len(g.faces_of(obj.shape)):
+                done.append(f"{obj.name} (every face held)")
+            elif kind in ("move", "setpt"):
+                what = []
+                if fidx:
+                    what.append(f"{len(fidx)} face(s)")
+                if eidx:
+                    what.append(f"{len(eidx)} solid edge(s)")
+                if vidx:
+                    what.append(f"{len(vidx)} point(s)")
+                done.append(" and ".join(what))
+            else:
+                done.append("1 face")
+        except g.GeometryError as exc:
+            refused.append(f"{obj.name}: {exc}")
+            keep += hold
+
+    # control points keep their own indices through a move, so the
+    # framework's habit of handing them back still holds for them
+    ctx.result_subobjects = list(ctx.result_subobjects) + keep
+    if done:
+        ctx.echo(f"{verb} " + ", ".join(done) + tail + ".")
+    for why in refused:
+        ctx.echo(why + ".")
+    if not done and not refused:
+        ctx.echo("Nothing held could be transformed.")
+
+
+def _solid_parts_shape(shape, fidx, eidx, fn, action, doing="transform",
+                       vidx=()):
+    """The same pure parent rebuild for a preview and a completed edit.
+
+    The exact rebuilds for a flat face or a set moved together come
+    first; whatever they cannot do (several faces turned at once, an edge
+    or a corner scaled, a curved face, a mirror) goes through the general
+    deformation, which carries the held parts through the transform and
+    lets the rest of the parent follow."""
+    if action and action[0] == "setpt":
+        return g.set_part_points(
+            shape, list(fidx), list(eidx), tuple(action[1]), tuple(action[2]),
+            vertices=list(vidx))
+    if fidx and len(fidx) == len(g.faces_of(shape)):
+        # A band holding every face means the whole parent, for any command.
+        return fn(shape)
+    try:
+        if action and action[0] == "move":
+            return g.move_parts(shape, fidx, eidx, tuple(action[1]),
+                                vertices=vidx)
+        if action and len(fidx) == 1 and not eidx and not vidx:
+            return _face_by_action(shape, fidx[0], action)
+    except g.GeometryError:
+        pass
+    return g.deform_parts(shape, list(fidx), list(eidx), list(vidx),
+                          g.affine_of(fn, _parts_centre(shape, fidx, eidx,
+                                                        vidx)))
+
+
+def _parts_centre(shape, fidx, eidx, vidx):
+    """Somewhere in the middle of the held parts, to read a transform near."""
+    import numpy as np
+    at = [g.centroid(g.faces_of(shape)[i]) for i in fidx]
+    at += [g.centroid(g.edges_of(shape)[i]) for i in eidx]
+    corners = g.vertex_points(shape) if vidx else []
+    at += [corners[i] for i in vidx]
+    return tuple(np.mean(np.asarray(at, float), axis=0)) if at else (0, 0, 0)
+
+
+def _face_by_action(shape, index, action):
+    """One face of a solid put through whichever transform this is."""
+    if not action:
+        raise g.GeometryError(
+            "a face of a solid can be moved, turned or scaled, "
+            "but not by this command")
+    what = action[0]
+    if what == "move":
+        return g.move_parts(shape, [index], [], tuple(action[1]))
+    if what == "rotate":
+        import numpy as np
+        _what, point, axis, degrees = action
+        normal = np.asarray(g.face_normal(g.faces_of(shape)[index]), float)
+        normal = normal / (np.linalg.norm(normal) or 1.0)
+        along = np.asarray(axis, float)
+        along = along / (np.linalg.norm(along) or 1.0)
+        if abs(float(np.dot(normal, along))) > 0.999:
+            # turning a plane about its own normal leaves the same plane, so
+            # the solid would come back unchanged and the message would be a
+            # lie. The gumball does not draw that ring for the same reason.
+            raise g.GeometryError(
+                "this face lies square to the axis, so turning it about "
+                "that axis would not change it")
+        return g.tilt_face(shape, index, tuple(point), tuple(axis),
+                           float(degrees))
+    if what == "scale":
+        return g.scale_face(shape, index, float(action[1]))
+    raise g.GeometryError(
+        "a face of a solid cannot be changed by this command")
+
+
+def _move_on_paper(ctx, lv):
+    """Move what is picked on a sheet, in paper millimetres.
+
+    A corner takes the two edges that meet at it, so `move` reshapes a frame
+    from typed coordinates exactly as dragging its grip does. With no corner
+    picked, whole sheet items travel instead. The model is untouched either
+    way — nothing here is model space.
+    """
+    if not lv.corners and not lv.selected:
+        ctx.echo("Nothing is picked on this sheet — click the geometry, a "
+                 "detail frame, an annotation or a corner grip first.")
+        return
+    what = "corner" if lv.corners else "sheet item"
+    p1 = yield PointReq(f"Point to move the {what} from")
+    p2 = yield PointReq("Point to move to", rubber_from=p1)
+    dx, dy = p2[0] - p1[0], p2[1] - p1[1]
+    moved = lv.move_corners(dx, dy) if lv.corners else \
+        lv.move_selected(dx, dy)
+    ctx.echo(f"Moved {moved} {what}(s) by {dx:g}, {dy:g} mm on the sheet.")
+
+
+@command("move", aliases=("m",), space="any")
+def cmd_move(ctx):
+    lv = ctx.sheet_view()
+    if lv is not None:
+        yield from _move_on_paper(ctx, lv)
+        return
+    choices = {"Vertical": ["No", "Yes"]}
+    held, objs = yield from _what_to_transform(
+        ctx, "Select objects to move", choices=choices)
+    p1 = yield PointReq("Point to move from", choices=choices)
+    # Keep the plane of the base point even if the target is picked in a
+    # different pane, or Vertical is enabled after the base was chosen.
+    normal = tuple(float(c) for c in ctx.cplane.normal)
+
+    def _offset(p):
+        off = tuple(b - a for a, b in zip(p1, p))
+        if ctx.opt("Vertical", "No") == "Yes":
+            distance = sum(c * n for c, n in zip(off, normal))
+            return tuple(distance * n for n in normal)
+        return off
+
+    def _preview(p):
+        offset = _offset(p)
+        return _preview_of(ctx, held, objs, lambda s: g.translate(s, offset),
+                           action=("move", offset))
+
+    def _constraints():
+        axis = (p1, normal) if ctx.opt("Vertical", "No") == "Yes" else None
+        target.axis_lock = axis
+        target.number_from = axis
+
+    target = PointReq("Point to move to (click, or type a distance)",
+                      rubber_from=p1, choices=choices, preview_fn=_preview,
+                      draft_fn=_drafted(ctx, held, _preview),
+                      option_changed=_constraints)
+    _constraints()
+    p2 = yield target
+    offset = _offset(p2)
+    _do(ctx, held, objs, lambda s: g.translate(s, offset), "Moved",
+        action=("move", offset))
+
+
+def _copy_on_paper(ctx, lv):
+    """Copy what is picked on a sheet, in paper millimetres.
+
+    Whole items only, unlike `move`: a corner grip is a way of reshaping the
+    frame it belongs to, and a corner on its own is not something there can be
+    two of. The originals stay picked, so every repeat is measured from the
+    same thing rather than from the copy before it.
+    """
+    if not lv.selected:
+        ctx.echo("Nothing is picked on this sheet — click the geometry, a "
+                 "detail frame or an annotation first.")
+        return
+    items = len(lv.selected)
+    p1 = yield PointReq("Point to copy the sheet item from")
+    count = 0
+    while True:
+        p2 = yield PointReq("Point to copy to (Enter to finish)",
+                            rubber_from=p1, allow_empty=count > 0)
+        if p2 is None:
+            break
+        lv.copy_selected(p2[0] - p1[0], p2[1] - p1[1])
+        count += 1
+    ctx.echo(f"Copied {items} sheet item(s) {count} time(s).")
+
+
+@command("copy", aliases=("co", "cp"), space="any")
+def cmd_copy(ctx):
+    lv = ctx.sheet_view()
+    if lv is not None:
+        yield from _copy_on_paper(ctx, lv)
+        return
+    choices = {"Vertical": ["No", "Yes"]}
+    held, objs = yield from _what_to_transform(
+        ctx, "Select objects to copy", choices=choices)
+    if held:
+        # a copy of part of an object is an object of its own
+        pieces = _detached_parts(ctx, held)
+        if not pieces:
+            ctx.echo("Nothing held can be copied.")
+            return
+    p1 = yield PointReq("Point to copy from", choices=choices)
+    normal = tuple(float(c) for c in ctx.cplane.normal)
+
+    def _offset(p):
+        off = tuple(b - a for a, b in zip(p1, p))
+        if ctx.opt("Vertical", "No") == "Yes":
+            distance = sum(c * n for c, n in zip(off, normal))
+            return tuple(distance * n for n in normal)
+        return off
+
+    def _preview(p):
+        if held:
+            return _ghost_of([_transform_piece(shape, lambda s: g.translate(
+                s, _offset(p))) for shape, _src in pieces])
+        return _ghost(objs, lambda s: g.translate(s, _offset(p)))
+
+    def _constraints():
+        axis = (p1, normal) if ctx.opt("Vertical", "No") == "Yes" else None
+        target.axis_lock = axis
+        target.number_from = axis
+
+    count = 0
+    made = []
+    while True:
+        target = PointReq("Point to copy to (Enter to finish)",
+                          rubber_from=p1, choices=choices,
+                          allow_empty=count > 0, preview_fn=_preview,
+                          option_changed=_constraints)
+        _constraints()
+        p2 = yield target
+        if p2 is None:
+            break
+        offset = _offset(p2)
+        if held:
+            made += _add_pieces(ctx, pieces,
+                                lambda s, d=offset: g.translate(s, d))
+        else:
+            for o in objs:
+                ctx.scene.add_from(g.translate(o.shape, offset), o)
+        count += 1
+    if held:
+        # what was held stays held, as a whole object copied stays picked
+        ctx.result_subobjects = list(ctx.result_subobjects) + _held_entries(held)
+        ctx.echo(f"Copied {len(pieces)} part(s) {count} time(s) "
+                 "as objects of their own.")
+        return
+    ctx.select_result(objs)
+    ctx.echo(f"Copied {len(objs)} object(s) {count} time(s).")
+
+
+@command("rotate", aliases=("ro",), space="any")
+def cmd_rotate(ctx):
+    """Rotate around the CPlane normal: type an angle, or pick a
+    reference direction and drag it to its new heading (live preview)."""
+    import math
+
+    import numpy as np
+    lv = ctx.sheet_view()
+    if lv is not None:
+        # everything picked turns (#36); paper geometry and pictures are
+        # the ones a preview can show while the angle is being dragged
+        picks = list(lv.selected)
+        if not picks:
+            ctx.echo("Nothing picked on the sheet: click geometry, a detail "
+                     "frame or an annotation first.")
+            return
+        objs = [obj for kind, obj in picks if kind == "object"]
+        held = []
+    else:
+        held, objs = yield from _what_to_transform(ctx, "Select objects to rotate")
+    center = yield PointReq("Center of rotation")
+    axis = (0.0, 0.0, 1.0) if lv is not None else tuple(ctx.cplane.normal)
+    ref = yield PointReq("Angle in degrees, or first reference point",
+                         rubber_from=center, allow_number=True)
+    if isinstance(ref, float):
+        angle = ref
+    else:
+        v1 = np.subtract(ref, center)
+        if np.linalg.norm(v1) < 1e-12:
+            ctx.echo("Reference point is on the center — cancelled.")
+            return
+
+        def _angle(p):
+            v2 = np.subtract(p, center)
+            n = np.asarray(axis, float)
+            return math.degrees(math.atan2(
+                float(np.dot(np.cross(v1, v2), n)), float(np.dot(v1, v2))))
+
+        def _preview(p):
+            a = p if isinstance(p, float) else _angle(p)
+            return _preview_of(ctx, held, objs,
+                               lambda s: g.rotate(s, center, axis, a),
+                               action=("rotate", center, axis, a))
+
+        p2 = yield PointReq("Angle, or second reference point",
+                            rubber_from=center, allow_number=True,
+                            preview_fn=_preview,
+                            draft_fn=_drafted(ctx, held, _preview))
+        angle = p2 if isinstance(p2, float) else _angle(p2)
+    if lv is not None:
+        from ..core.layout import transform_sheet_item
+        a = math.radians(angle)
+        turn = np.array([[math.cos(a), -math.sin(a)],
+                         [math.sin(a), math.cos(a)]])
+        pivot = np.array([float(center[0]), float(center[1])])
+        matrix = np.eye(3)
+        matrix[:2, :2] = turn
+        matrix[:2, 2] = pivot - turn @ pivot
+        for kind, obj in picks:
+            transform_sheet_item(kind, obj, matrix, 1.0, ctx.scene)
+        ctx.scene.notify("layouts")
+        ctx.echo(f"Rotated {len(picks)} sheet item(s) by {angle:g} degrees.")
+    else:
+        _do(ctx, held, objs, lambda s: g.rotate(s, center, axis, angle),
+            "Rotated", f" by {angle:g} degrees",
+            action=("rotate", center, axis, angle))
+
+
+def _scale_on_paper(ctx, lv, one_way: bool):
+    """Scale what is picked on a sheet, in paper millimetres (#36).
+
+    `scale` and `scale2d` are the same thing on paper, the sheet being a
+    plane: a uniform scale, text and offsets growing with it. `scale1d`
+    stretches along one direction and leaves text and dimensions their
+    size. A detail's frame scales and its drawing scale stays, locked or
+    not.
+    """
+    import math
+
+    import numpy as np
+    from ..core.layout import transform_sheet_item
+    picks = list(lv.selected)
+    if not picks:
+        ctx.echo("Nothing picked on the sheet: click geometry, a detail "
+                 "frame or an annotation first.")
+        return
+    base = yield PointReq("Base point")
+    ref = yield PointReq("Scale factor, or first reference point",
+                         rubber_from=base, allow_number=True)
+    bx, by = float(base[0]), float(base[1])
+    if isinstance(ref, float):
+        factor = ref
+        aim = ctx.aim_direction() if one_way else None
+        axis = (aim[1][0], aim[1][1]) if aim is not None else (1.0, 0.0)
+    else:
+        axis = (float(ref[0]) - bx, float(ref[1]) - by)
+        d0 = math.hypot(*axis)
+        if d0 < 1e-12:
+            ctx.echo("Reference point is on the base point — cancelled.")
+            return
+        p2 = yield PointReq("Second reference point (or type factor)",
+                            rubber_from=base, allow_number=True)
+        if isinstance(p2, float):
+            factor = p2
+        elif one_way:
+            # how far along the axis the pick lands, against the reference
+            factor = ((float(p2[0]) - bx) * axis[0]
+                      + (float(p2[1]) - by) * axis[1]) / (d0 * d0)
+        else:
+            factor = math.hypot(float(p2[0]) - bx, float(p2[1]) - by) / d0
+    if abs(factor) < 1e-9:
+        ctx.echo("Zero scale factor — cancelled.")
+        return
+    if one_way:
+        a = np.asarray(axis, float)
+        a /= np.linalg.norm(a) or 1.0
+        linear = np.eye(2) + (factor - 1.0) * np.outer(a, a)
+        size = 1.0
+    else:
+        linear = np.eye(2) * factor
+        size = factor
+    matrix = np.eye(3)
+    matrix[:2, :2] = linear
+    matrix[:2, 2] = np.array([bx, by]) - linear @ np.array([bx, by])
+    for kind, obj in picks:
+        transform_sheet_item(kind, obj, matrix, size, ctx.scene)
+    ctx.scene.notify("layouts")
+    how = " along one direction" if one_way else ""
+    ctx.echo(f"Scaled {len(picks)} sheet item(s) by {factor:g}{how}.")
+
+
+@command("scale", aliases=("sc",), space="any")
+def cmd_scale(ctx):
+    """Scale about a base point: type a factor, or grab a reference
+    point and drag it to its new position (live preview)."""
+    import math
+    lv = ctx.sheet_view()
+    if lv is not None:
+        yield from _scale_on_paper(ctx, lv, one_way=False)
+        return
+    held, objs = yield from _what_to_transform(ctx, "Select objects to scale")
+    center = yield PointReq("Base point")
+    ref = yield PointReq("Scale factor, or first reference point",
+                         rubber_from=center, allow_number=True)
+    if isinstance(ref, float):
+        factor = ref
+    else:
+        d0 = math.dist(center, ref)
+        if d0 < 1e-12:
+            ctx.echo("Reference point is on the base point — cancelled.")
+            return
+
+        def _factor(p):
+            return p if isinstance(p, float) else math.dist(center, p) / d0
+
+        def _preview(p):
+            f = _factor(p)
+            if f < 1e-9:
+                return None
+            return _preview_of(ctx, held, objs,
+                               lambda s: g.scale(s, center, f),
+                               action=("scale", f))
+
+        p2 = yield PointReq("Second reference point (drag to scale)",
+                            rubber_from=center, allow_number=True,
+                            preview_fn=_preview,
+                            draft_fn=_drafted(ctx, held, _preview))
+        factor = _factor(p2)
+    if abs(factor) < 1e-9:
+        ctx.echo("Zero scale factor — cancelled.")
+        return
+    _do(ctx, held, objs, lambda s: g.scale(s, center, factor),
+        "Scaled", f" by {factor:g}", action=("scale", factor))
+
+
+@command("scalenu")
+def cmd_scale_nu(ctx):
+    """Scale by a different amount along each axis: type the three
+    factors, or grab a reference point and drag it to where it should end
+    up (live preview either way)."""
+    held, objs = yield from _what_to_transform(
+        ctx, "Select objects to scale (non-uniform)")
+    center = yield PointReq("Base point")
+
+    def _apply(s, factors):
+        return g.scale(s, center, 1.0, factors=factors)
+
+    def _preview(factors):
+        if not all(abs(f) > 1e-9 for f in factors):
+            return None
+        return _preview_of(ctx, held, objs, lambda s: _apply(s, factors))
+
+    ref = yield PointReq("X factor, or first reference point",
+                         rubber_from=center, allow_number=True,
+                         preview_fn=lambda v: _preview((v, 1.0, 1.0)))
+    if isinstance(ref, float):
+        sx = ref
+        sy = yield NumberReq("Y factor", default=1.0,
+                             preview_fn=lambda v: _preview((sx, v, 1.0)))
+        sz = yield NumberReq("Z factor", default=1.0,
+                             preview_fn=lambda v: _preview((sx, sy, v)))
+        factors = (sx, sy, sz)
+    else:
+        span = [r - c for c, r in zip(center, ref)]
+        if all(abs(d) < 1e-12 for d in span):
+            ctx.echo("Reference point is on the base point — cancelled.")
+            return
+
+        def _factors(p):
+            # Per axis, and only where the reference point gave one a
+            # length to be a ratio of: an axis it does not move along is
+            # not being asked about, so it keeps its size.
+            return tuple((c - b) / d if abs(d) > 1e-9 else 1.0
+                         for b, d, c in zip(center, span, p))
+
+        p2 = yield PointReq("Second reference point (drag to scale)",
+                            rubber_from=center,
+                            preview_fn=lambda p: _preview(_factors(p)),
+                            draft_fn=_drafted(
+                                ctx, held, lambda p: _preview(_factors(p))))
+        factors = _factors(p2)
+    if not all(abs(f) > 1e-9 for f in factors):
+        ctx.echo("Zero scale factor — cancelled.")
+        return
+    _do(ctx, held, objs, lambda s: _apply(s, factors), "Scaled",
+        " by " + " × ".join(f"{f:g}" for f in factors))
+
+
+_COPY = {"Copy": ["No", "Yes"]}
+
+
+def _mirror_on_paper(ctx, lv):
+    """Mirror what is picked on a sheet across a line on the paper (#36).
+
+    Kept or not, as in the model. A kept original stays exactly where it
+    was and the mirror is a copy.
+    """
+    import math
+
+    import numpy as np
+    from ..core.layout import copy_sheet_item, transform_sheet_item
+    picks = list(lv.selected)
+    if not picks:
+        ctx.echo("Nothing picked on the sheet: click geometry, a detail "
+                 "frame or an annotation first.")
+        return
+    p1 = yield PointReq("Start of mirror line", choices=_COPY)
+    a = np.array([float(p1[0]), float(p1[1])])
+
+    def _reflection(p):
+        """The paper map mirroring across p1-p, or None for no line."""
+        d = np.array([float(p[0]), float(p[1])]) - a
+        if math.hypot(*d) < 1e-9:
+            return None
+        d /= np.linalg.norm(d)
+        reflect = 2.0 * np.outer(d, d) - np.eye(2)
+        matrix = np.eye(3)
+        matrix[:2, :2] = reflect
+        matrix[:2, 2] = a - reflect @ a
+        return matrix
+
+    def _preview(p):
+        matrix = _reflection(p)
+        return None if matrix is None else _sheet_ghost(ctx, picks, matrix)
+
+    p2 = yield PointReq("End of mirror line", rubber_from=p1,
+                        preview_fn=_preview, choices=_COPY)
+    matrix = _reflection(p2)
+    if matrix is None:
+        ctx.echo("The mirror line has no length — cancelled.")
+        return
+    lay = lv.layout
+    done = 0
+    for kind, obj in picks:
+        if ctx.opt("Copy", "No") == "Yes":
+            obj = copy_sheet_item(lay, kind, obj)
+            if obj is None:
+                continue
+        transform_sheet_item(kind, obj, matrix, 1.0, ctx.scene)
+        done += 1
+    ctx.scene.notify("layouts")
+    ctx.echo(f"Mirrored {done} sheet item(s).")
+
+
+@command("mirror", aliases=("mi",), space="any")
+def cmd_mirror(ctx):
+    lv = ctx.sheet_view()
+    if lv is not None:
+        yield from _mirror_on_paper(ctx, lv)
+        return
+    held, objs = yield from _what_to_transform(ctx, "Select objects to mirror")
+    p1 = yield PointReq("Start of mirror line", choices=_COPY)
+
+    def _mirror_normal(p):
+        import numpy as np
+        line = np.subtract(p, p1)
+        normal = np.cross(ctx.cplane.normal, line)
+        if np.linalg.norm(normal) < 1e-12:
+            normal = np.asarray(ctx.cplane.xdir)
+        return tuple(float(c) for c in normal)
+
+    pieces = _detached_parts(ctx, held) if held else []
+
+    def _preview(p):
+        n = _mirror_normal(p)
+        if held and ctx.opt("Copy", "No") == "Yes":
+            return _ghost_of([_transform_piece(shape, lambda s: g.mirror(
+                s, p1, n)) for shape, _src in pieces])
+        return _preview_of(ctx, held, objs, lambda s: g.mirror(s, p1, n))
+
+    p2 = yield PointReq("End of mirror line", rubber_from=p1,
+                        preview_fn=_preview, choices=_COPY,
+                        draft_fn=_drafted(ctx, held, _preview))
+    # mirror across the plane through the picked line, perpendicular to
+    # the construction plane
+    normal = _mirror_normal(p2)
+    if held:
+        if ctx.opt("Copy", "No") == "Yes":
+            # a copy of part of an object is an object of its own
+            _add_pieces(ctx, pieces, lambda s: g.mirror(s, p1, normal))
+            ctx.result_subobjects = (list(ctx.result_subobjects)
+                                     + _held_entries(held))
+            ctx.echo(f"Mirrored a copy of {len(pieces)} part(s) as objects "
+                     "of their own.")
+            return
+        _do(ctx, held, objs, lambda s: g.mirror(s, p1, normal), "Mirrored")
+        return
+    for o in objs:
+        mirrored = g.mirror(o.shape, p1, normal)
+        if ctx.opt("Copy", "No") == "Yes":
+            ctx.scene.add_from(mirrored, o)
+        else:
+            ctx.scene.replace_shape(o.id, mirrored)
+    ctx.select_result(objs)
+    ctx.echo(f"Mirrored {len(objs)} object(s).")
+
+
+ALIGNS = ("left", "center", "right", "across",
+          "top", "middle", "bottom", "down")
+
+
+def _extent_on(obj, cp):
+    """(u0, v0, u1, v1): the object's bounds measured on the plane."""
+    import numpy as np
+    mesh = obj.mesh
+    parts = [np.asarray(a, float).reshape(-1, 3)
+             for a in (mesh.vertices, mesh.edge_segments, mesh.points)
+             if a is not None and len(a)]
+    if parts:
+        pts = np.concatenate(parts)
+    else:
+        lo, hi = g.bbox(obj.shape)
+        pts = np.array([(x, y, z) for x in (lo[0], hi[0])
+                        for y in (lo[1], hi[1]) for z in (lo[2], hi[2])])
+    d = pts - np.asarray(cp.origin, float)
+    u, v = d @ np.asarray(cp.xdir, float), d @ np.asarray(cp.ydir, float)
+    return float(u.min()), float(v.min()), float(u.max()), float(v.max())
+
+
+@command("align")
+def cmd_align(ctx):
+    """Line up the picked objects on the view's plane, as a layout program
+    does: their edges or middles to the bounds of the pick, or spaced evenly
+    with the first and the last left where they are."""
+    import numpy as np
+
+    from ..ui.wyrm.align import arranged
+    objs = yield SelectReq("Select objects to align", min_count=2)
+    how = yield OptionReq("Align", options=list(ALIGNS), default="left")
+    if how in ("across", "down") and len(objs) < 3:
+        ctx.echo("Spacing evenly needs three objects or more.")
+        return
+    cp = ctx.cplane
+    xdir, ydir = np.asarray(cp.xdir, float), np.asarray(cp.ydir, float)
+    # as boxes on a page, which runs downwards: the plane's v turned over
+    boxes = []
+    for o in objs:
+        u0, v0, u1, v1 = _extent_on(o, cp)
+        boxes.append((u0, -v1, u1 - u0, v1 - v0))
+    for o, box, (x, y) in zip(objs, boxes, arranged(boxes, how)):
+        shift = (x - box[0]) * xdir - (y - box[1]) * ydir
+        if float(np.linalg.norm(shift)) < 1e-12:
+            continue
+        ctx.scene.replace_shape(o.id, g.translate(o.shape, tuple(shift)))
+    ctx.select_result(objs)
+    ctx.echo(f"Aligned {len(objs)} object(s) ({how}).")
+
+
+@command("arraypolar")
+def cmd_array_polar(ctx):
+    objs = yield SelectReq("Select objects to array")
+    center = yield PointReq("Center of polar array")
+    # the ring lies on the plane you are working on, so an array laid out in
+    # a Front pane stays in that pane instead of swinging away behind it
+    axis = tuple(float(a) for a in ctx.cplane.normal)
+
+    def _ring(count, total):
+        step = total / (count if abs(total - 360.0) < 1e-9 else count - 1)
+        return g.make_compound(
+            [g.rotate(o.shape, center, axis, step * i)
+             for i in range(1, count) for o in objs])
+
+    count = yield IntReq("Number of items", default=6, minimum=2,
+                         preview_fn=lambda v: _ring(v, 360.0))
+    total = yield NumberReq("Angle to fill (degrees)", default=360.0,
+                            preview_fn=lambda v: _ring(count, v))
+    step = total / (count if abs(total - 360.0) < 1e-9 else count - 1)
+    n = 0
+    with ctx.scene.batched():           # one notification, not one a copy
+        for i in range(1, count):
+            for o in objs:
+                ctx.scene.add_from(
+                    g.rotate(o.shape, center, axis, step * i), o)
+                n += 1
+    ctx.echo(f"Created {n} arrayed object(s) around {center}.")
+
+
+@command("arraypath", aliases=("arraycrv",))
+def cmd_array_path(ctx):
+    objs = yield SelectReq("Select objects to array")
+    paths = yield SelectReq("Select path curve", kinds=("curve",),
+                            max_count=1, allow_preselected=False)
+    count = yield IntReq("Number of items", default=6, minimum=2)
+    how = yield OptionReq("Orientation",
+                          options=["Freeform", "Roadlike", "None"],
+                          default="Freeform")
+    base = yield PointReq("Base point on the object(s)")
+    frames = g.sample_curve_frames(paths[0].shape, count)
+    # Roadlike's idea of up is the plane you are working on, so a path
+    # arrayed in the Front pane keeps its copies standing on that plane
+    # rather than on the world's floor.
+    up = tuple(float(a) for a in ctx.cplane.normal)
+    n = 0
+    with ctx.scene.batched():           # one notification, not one a copy
+        for frame in frames:
+            placement = _path_placement(frames[0], frame, base, how, up)
+            if placement is None:       # the copy that lands on the original
+                continue
+            for o in objs:
+                ctx.scene.add_from(g.apply_matrix(o.shape, placement), o)
+                n += 1
+    ctx.echo(f"Placed {n} object(s) along {paths[0].name}.")
+
+
+def _path_placement(first, frame, base, how, up):
+    """Where one arrayed copy goes, as a 4x4, or None if it would not move.
+
+    Turn it from the frame at the head of the path to the frame here, about
+    the base point, then set the base point down on the curve. Doing it in
+    that order is what keeps the base point exactly on its sample: the
+    rotation happens around the base, so it cannot drag the object off.
+    """
+    import numpy as np
+
+    if how == "Freeform":
+        rot = _axes(frame[1], frame[2]) @ _axes(first[1], first[2]).T
+    elif how == "Roadlike":
+        rot = _yaw_between(first[1], frame[1], up)
+    else:
+        rot = np.eye(3)
+    m = np.eye(4)
+    m[:3, :3] = rot
+    m[:3, 3] = np.asarray(frame[0], float) - rot @ np.asarray(base, float)
+    if np.allclose(m, np.eye(4), atol=1e-12):
+        return None
+    return m
+
+
+def _axes(tangent, up):
+    """The frame as a rotation matrix: its columns are where x, y and z end
+    up, so B_here @ B_start.T is the turn from one frame to the other."""
+    import numpy as np
+
+    t = np.asarray(tangent, float)
+    u = np.asarray(up, float)
+    return np.column_stack([t, u, np.cross(t, u)])
+
+
+def _yaw_between(t0, t1, up):
+    """The part of the turn that happens in plan. Both tangents are flattened
+    onto the plane `up` is normal to, and what is left is a rotation about
+    `up` alone: the copy swings to follow the path but never leans with it.
+    A tangent pointing straight up has no plan direction to follow, so that
+    stretch of the path leaves the copy facing the way it was."""
+    import numpy as np
+
+    n = np.asarray(up, float)
+    n = n / np.linalg.norm(n)
+    flat = []
+    for t in (t0, t1):
+        v = np.asarray(t, float)
+        v = v - float(np.dot(v, n)) * n
+        norm = np.linalg.norm(v)
+        if norm < 1e-9:
+            return np.eye(3)
+        flat.append(v / norm)
+    return _rotation_between(flat[0], flat[1])
+
+
+@command("array")
+def cmd_array(ctx):
+    objs = yield SelectReq("Select objects to array")
+    nx = yield IntReq("Count X", default=2, minimum=1)
+    ny = yield IntReq("Count Y", default=1, minimum=1)
+
+    def _grid(dx, dy):
+        # The objects' own meshes moved into place, not the copies built:
+        # this runs every time the mouse moves. With one spacing still to
+        # come the rows or columns fall on top of each other, and on the
+        # original, so each place is only drawn once.
+        offsets = dict.fromkeys((i * dx, j * dy, 0.0)
+                                for i in range(nx) for j in range(ny))
+        offsets.pop((0.0, 0.0, 0.0), None)
+        return copies_of([o.mesh for o in objs], list(offsets))
+
+    from . import dragging
+    from .base import PointReq
+    # spacing is centre to centre, so the drag starts at the centre of what
+    # is selected: wherever the cursor lands is where the next copy lands
+    centre = dragging.middle(objs)
+    xdir, ydir = tuple(ctx.cplane.xdir), tuple(ctx.cplane.ydir)
+    read_x = dragging.signed_along(centre, xdir)
+    read_y = dragging.signed_along(centre, ydir)
+
+    dx = read_x((yield PointReq("Spacing X (click, or type a number)",
+                                axis_lock=(centre, xdir),
+                                number_from=(centre, xdir),
+                                rubber_from=centre,
+                                preview_fn=lambda p: _grid(read_x(p), 0.0))))
+    dy = 0.0
+    if ny > 1:
+        dy = read_y((yield PointReq(
+            "Spacing Y (click, or type a number)",
+            axis_lock=(centre, ydir), number_from=(centre, ydir),
+            rubber_from=centre,
+            preview_fn=lambda p: _grid(dx, read_y(p)))))
+    n = 0
+    # One notification for the array, not one per copy: the counts are typed
+    # by the user and 40x40 is an ordinary thing to type. See Scene.batched.
+    with ctx.scene.batched():
+        for i in range(nx):
+            for j in range(ny):
+                if i == 0 and j == 0:
+                    continue
+                for o in objs:
+                    ctx.scene.add_from(
+                        g.translate(o.shape, (i * dx, j * dy, 0)), o)
+                    n += 1
+    ctx.echo(f"Created {n} arrayed object(s).")
+
+
+def _rotation_between(v1, v2):
+    """3x3 rotation taking direction v1 to v2 (numpy, Rodrigues)."""
+    import numpy as np
+    a = np.asarray(v1, float)
+    b = np.asarray(v2, float)
+    a = a / np.linalg.norm(a)
+    b = b / np.linalg.norm(b)
+    v = np.cross(a, b)
+    c = float(np.dot(a, b))
+    s = float(np.linalg.norm(v))
+    if s < 1e-12:
+        if c > 0:
+            return np.eye(3)
+        # antiparallel: rotate pi about any axis perpendicular to a
+        perp = np.cross(a, [1.0, 0.0, 0.0])
+        if np.linalg.norm(perp) < 1e-9:
+            perp = np.cross(a, [0.0, 1.0, 0.0])
+        perp = perp / np.linalg.norm(perp)
+        return 2.0 * np.outer(perp, perp) - np.eye(3)
+    k = v / s
+    kx = np.array([[0, -k[2], k[1]], [k[2], 0, -k[0]], [-k[1], k[0], 0]])
+    angle = float(np.arctan2(s, c))
+    import math
+    return (np.eye(3) + math.sin(angle) * kx
+            + (1 - math.cos(angle)) * (kx @ kx))
+
+
+def _frame(p1, p2, p3):
+    """Orthonormal basis from three points (x along p1->p2)."""
+    import numpy as np
+    x = np.asarray(p2, float) - np.asarray(p1, float)
+    nx = np.linalg.norm(x)
+    if nx < 1e-12:
+        raise g.GeometryError("Reference points coincide")
+    x = x / nx
+    v = np.asarray(p3, float) - np.asarray(p1, float)
+    z = np.cross(x, v)
+    nz = np.linalg.norm(z)
+    if nz < 1e-12:
+        raise g.GeometryError("Points are collinear")
+    z = z / nz
+    return np.column_stack([x, np.cross(z, x), z])
+
+
+def _similarity(rot3, scale, src_origin, dst_origin):
+    """4x4 taking src_origin to dst_origin with rotation and scale."""
+    import numpy as np
+    A = rot3 * float(scale)
+    M = np.eye(4)
+    M[:3, :3] = A
+    M[:3, 3] = np.asarray(dst_origin, float) - A @ np.asarray(src_origin,
+                                                              float)
+    return M
+
+
+def _place(ctx, objs, matrix, copy: bool):
+    made = []
+    for o in objs:
+        shape = g.apply_matrix(o.shape, matrix)
+        if copy:
+            made.append(ctx.scene.add_from(shape, o))
+        else:
+            ctx.scene.replace_shape(o.id, shape)
+            made.append(o)
+    return made
+
+
+def _numbered(*pts):
+    return [(p, str(i)) for i, p in enumerate(pts, 1)]
+
+
+def _held_orient(ctx, held, matrix_at):
+    """preview_fn and draft_fn for orienting held parts with the matrix
+    `matrix_at(point)` gives (4x4): copies show the detached pieces, a
+    reshape the moving edges while the cursor moves."""
+    pieces = _detached_parts(ctx, held)
+
+    def _copying():
+        return ctx.opt("Copy", "No") == "Yes"
+
+    def preview(p):
+        m = matrix_at(p)
+        if _copying():
+            return _ghost_of([_transform_piece(shape, lambda s: g.apply_matrix(
+                s, m)) for shape, _src in pieces])
+        return _preview_of(ctx, held, [], lambda s: g.apply_matrix(s, m))
+
+    parts_draft = _parts_draft(ctx, held, lambda p: matrix_at(p)[:3])
+
+    def draft(p):
+        if _copying() or parts_draft is None:
+            return None
+        return parts_draft(p)
+
+    return preview, (draft if parts_draft is not None else None), pieces
+
+
+def _orient_held(ctx, held, pieces, matrix, verb):
+    """Orient what is held: copies of it as objects of their own, or the
+    parts themselves reshaped into place."""
+    if ctx.opt("Copy", "No") == "Yes":
+        _add_pieces(ctx, pieces, lambda s: g.apply_matrix(s, matrix))
+        ctx.result_subobjects = list(ctx.result_subobjects) + _held_entries(held)
+        ctx.echo(f"{verb} a copy of {len(pieces)} part(s) as objects of "
+                 "their own.")
+        return
+    _do(ctx, held, [], lambda s: g.apply_matrix(s, matrix), verb)
+
+
+def _slide_ghost(objs, r1):
+    """The objects carried across with the first target: it settles where
+    they go, not how they turn, so the next picks show the turn."""
+    def _slide(p):
+        shift = tuple(a - b for a, b in zip(p, r1))
+        return _ghost(objs, lambda s: g.translate(s, shift))
+    return _slide
+
+
+@command("orient", aliases=("o2",))
+def cmd_orient(ctx):
+    """Remap objects from two reference points to two target points
+    (rotation + translation, Scale=Yes matches the point spacing)."""
+    import numpy as np
+    opts = {"Copy": ["No", "Yes"], "Scale": ["No", "Yes"]}
+    held, objs = yield from _what_to_transform(ctx, "Select objects to orient")
+    r1 = yield PointReq("First reference point", choices=opts)
+    r2 = yield PointReq("Second reference point", rubber_from=r1,
+                        marks=_numbered(r1), choices=opts)
+    refs = _numbered(r1, r2)
+    t1 = yield PointReq("First target point", marks=refs, choices=opts,
+                        preview_fn=None if held else _slide_ghost(objs, r1))
+
+    def _matrix(t2):
+        v1 = np.subtract(r2, r1)
+        v2 = np.subtract(t2, t1)
+        if np.linalg.norm(v1) < 1e-12 or np.linalg.norm(v2) < 1e-12:
+            raise g.GeometryError("Reference points coincide")
+        s = (np.linalg.norm(v2) / np.linalg.norm(v1)
+             if ctx.opt("Scale", "No") == "Yes" else 1.0)
+        return _similarity(_rotation_between(v1, v2), s, r1, t1)
+
+    def _preview(p):
+        m = _matrix(p)
+        return _ghost(objs, lambda s: g.apply_matrix(s, m))
+
+    draft = None
+    if held:
+        _preview, draft, pieces = _held_orient(ctx, held, _matrix)
+    t2 = yield PointReq("Second target point", rubber_from=t1, marks=refs,
+                        choices=opts, preview_fn=_preview, draft_fn=draft)
+    if held:
+        _orient_held(ctx, held, pieces, _matrix(t2), "Oriented")
+        return
+    copy = ctx.opt("Copy", "No") == "Yes"
+    ctx.select_result(objs)
+    made = _place(ctx, objs, _matrix(t2), copy)
+    verb = "Oriented a copy of" if copy else "Oriented"
+    ctx.echo(f"{verb} {len(made)} object(s)"
+             + (" (scaled to fit)." if ctx.opt("Scale", "No") == "Yes"
+                else "."))
+
+
+@command("orient3pt", aliases=("o3",))
+def cmd_orient3pt(ctx):
+    """Remap objects from three reference points to three target points
+    (full 3D reorientation)."""
+    opts = {"Copy": ["No", "Yes"]}
+    held, objs = yield from _what_to_transform(ctx, "Select objects to orient")
+    r1 = yield PointReq("First reference point", choices=opts)
+    r2 = yield PointReq("Second reference point", rubber_from=r1,
+                        marks=_numbered(r1), choices=opts)
+    r3 = yield PointReq("Third reference point", rubber_from=r2,
+                        marks=_numbered(r1, r2), choices=opts)
+    refs = _numbered(r1, r2, r3)
+    t1 = yield PointReq("First target point", marks=refs, choices=opts,
+                        preview_fn=None if held else _slide_ghost(objs, r1))
+    t2 = yield PointReq("Second target point", rubber_from=t1, marks=refs,
+                        choices=opts)
+
+    def _matrix(t3):
+        rot = _frame(t1, t2, t3) @ _frame(r1, r2, r3).T
+        return _similarity(rot, 1.0, r1, t1)
+
+    def _preview(p):
+        m = _matrix(p)
+        return _ghost(objs, lambda s: g.apply_matrix(s, m))
+
+    draft = None
+    if held:
+        _preview, draft, pieces = _held_orient(ctx, held, _matrix)
+    t3 = yield PointReq("Third target point", rubber_from=t2, marks=refs,
+                        choices=opts, preview_fn=_preview, draft_fn=draft)
+    if held:
+        _orient_held(ctx, held, pieces, _matrix(t3), "Oriented")
+        return
+    copy = ctx.opt("Copy", "No") == "Yes"
+    ctx.select_result(objs)
+    made = _place(ctx, objs, _matrix(t3), copy)
+    verb = "Oriented a copy of" if copy else "Oriented"
+    ctx.echo(f"{verb} {len(made)} object(s) onto the target frame.")
+
+
+@command("rotate3d", aliases=("ro3",))
+def cmd_rotate3d(ctx):
+    """Rotate around an arbitrary axis picked as two points: type an
+    angle, or point at a reference direction and swing it round to where
+    it should end up (live preview)."""
+    import math
+
+    import numpy as np
+    held, objs = yield from _what_to_transform(ctx, "Select objects to rotate")
+    p1 = yield PointReq("Start of rotation axis")
+    p2 = yield PointReq("End of rotation axis", rubber_from=p1)
+    axis = tuple(np.subtract(p2, p1))
+    if float(np.linalg.norm(axis)) < 1e-12:
+        ctx.echo("Zero-length axis — cancelled.")
+        return
+    unit = np.asarray(axis, float)
+    unit /= np.linalg.norm(unit)
+
+    def _round_the_axis(p):
+        """The part of the direction p1 -> p that goes round the axis.
+
+        `rotate` can skip this: it turns about the construction plane
+        normal and its reference points are picked on that plane, so they
+        are square to the axis already. Here the axis is any two points in
+        space, so a reference picked well along it is mostly naming the
+        axis itself, and the leftover would report a turn of almost
+        nothing however far round the second pick went.
+        """
+        v = np.subtract(p, p1)
+        return v - np.dot(v, unit) * unit
+
+    pa = np.asarray(p1, float)
+    axis_line = [tuple(pa), tuple(np.asarray(p2, float))]
+
+    def _foot(p):
+        """Where `p` turns about: its own point on the axis."""
+        return pa + unit * float(np.dot(np.subtract(p, pa), unit))
+
+    def _turn(center, start, by, steps=64):
+        """Points along the circle about the axis from `start`, `by` round."""
+        r = np.subtract(start, center)
+        side = np.cross(unit, r)
+        return [tuple(center + math.cos(t) * r + math.sin(t) * side)
+                for t in np.linspace(0.0, by, max(2, int(steps * abs(by)
+                                                         / (2 * math.pi)) + 2))]
+
+    def _circle_guide(p):
+        c = _foot(p)
+        if float(np.linalg.norm(np.subtract(p, c))) < 1e-9:
+            return [axis_line]
+        return [axis_line, _turn(c, p, 2 * math.pi)]
+
+    ref = yield PointReq("Angle in degrees, or first reference point",
+                         rubber_pts=[p1, p2], rubber_band=False,
+                         guide_fn=_circle_guide, allow_number=True,
+                         choices={"Copy": ["No", "Yes"]})
+    if isinstance(ref, float):
+        angle = ref
+    else:
+        v1 = _round_the_axis(ref)
+        if float(np.linalg.norm(v1)) < 1e-9:
+            ctx.echo("Reference point is on the axis — cancelled.")
+            return
+
+        def _angle(p):
+            v2 = _round_the_axis(p)
+            return math.degrees(math.atan2(
+                float(np.dot(np.cross(v1, v2), unit)), float(np.dot(v1, v2))))
+
+        pieces = _detached_parts(ctx, held) if held else []
+
+        def _preview(p):
+            a = p if isinstance(p, float) else _angle(p)
+            if held and ctx.opt("Copy", "No") == "Yes":
+                return _ghost_of([_transform_piece(shape, lambda s: g.rotate(
+                    s, p1, axis, a)) for shape, _src in pieces])
+            return _preview_of(ctx, held, objs,
+                               lambda s: g.rotate(s, p1, axis, a))
+
+        center = _foot(ref)
+
+        def _swept_guide(p):
+            """The part of the circle turned so far, between the radii to
+            where it started and to where it has got."""
+            if isinstance(p, float):
+                return [axis_line]
+            to = np.subtract(p, center)
+            to -= np.dot(to, unit) * unit
+            return [axis_line, [tuple(center), tuple(ref)],
+                    [tuple(center), tuple(center + to)],
+                    _turn(center, ref, math.radians(_angle(p)))]
+
+        # held to the plane the reference turns in, so the cursor swings it
+        # round freely wherever the axis points, snap or no snap
+        p3 = yield PointReq("Angle, or second reference point",
+                            rubber_pts=[p1, p2, ref], rubber_band=False,
+                            pick_plane=(tuple(center), tuple(unit)),
+                            guide_fn=_swept_guide, allow_number=True,
+                            preview_fn=_preview,
+                            draft_fn=_drafted(ctx, held, _preview))
+        angle = p3 if isinstance(p3, float) else _angle(p3)
+    copy = ctx.opt("Copy", "No") == "Yes"
+    if held:
+        if copy:
+            # a copy of part of an object is an object of its own
+            pieces = _detached_parts(ctx, held)
+            _add_pieces(ctx, pieces, lambda s: g.rotate(s, p1, axis, angle))
+            ctx.result_subobjects = (list(ctx.result_subobjects)
+                                     + _held_entries(held))
+            ctx.echo(f"Rotated a copy of {len(pieces)} part(s) as objects "
+                     "of their own.")
+            return
+        _do(ctx, held, objs, lambda s: g.rotate(s, p1, axis, angle),
+            "Rotated", f" by {angle:g} degrees around the picked axis")
+        return
+    for o in objs:
+        rotated = g.rotate(o.shape, p1, axis, angle)
+        if copy:
+            ctx.scene.add_from(rotated, o)
+        else:
+            ctx.scene.replace_shape(o.id, rotated)
+    verb = "Rotated a copy of" if copy else "Rotated"
+    ctx.echo(f"{verb} {len(objs)} object(s) {angle:g} degrees "
+             "around the picked axis.")
+
+
+@command("setpt", aliases=("setpoints",))
+def cmd_setpt(ctx):
+    """Force chosen coordinates of every control point to one value —
+    the classic way to flatten walls onto a level (Z) or line things
+    up on an axis."""
+    held = {kind: parts for kind, parts in ctx.held_parts().items()
+            if kind in ("segment", "face", "edge", "point")}
+    objs = [] if held else (yield SelectReq(
+        "Select curves, surfaces or points", kinds=("curve", "surface", "point")))
+
+    def _axes():
+        return (ctx.opt("X", "No") == "Yes", ctx.opt("Y", "No") == "Yes",
+                ctx.opt("Z", "Yes") == "Yes")
+
+    def _preview(point):
+        axes = _axes()
+        if not any(axes):
+            return None
+        return _preview_of(
+            ctx, held, objs, lambda shape: g.set_points(shape, point, axes),
+            action=("setpt", point, axes))
+
+    target = yield PointReq(
+        "Target point",
+        choices={"X": ["No", "Yes"], "Y": ["No", "Yes"],
+                 "Z": ["Yes", "No"]}, preview_fn=_preview,
+        draft_fn=_parts_draft(
+            ctx, held, lambda p: g.setting_matrix(p, _axes())
+            if any(_axes()) else None))
+    axes = _axes()
+    if not any(axes):
+        ctx.echo("All axes set to No — nothing to do.")
+        return
+    tags = "".join(a for a, on in zip("XYZ", axes) if on)
+    if held:
+        _do(ctx, held, [], lambda shape: g.set_points(shape, target, axes),
+            f"Set {tags} on", action=("setpt", target, axes))
+        return
+    n = 0
+    for o in objs:
+        try:
+            ctx.scene.replace_shape(o.id, g.set_points(o.shape, target, axes))
+            n += 1
+        except g.GeometryError as exc:
+            ctx.echo(f"{o.name}: {exc}")
+    ctx.echo(f"Set {tags} on {n} object(s).")
+
+
+@command("projecttocplane", aliases=("flatten",))
+def cmd_projecttocplane(ctx):
+    """Flatten curves/surfaces/points onto the construction plane."""
+    objs = yield SelectReq("Select objects to flatten",
+                           kinds=("curve", "surface", "point"))
+    origin = tuple(ctx.cplane.origin)
+    normal = tuple(ctx.cplane.normal)
+    n = 0
+    for o in objs:
+        try:
+            ctx.scene.replace_shape(
+                o.id, g.project_to_plane(o.shape, origin, normal))
+            n += 1
+        except g.GeometryError as exc:
+            ctx.echo(f"{o.name}: {exc}")
+    ctx.echo(f"Flattened {n} object(s) onto the CPlane.")
+
+
+@command("scale1d", space="any")
+def cmd_scale1d(ctx):
+    """Stretch along one direction only: type a factor and it stretches
+    the way the cursor is pointing, or set the axis with a reference point
+    and drag that to where it should end up."""
+    import math
+    lv = ctx.sheet_view()
+    if lv is not None:
+        yield from _scale_on_paper(ctx, lv, one_way=True)
+        return
+    held, objs = yield from _what_to_transform(
+        ctx, "Select objects to scale in one direction")
+    base = yield PointReq("Base point")
+
+    def _stretch(axis, factor):
+        _do(ctx, held, objs,
+            lambda s: g.scale_along_axis(s, base, axis, factor),
+            "Scaled", f" by {factor:g} along the axis")
+
+    ref = yield PointReq("Scale factor, or first reference point",
+                         rubber_from=base, allow_number=True)
+    if isinstance(ref, float):
+        # The number says how much, never which way. The cursor has been
+        # saying which way all along, and where there is no cursor to ask
+        # — a batch, or the bridge — the CPlane's own x direction does.
+        if abs(ref) < 1e-9:
+            ctx.echo("Zero scale factor — cancelled.")
+            return
+        aim = ctx.aim_direction()
+        _stretch(aim[1] if aim is not None else tuple(ctx.cplane.xdir), ref)
+        return
+    axis = tuple(b - a for a, b in zip(base, ref))
+    d0 = math.dist(base, ref)
+    if d0 < 1e-12:
+        ctx.echo("Reference point is on the base point — cancelled.")
+        return
+
+    def _factor(p):
+        if isinstance(p, float):
+            return p
+        # project the pick onto the axis to get the new length
+        v = [c - b for b, c in zip(base, p)]
+        along = sum(x * a for x, a in zip(v, axis)) / d0
+        return along / d0
+
+    def _preview(p):
+        f = _factor(p)
+        if abs(f) < 1e-9:
+            return None
+        return _preview_of(ctx, held, objs,
+                           lambda s: g.scale_along_axis(s, base, axis, f))
+
+    # on the axis, where the stretch is measured: a snap there says how
+    # far, and the axis running into another part's edge is a place to snap
+    p2 = yield PointReq("New reference point (or type factor)",
+                        rubber_from=base, allow_number=True,
+                        axis_lock=(tuple(base), axis),
+                        preview_fn=_preview,
+                        draft_fn=_drafted(ctx, held, _preview))
+    factor = _factor(p2)
+    if abs(factor) < 1e-9:
+        ctx.echo("Zero scale factor — cancelled.")
+        return
+    _stretch(axis, factor)
+
+
+@command("scale2d", space="any")
+def cmd_scale2d(ctx):
+    """Scale in the CPlane only (thickness along the CPlane normal is
+    kept)."""
+    import math
+    lv = ctx.sheet_view()
+    if lv is not None:
+        yield from _scale_on_paper(ctx, lv, one_way=False)
+        return
+    held, objs = yield from _what_to_transform(
+        ctx, "Select objects to scale in the CPlane")
+    base = yield PointReq("Base point")
+    normal = tuple(ctx.cplane.normal)
+
+    def _apply(s, f):
+        return g.scale_along_axis(g.scale(s, base, f), base, normal, 1.0 / f)
+
+    ref = yield PointReq("Scale factor, or first reference point",
+                         rubber_from=base, allow_number=True)
+    if isinstance(ref, float):
+        factor = ref
+    else:
+        d0 = math.dist(base, ref)
+        if d0 < 1e-12:
+            ctx.echo("Reference point is on the base point — cancelled.")
+            return
+
+        def _factor(p):
+            return p if isinstance(p, float) else math.dist(base, p) / d0
+
+        def _preview(p):
+            f = _factor(p)
+            return None if abs(f) < 1e-9 \
+                else _preview_of(ctx, held, objs, lambda s: _apply(s, f))
+
+        p2 = yield PointReq("Second reference point (drag to scale)",
+                            rubber_from=base, allow_number=True,
+                            preview_fn=_preview,
+                            draft_fn=_drafted(ctx, held, _preview))
+        factor = _factor(p2)
+    if abs(factor) < 1e-9:
+        ctx.echo("Zero scale factor — cancelled.")
+        return
+    _do(ctx, held, objs, lambda s: _apply(s, factor), "Scaled",
+        f" by {factor:g} in the CPlane")

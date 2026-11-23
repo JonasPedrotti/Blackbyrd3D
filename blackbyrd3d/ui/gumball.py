@@ -1,0 +1,2969 @@
+"""Gumball: on-object move/rotate/scale manipulator.
+
+Handles (aligned to the construction plane, anchored at the selection
+centre, constant screen size):
+  - axis arrows        -> move along axis
+  - plane pads         -> move in plane
+  - circles            -> rotate about axis (Shift snaps to 15 degrees)
+  - square knobs       -> scale along axis (Shift scales uniformly)
+
+Precision: drag a handle for feel, or click it and type an exact value
+(distance / angle / factor) then Enter — the value previews live while
+you type. Grid snap rounds move drags to the grid step. Alt-drag any
+move, rotate or scale handle works on a copy. Escape cancels.
+"""
+
+from __future__ import annotations
+
+import math
+
+import numpy as np
+from OpenGL import GL
+from PySide6.QtCore import Qt
+
+from ..core import geometry as g
+from ..utils.math3d import ray_line_parameter, ray_plane_any
+
+AXIS_COLORS = ((0.86, 0.33, 0.31), (0.42, 0.72, 0.35), (0.35, 0.55, 0.92))
+HOVER_COLOR = (1.0, 0.85, 0.3)
+PP_COLOR = (0.85, 0.71, 0.29)    # push/pull arrow on a face (brand gold)
+FILLET_COLOR = (0.44, 0.74, 0.86)   # fillet radius handle on edges (teal)
+PAD_ALPHA = 0.35
+SIZE_PX = 78.0            # on-screen gumball radius
+SHAFT0, SHAFT1 = 0.18, 1.0
+CONE1 = 1.22
+
+
+def _arc(anchor, u, v, radius, n):
+    """The quarter of a ring from -u round to -v: the three of them close an
+    eighth of a sphere on the side away from the arrows, as Rhino draws it."""
+    return [anchor - radius * (u * math.cos(t) + v * math.sin(t))
+            for t in (k / n * math.pi / 2 for k in range(n + 1))]
+
+
+def _turned(p, anchor, axis, degrees):
+    """`p` turned about the line through `anchor` along `axis`."""
+    k = np.asarray(axis, float)
+    k = k / (np.linalg.norm(k) or 1.0)
+    v = np.asarray(p, float) - anchor
+    a = math.radians(degrees)
+    return (anchor + v * math.cos(a) + np.cross(k, v) * math.sin(a)
+            + k * float(np.dot(k, v)) * (1.0 - math.cos(a)))
+
+
+def _alt_held(modifiers) -> bool:
+    """Alt state, robust to a Qt KeyboardModifiers flag or a plain int."""
+    m = getattr(modifiers, "value", modifiers)          # Qt flag -> int
+    return bool(int(m) & int(Qt.KeyboardModifier.AltModifier.value))
+
+
+def _ctrl_held(modifiers) -> bool:
+    """Ctrl state, read the same way, for the arrow that extrudes."""
+    m = getattr(modifiers, "value", modifiers)          # Qt flag -> int
+    return bool(int(m) & int(Qt.KeyboardModifier.ControlModifier.value))
+
+
+def _ctrl_down() -> bool:
+    """Whether Ctrl is held right now, asked of the application."""
+    from PySide6.QtWidgets import QApplication
+    return _ctrl_held(QApplication.keyboardModifiers())
+
+
+# The filled box on the shaft grows the thing; scale is the hollow box on the
+# far side of the pivot, on a dashed leader that mirrors the shaft. Each axis
+# then reads as one handle with an end of its own either way, and two boxes
+# that look different and sit at opposite ends are never mistaken for each
+# other, so neither asks you to hold a key down while you drag.
+# The hollow box stands where the selection ends on that side, so it is
+# taken hold of at the edge it moves. DASH0 and SCALE_MIN are distances back
+# along -axis, in gumball sizes; SCALE_POS is where it goes with nothing to
+# measure. See _leader and scale_reach.
+EXT_POS = 0.6
+DASH0, SCALE_MIN, SCALE_POS = 0.18, 0.36, 1.66
+DASH_PERIOD = 0.25
+ARC_R = 0.82
+PAD0, PAD1 = 0.28, 0.5
+CENTER_R = 0.07             # the pivot's own circle, in gumball sizes
+ALIGNMENTS = ("object", "cplane", "world", "view")
+CENTER_COLOR = (0.92, 0.92, 0.95)
+
+# handle ids: ("move",axis) ("pad",axis) ("rot",axis) ("scale",axis)
+#             ("center",0) — the pivot: drag to move freely, right-click to
+#             choose what the axes are aligned to
+#             ("ext",axis) — the filled box, where there is something to grow
+_ONE_DOF = ("move", "rot", "scale", "ext")   # take a single typed value
+
+
+class Gumball:
+    def __init__(self, viewport):
+        self.vp = viewport
+        self._enabled = True           # only when there is no config to ask
+        self.hover = None
+        self.drag = None          # dict with handle, originals, refs
+        self._geom_cache = None
+        self._sweep_key = None    # what _sweep_sources was last asked about
+        self._sweep_cache: list = []
+        self._sweep_axes: dict = {}
+        self._memo: dict = {}          # sub-object targets, per scene state
+        self._spans: dict = {}         # (state, axes, lo, hi) per shape
+        self._align = None             # only when there is no config to ask
+        self._menu = None              # the alignment menu while it is open
+
+    # ------------------------------------------------------------ settings
+
+    def _config(self):
+        """The settings every pane shares, or None (a bare test viewport)."""
+        cfg = self.vp.config
+        return cfg if cfg is not None and hasattr(cfg, "set") else None
+
+    def _settings(self, **change) -> dict:
+        """The gumball's settings as the one entry they are saved as, with
+        `change` applied.
+
+        The on/off switch used to be saved as the whole entry, a bare true
+        or false, which left nowhere to keep an alignment beside it: turning
+        the gumball off and on again forgot the alignment, and choosing one
+        after that raised. A bare switch read here becomes the entry's
+        "enabled" and keeps its value.
+        """
+        entry = self._config().get("gumball", default=None)
+        out = (dict(entry) if isinstance(entry, dict)
+               else {"enabled": True if entry is None else bool(entry)})
+        out.update(change)
+        return out
+
+    def _repaint_panes(self):
+        """Every pane draws the gumball the settings describe."""
+        panes = getattr(getattr(self.vp, "window", lambda: None)(),
+                        "all_viewports", None)
+        for pane in (panes() if panes else [self.vp]):
+            if hasattr(pane, "update"):
+                pane.update()
+
+    @property
+    def enabled(self) -> bool:
+        """Whether the gumball shows on what is picked. Read from the
+        settings each time, as the alignment is, so the panes cannot
+        disagree about it."""
+        cfg = self._config()
+        if cfg is None:
+            return self._enabled
+        entry = cfg.get("gumball", default=True)
+        if isinstance(entry, dict):
+            return bool(entry.get("enabled", True))
+        return bool(entry)
+
+    @enabled.setter
+    def enabled(self, value):
+        self.set_enabled(value)
+
+    def set_enabled(self, value: bool):
+        self._enabled = bool(value)
+        cfg = self._config()
+        if cfg is not None:
+            cfg.set("gumball", self._settings(enabled=self._enabled))
+        self._repaint_panes()
+
+    # ------------------------------------------------------------ alignment
+
+    @property
+    def align(self) -> str:
+        """Which axes the handles follow, as Rhino's GumballAlignment names
+        them: "object" (the object's own frame, see `_object_axes`; a held
+        face or edge's own frame), "cplane", "world" or "view"."""
+        cfg = self._config()
+        value = (cfg.get("gumball", "align", default="object")
+                 if cfg is not None else self._align)
+        return value if value in ALIGNMENTS else "object"
+
+    def set_align(self, value: str):
+        if value not in ALIGNMENTS:
+            raise ValueError(f"align must be one of {ALIGNMENTS}")
+        cfg = self._config()
+        if cfg is not None:
+            cfg.set("gumball", self._settings(align=value))
+        self._align = value
+        self._memo.clear()
+        self._repaint_panes()
+
+    def menu_rows(self) -> list:
+        """(label, value, on, offered) for the alignment menu."""
+        current = self.align
+        return [("Align to object", "object", current == "object", True),
+                ("Align to CPlane", "cplane", current == "cplane", True),
+                ("Align to world", "world", current == "world", True),
+                ("Align to view", "view", current == "view", True)]
+
+    def open_menu(self, px, py):
+        """Offer every alignment at the cursor, with the current one checked."""
+        from PySide6.QtCore import QPoint
+        from PySide6.QtGui import QAction, QActionGroup
+        from PySide6.QtWidgets import QMenu
+        vp = self.vp
+        if not hasattr(vp, "mapToGlobal"):
+            return None
+        from .object_chooser import ObjectChooser
+        menu = QMenu(vp)
+        menu.setStyleSheet(ObjectChooser.STYLE + """
+            QMenu::item { padding: 5px 22px 5px 26px; color: #e8e8ea; }
+            QMenu::item:selected { background: #4a3f28; color: #f0d9a8; }
+            QMenu::item:disabled { color: #6b6c72; }
+            QMenu::indicator { width: 12px; height: 12px; left: 8px; }
+        """)
+        group = QActionGroup(menu)
+        group.setExclusive(True)
+        for label, value, on, offered in self.menu_rows():
+            act = QAction(label, menu)
+            act.setCheckable(True)
+            act.setChecked(on)
+            act.setEnabled(offered)
+            act.setData(value)
+            group.addAction(act)
+            menu.addAction(act)
+        menu.triggered.connect(lambda a: self.set_align(a.data()))
+        menu.aboutToHide.connect(lambda: setattr(self, "_menu", None))
+        self._menu = menu
+        menu.popup(vp.mapToGlobal(QPoint(int(px), int(py))))
+        return menu
+
+    def _foreign_axes(self):
+        """The world, CPlane or view axes when asked for, else None."""
+        if self.align == "world":
+            return (np.array([1.0, 0.0, 0.0]), np.array([0.0, 1.0, 0.0]),
+                    np.array([0.0, 0.0, 1.0]))
+        if self.align == "cplane":
+            cp = self._plane()
+            return (np.asarray(cp.xdir, float), np.asarray(cp.ydir, float),
+                    np.asarray(cp.normal, float))
+        if self.align == "view":
+            right, up = self.vp._eye().right_up()
+            return right, up, np.cross(right, up)
+        return None
+
+    def _object_frame(self, shape):
+        """An object's geometric frame, without any CPlane-dependent axes."""
+        from ..core import occ
+        from ..core.hatch import HatchShape
+        from ..core.picture import PictureShape
+        from ..core.text_object import TextShape
+
+        if isinstance(shape, TextShape):
+            frame = shape.frame
+            x, y = frame[:3, 0], frame[:3, 1]
+            return "axes", (x / np.linalg.norm(x), y / np.linalg.norm(y),
+                            np.asarray(shape.plane_normal, float))
+        if isinstance(shape, HatchShape):
+            return "axes", tuple(shape.frame[:3, i] for i in range(3))
+        from ..core.dimension import DimensionShape
+        if isinstance(shape, DimensionShape):
+            return "axes", shape.frame()[1:]
+        if isinstance(shape, PictureShape):
+            x = np.asarray(shape.plane["u"], float)
+            z = np.cross(x, np.asarray(shape.plane["v"], float))
+            if np.linalg.norm(x) < 1e-12 or np.linalg.norm(z) < 1e-12:
+                return None
+            x, z = x / np.linalg.norm(x), z / np.linalg.norm(z)
+            return "axes", (x, np.cross(z, x), z)
+        if not isinstance(shape, occ.TopoDS_Shape):
+            return None
+        kind = shape.ShapeType()
+        if kind in (occ.FACE, occ.SHELL):
+            faces = g.faces_of(shape)
+            if len(faces) == 1:
+                try:
+                    return "face", np.asarray(g.face_normal(faces[0]), float)
+                except g.GeometryError:      # a free-form surface has no frame
+                    pass
+            return None
+        if kind not in (occ.EDGE, occ.WIRE):
+            return None
+        curves = [occ.edge_adaptor(edge) for edge in g.edges_of(shape)]
+        if not curves:
+            return None
+        if all(curve.GetType() == occ.GeomAbs_CurveType.GeomAbs_Line
+               for curve in curves):
+            line = curves[0].Line()
+            x = np.asarray(g.pnt_tuple(line.Direction()), float)
+            origin = np.asarray(g.pnt_tuple(line.Location()), float)
+            # A collinear wire is also reported planar, but that arbitrary
+            # plane cannot tell us which way its gumball ought to point.
+            points = [np.asarray(g.pnt_tuple(curve.Value(t)), float)
+                      for curve in curves
+                      for t in (curve.FirstParameter(), curve.LastParameter())]
+            if all(np.linalg.norm(np.cross(p - origin, x)) < 1e-6
+                   for p in points):
+                return "line", x
+        surface = occ.BRepLib_FindSurface(shape, -1.0, True, False)
+        if surface.Found():
+            normal = surface.Surface().Pln().Axis().Direction()
+            return "curve", np.asarray(g.pnt_tuple(normal), float)
+        return None
+
+    def _object_axes(self, obj, cp):
+        """One whole object's axes, combined with the live CPlane."""
+        frame = self._remembered(("frame", obj.id),
+                                lambda: self._object_frame(obj.shape))
+        if frame is None:
+            return None
+        kind, basis = frame
+        if kind == "axes":
+            return basis
+        if kind == "line":
+            x = basis
+            z = np.asarray(cp.normal, float) - np.dot(cp.normal, x) * x
+            if np.linalg.norm(z) < 1e-6:
+                z = np.asarray(cp.ydir, float) - np.dot(cp.ydir, x) * x
+            z /= np.linalg.norm(z)
+        else:
+            z = basis
+            if kind == "curve" and np.dot(z, cp.normal) < 0:
+                z = -z
+            for want in (cp.xdir, cp.ydir, (1, 0, 0)):
+                x = np.asarray(want, float) - np.dot(want, z) * z
+                if np.linalg.norm(x) > 1e-6:
+                    break
+            x /= np.linalg.norm(x)
+        return x, np.cross(z, x), z
+
+    # ----------------------------------------------------------- state
+
+    def active(self) -> bool:
+        vp = self.vp
+        # A sheet on its own has nothing for a gumball to hold — paper geometry
+        # is dragged by its own ink — but inside a detail what is picked is a
+        # model object, so it gets the handles the model window gives it.
+        on_model = vp.space == "model" or vp._detail_eye() is not None
+        if not (self.enabled and on_model and not vp.point_mode):
+            return False
+        if self.drag is not None:            # a drag stays live to its end
+            return True
+        return (bool(vp.selection.ids)
+                or self._tf_target() is not None
+                or self._cv_target() is not None
+                or self._pushpull_target() is not None
+                or self._multiface_target() is not None
+                or self._parts_target() is not None
+                or self._segment_target() is not None
+                or self._fillet_target() is not None)
+
+    def _tf_target(self):
+        """({obj_id: (faces, edges, corners)}, anchor) for held faces, edges
+        and corners of surfaces and solids, which the whole gumball moves,
+        turns and scales as Rhino's does; else None. Holding Ctrl asks for
+        the other gumball instead: push/pull for a face, fillet for an
+        edge. Only when nothing else is held alongside them."""
+        if _ctrl_down():
+            return None
+        subs = getattr(self.vp.selection, "subobjects", None)
+        if not subs:
+            return None
+        return self._remembered(("tf", tuple(subs)), self._tf_target_of)
+
+    def _tf_target_of(self):
+        subs = list(getattr(self.vp.selection, "subobjects", ()))
+        names = {"face": 0, "edge": 1, "vertex": 2}
+        held, at = {}, []
+        for oid, kind, idx in subs:
+            obj = self.vp.scene.get(oid)
+            if (kind not in names or obj is None
+                    or obj.kind not in ("surface", "solid")):
+                return None
+            held.setdefault(oid, ([], [], []))[names[kind]].append(int(idx))
+        try:
+            for oid, (fidx, eidx, vidx) in held.items():
+                shape = self.vp.scene.get(oid).shape
+                flist, elist = g.faces_of(shape), g.edges_of(shape)
+                corners = g.vertex_points(shape) if vidx else []
+                at += [np.asarray(g.centroid(flist[i]), float) for i in fidx]
+                at += [np.asarray(g.centroid(elist[i]), float) for i in eidx]
+                at += [np.asarray(corners[i], float) for i in vidx]
+        except (g.GeometryError, IndexError):
+            return None
+        if not at:
+            return None
+        return held, np.mean(at, axis=0)
+
+    def alternative_hint(self) -> str | None:
+        """What holding Ctrl would offer instead, while the transform
+        gumball is on held parts: a line for the corner of the view."""
+        if self.drag is not None or not self.active():
+            return None
+        tf = self._tf_target()
+        if tf is None:
+            return None
+        held = tf[0]
+        if len(held) != 1:
+            return None
+        oid = next(iter(held))
+        fidx, eidx, vidx = held[oid]
+        if len(fidx) == 1 and not eidx and not vidx:
+            # push/pull is for a flat face; a curved one only offsets
+            obj = self.vp.scene.get(oid)
+            try:
+                face = g.faces_of(obj.shape)[fidx[0]]
+                flat = (g.flat_normal(face) is not None
+                        or g._trimmed_flat(face))
+            except (g.GeometryError, IndexError, AttributeError):
+                flat = False
+            return "Hold Ctrl for the push/pull gumball" if flat else None
+        if eidx and not fidx and not vidx:
+            return "Hold Ctrl for the fillet gumball"
+        if fidx and not vidx:
+            return "Hold Ctrl for the face offset gumball"
+        return None
+
+    def _cv_target(self):
+        """({obj_id: [index]}, mean position) for the held control points.
+
+        Only points a pane is showing count. PointsOff leaves the selection
+        as it found it, and a handle standing on a point nobody can see is
+        not something anybody is still holding.
+        """
+        subs = getattr(self.vp.selection, "subobjects", None)
+        if not subs:
+            return None
+        held: dict = {}
+        for oid, kind, idx in subs:
+            obj = self.vp.scene.get(oid)
+            if obj is None:
+                continue
+            if obj.kind == "mesh" and kind in ("face", "edge", "vertex"):
+                # a mesh's triangle or edge is held by its points
+                try:
+                    points = obj.shape.part_points(kind, idx)
+                except (IndexError, ValueError):
+                    continue
+            elif kind == "cv" and oid in self.vp.cv_enabled:
+                points = [int(idx)]
+            else:
+                continue
+            for i in points:
+                if i not in held.setdefault(oid, []):
+                    held[oid].append(i)
+        at = []
+        for oid, idxs in held.items():
+            pts = self.vp._cv_points(self.vp.scene.get(oid))
+            if pts is None:
+                continue
+            at += [np.asarray(pts[i], float) for i in idxs if 0 <= i < len(pts)]
+        if not at:
+            return None
+        return held, np.mean(at, axis=0)
+
+    def _pushpull_target(self):
+        """For a single selected planar face, return
+        (obj_id, face_index, centroid, (t1, t2, normal)); else None.
+
+        This is what turns the gumball into a face handle: an axis-aligned
+        arrow that moves the face in/out and rebuilds the solid. A planar
+        face pushes/pulls along its normal (geometry.push_pull); a curved
+        face offsets along its outward direction (geometry.offset_face), so
+        e.g. a cylinder's wall grows/shrinks its radius. Returns
+        (oid, face_index, centroid, (t1, t2, axis), planar)."""
+        subs = getattr(self.vp.selection, "subobjects", None)
+        if not subs:
+            return None
+        faces = [(oid, idx) for (oid, kind, idx) in subs if kind == "face"]
+        if len(faces) != 1 or self._parts_target() is not None:
+            return None                      # one face, on its own
+        return self._remembered(("face", faces[0]),
+                                lambda: self._face_target(*faces[0]))
+
+    def _remembered(self, key, compute):
+        """`compute()` once per scene revision and held sub-objects, for
+        targets paint, hover and hit-testing ask for several times a frame.
+        Whole-object targets include their object id in `key`, because
+        changing whole-object selection does not change either state value."""
+        state = (getattr(self.vp.scene, "revision", 0),
+                 tuple(getattr(self.vp.selection, "subobjects", ())))
+        hit = self._memo.get(key)
+        if hit is not None and hit[0] == state:
+            return hit[1]
+        value = compute()
+        self._memo[key] = (state, value)
+        return value
+
+    def _face_target(self, oid, fidx):
+        obj = self.vp.scene.get(oid)
+        if obj is None:
+            return None
+        try:
+            flist = g.faces_of(obj.shape)
+            if not (0 <= fidx < len(flist)):
+                return None
+            face = flist[fidx]
+            try:
+                axis = np.asarray(g.face_normal(face), float)   # planar
+                centroid = np.asarray(g.centroid(face), float)
+                planar = True
+            except g.GeometryError:          # curved -> offset along outward
+                pt, nrm = g.face_point_normal(face)   # sampled on the surface
+                centroid = np.asarray(pt, float)
+                axis = np.asarray(nrm, float)
+                planar = False
+            along = g.face_long_direction(face) if planar else None
+        except g.GeometryError:
+            return None
+        length = float(np.linalg.norm(axis))
+        if length < 1e-9:
+            return None
+        axis = axis / length
+        # The rings turn the face about t1 and t2, so those want to run
+        # with the face's edges: a lid propped along its hinge, not about
+        # some line the world axes happened to suggest.
+        t1 = None
+        if along is not None:
+            t1 = np.asarray(along, float)
+            t1 = t1 - axis * float(np.dot(t1, axis))
+            if np.linalg.norm(t1) < 1e-6:
+                t1 = None
+        if t1 is None:
+            ref = (np.array([1.0, 0.0, 0.0]) if abs(axis[0]) < 0.9
+                   else np.array([0.0, 1.0, 0.0]))
+            t1 = np.cross(axis, ref)
+        t1 = t1 / (np.linalg.norm(t1) or 1.0)
+        t2 = np.cross(axis, t1)
+        return oid, fidx, centroid, (t1, t2, axis), planar
+
+    def _face_axis(self, face):
+        """(centroid/sample-point, outward unit normal) for a face, planar
+        or curved; None if it has no usable normal."""
+        try:
+            nrm = np.asarray(g.face_normal(face), float)     # planar
+            c = np.asarray(g.centroid(face), float)
+        except g.GeometryError:
+            pt, nrm = g.face_point_normal(face)              # curved
+            c, nrm = np.asarray(pt, float), np.asarray(nrm, float)
+        length = float(np.linalg.norm(nrm))
+        if length < 1e-9:
+            return None
+        return c, nrm / length
+
+    def _multiface_target(self):
+        """For 2+ selected faces on one solid, return
+        (obj_id, [face_index...], anchor, (t1, t2, axis)); else None.
+
+        All the faces offset by the same distance along their own normals
+        (geometry.offset_faces) — inflate/deflate a shape, grow a slab from
+        both sides, etc. The handle sits at the faces' mean point along the
+        summed outward normal (first face's normal if they cancel)."""
+        subs = getattr(self.vp.selection, "subobjects", None)
+        if not subs:
+            return None
+        faces = [(oid, idx) for (oid, kind, idx) in subs if kind == "face"]
+        if len(faces) < 2 or self._parts_target() is not None:
+            return None                      # faces on their own
+        oid = faces[0][0]
+        idxs = [idx for (o, idx) in faces if o == oid]
+        if len(idxs) < 2:                    # need 2+ on the same solid
+            return None
+        obj = self.vp.scene.get(oid)
+        if obj is None:
+            return None
+        try:
+            flist = g.faces_of(obj.shape)
+            if any(not (0 <= i < len(flist)) for i in idxs):
+                return None
+            axes = [self._face_axis(flist[i]) for i in idxs]
+        except g.GeometryError:
+            return None
+        if any(a is None for a in axes):
+            return None
+        pts = [c for c, _ in axes]
+        normals = [n for _, n in axes]
+        anchor = np.mean(pts, axis=0)
+        axis = np.sum(normals, axis=0)
+        if np.linalg.norm(axis) < 1e-6:      # opposing faces cancel
+            axis = normals[0]
+        axis = axis / (np.linalg.norm(axis) or 1.0)
+        ref = (np.array([1.0, 0.0, 0.0]) if abs(axis[0]) < 0.9
+               else np.array([0.0, 1.0, 0.0]))
+        t1 = np.cross(axis, ref)
+        t1 = t1 / (np.linalg.norm(t1) or 1.0)
+        t2 = np.cross(axis, t1)
+        return oid, idxs, anchor, (t1, t2, axis)
+
+    def _segment_target(self):
+        """({obj_id: [edge_index...]}, anchor) when what is held is one or
+        more segments of curves, else None.
+
+        Rhino's sub-object gumball on a polycurve: Ctrl+Shift-click one side
+        of a rectangle and drag it, and the sides it meets stretch after it.
+        A held edge of a solid is a fillet handle instead, so this only
+        answers when every held edge belongs to a curve, and a held control
+        point still comes first.
+        """
+        subs = getattr(self.vp.selection, "subobjects", None)
+        if not subs:
+            return None
+        return self._remembered(("segments", tuple(subs)),
+                                self._segment_target_of)
+
+    def _segment_target_of(self):
+        subs = list(getattr(self.vp.selection, "subobjects", ()))
+        held: dict = {}
+        points: dict = {}
+        mids = []
+        for oid, kind, idx in subs:
+            if kind not in ("edge", "vertex"):
+                return None
+            obj = self.vp.scene.get(oid)
+            if obj is None or obj.kind != "curve":
+                return None
+            try:
+                if kind == "vertex":
+                    at = self.vp.held_points(obj)
+                    if not (0 <= idx < len(at)):
+                        return None
+                    mids.append(np.asarray(at[idx], float))
+                    points.setdefault(oid, []).append(int(idx))
+                    continue
+                elist = g.edges_of(obj.shape)
+                if not (0 <= idx < len(elist)):
+                    return None
+                mids.append(np.asarray(g.centroid(elist[idx]), float))
+            except g.GeometryError:
+                return None
+            held.setdefault(oid, []).append(int(idx))
+        if not held and not points:
+            return None
+        return held, np.mean(mids, axis=0), points
+
+    def _parts_target(self):
+        """For faces and edges held together on one solid, return
+        (obj_id, [face_index...], [edge_index...], anchor); else None.
+
+        A Ctrl+Shift band round part of a solid holds its faces and edges
+        together, which a click never did, and none of the other modes
+        wanted the mix: one face pushes, several inflate, edges fillet.
+        The mix gets a whole gumball whose arrows move the parts as one
+        change (geometry.move_parts), so a band round a box's top and the
+        edges round it drags the top up once."""
+        subs = getattr(self.vp.selection, "subobjects", None)
+        if not subs:
+            return None
+        return self._remembered(("parts", tuple(subs)), self._parts_target_of)
+
+    def _parts_target_of(self):
+        subs = list(getattr(self.vp.selection, "subobjects", ()))
+        faces = [(oid, idx) for (oid, kind, idx) in subs if kind == "face"]
+        edges = [(oid, idx) for (oid, kind, idx) in subs if kind == "edge"]
+        points = [(oid, idx) for (oid, kind, idx) in subs if kind == "vertex"]
+        if points:
+            return self._points_target_of(subs, faces, edges, points)
+        if len(faces) < 2 or not edges:
+            # one face keeps its own richer handle whatever edges ride
+            # along; the mix this is for is what a band across a solid
+            # holds, several faces and the edges between them
+            return None
+        if len({oid for oid, _, _ in subs}) != 1:
+            return None                       # one solid at a time
+        oid = faces[0][0]
+        obj = self.vp.scene.get(oid)
+        if obj is None or obj.kind != "solid":
+            return None
+        try:
+            flist = g.faces_of(obj.shape)
+            elist = g.edges_of(obj.shape)
+            fidx = [i for _, i in faces if 0 <= i < len(flist)]
+            eidx = [i for _, i in edges if 0 <= i < len(elist)]
+            if not fidx or not eidx:
+                return None
+            at = [np.asarray(g.centroid(flist[i]), float) for i in fidx]
+            at += [np.asarray(g.centroid(elist[i]), float) for i in eidx]
+        except g.GeometryError:
+            return None
+        return oid, fidx, eidx, np.mean(at, axis=0), []
+
+    def _points_target_of(self, subs, faces, edges, points):
+        """Points of one surface or solid held, with any faces and edges of
+        it: moved as one change, each held point a corner that moves."""
+        if len({oid for oid, _, _ in subs}) != 1:
+            return None                       # one object at a time
+        oid = points[0][0]
+        obj = self.vp.scene.get(oid)
+        if obj is None or obj.kind not in ("surface", "solid", "compound"):
+            return None
+        try:
+            flist = g.faces_of(obj.shape)
+            elist = g.edges_of(obj.shape)
+            corners = self.vp.held_points(obj)
+            fidx = [i for _, i in faces if 0 <= i < len(flist)]
+            eidx = [i for _, i in edges if 0 <= i < len(elist)]
+            vidx = [i for _, i in points if 0 <= i < len(corners)]
+            if not vidx:
+                return None
+            at = [np.asarray(corners[i], float) for i in vidx]
+            at += [np.asarray(g.centroid(flist[i]), float) for i in fidx]
+            at += [np.asarray(g.centroid(elist[i]), float) for i in eidx]
+        except g.GeometryError:
+            return None
+        return oid, fidx, eidx, np.mean(at, axis=0), vidx
+
+    def _fillet_target(self):
+        """For one or more selected edges on a single solid, return
+        (obj_id, [edge_index...], anchor, (t1, t2, outward)); else None.
+
+        Turns the gumball into an interactive fillet: a single outward
+        handle at the edges' midpoint that sets the radius and rebuilds the
+        solid live (via geometry.fillet_edges). Any number of edges fillet
+        together at one radius."""
+        subs = getattr(self.vp.selection, "subobjects", None)
+        if not subs:
+            return None
+        return self._remembered(("fillet", tuple(subs)),
+                                self._fillet_target_of)
+
+    def _fillet_target_of(self):
+        subs = list(getattr(self.vp.selection, "subobjects", ()))
+        edges = [(oid, idx) for (oid, kind, idx) in subs if kind == "edge"]
+        if not edges or self._segment_target() is not None:
+            return None                       # a curve segment: whole gumball
+        if self._parts_target() is not None:
+            return None                       # edges with faces: moved, not filleted
+        oid = edges[0][0]
+        idxs = [idx for (o, idx) in edges if o == oid]   # one solid at a time
+        obj = self.vp.scene.get(oid)
+        if obj is None:
+            return None
+        try:
+            elist = g.edges_of(obj.shape)
+            if any(not (0 <= i < len(elist)) for i in idxs):
+                return None
+            mids = [np.asarray(g.centroid(elist[i]), float) for i in idxs]
+            lo, hi = obj.bbox()
+            solid_c = (np.asarray(lo, float) + np.asarray(hi, float)) / 2.0
+        except g.GeometryError:
+            return None
+        anchor = np.mean(mids, axis=0)
+        out = anchor - solid_c
+        length = float(np.linalg.norm(out))
+        out = out / length if length > 1e-9 else np.array([0.0, 0.0, 1.0])
+        beside = self._edge_axes(oid, idxs)
+        if beside is not None:
+            # the arrows that move the edge run along the faces it sits
+            # between, so t1 and t2 are those faces' normals
+            return oid, idxs, anchor, (beside[0], beside[1], out)
+        ref = (np.array([1.0, 0.0, 0.0]) if abs(out[0]) < 0.9
+               else np.array([0.0, 1.0, 0.0]))
+        t1 = np.cross(out, ref)
+        t1 = t1 / (np.linalg.norm(t1) or 1.0)
+        t2 = np.cross(out, t1)
+        return oid, idxs, anchor, (t1, t2, out)
+
+    def _edge_axes(self, oid, idxs):
+        """The unit normals of the two planar faces a lone straight edge
+        sits between, or None when the held edges are not that: several,
+        curved, or beside a curved face. Those are what make an edge
+        movable, and the directions the move arrows point."""
+        if len(idxs) != 1:
+            return None
+        return self._remembered(("edge", oid, idxs[0]),
+                                lambda: self._edge_axes_of(oid, idxs[0]))
+
+    def _edge_axes_of(self, oid, eidx):
+        obj = self.vp.scene.get(oid)
+        if obj is None:
+            return None
+        try:
+            elist = g.edges_of(obj.shape)
+            if not (0 <= eidx < len(elist)):
+                return None
+            g.edge_line(elist[eidx])                # straight, or raises
+            beside = g.edge_faces(obj.shape, eidx)
+            if len(beside) != 2:
+                return None
+            flist = g.faces_of(obj.shape)
+            axes = [np.asarray(g.face_normal(flist[i]), float)
+                    for i in beside]
+        except g.GeometryError:
+            return None
+        axes = [a / (np.linalg.norm(a) or 1.0) for a in axes]
+        return axes[0], axes[1]
+
+    def _edge_move_target(self):
+        """(obj_id, edge_index) when the held edge can be moved; None."""
+        if self.drag is not None:
+            return self.drag.get("edge_move")
+        ft = self._fillet_target()
+        if ft is None or self._edge_axes(ft[0], ft[1]) is None:
+            return None
+        return ft[0], ft[1][0]
+
+    def handles(self) -> set:
+        """Every handle on offer right now, by id.
+
+        A held flat face gets everything that can change the solid: the
+        arrow along its normal moves it and the box on that arrow grows
+        it; the arrows and pads in its plane slide it and the faces
+        beside it lean to keep hold of its edges; the scale boxes taper
+        it the same way; the two rings tilt it. The ring about its own
+        normal and the box that would scale it along that normal could
+        not change a plane, so they are not drawn. A curved face only
+        knows how to offset. A held edge keeps its fillet arrow and box,
+        and gains an arrow along each face it sits between when it is a
+        straight edge between two flat faces.
+        """
+        d = self.drag
+        if (d is not None and d.get("tf") is not None) or (
+                d is None and self._tf_target() is not None):
+            return ({(kind, i) for kind in ("move", "pad", "rot", "scale")
+                     for i in range(3)} | {("center", 0)})
+        if d is not None and d.get("pp"):
+            return self._face_handles(bool(d.get("pp_planar", True)),
+                                      d["axes"])
+        if d is not None and d.get("multiface"):
+            return {("move", 2)}
+        if self._face_mode():
+            pp = self._pushpull_target()
+            if pp is None:                    # several faces: one arrow
+                return {("move", 2)}
+            state = self.anchor_and_axes()
+            return self._face_handles(bool(pp[4]),
+                                      state[1] if state else pp[3])
+        if self._fillet_mode():
+            out = {("move", 2), ("ext", 2)}
+            if self._edge_move_target() is not None:
+                out |= {("move", 0), ("move", 1)}
+            return out
+        if (d is not None and d.get("parts")) or (
+                d is None and self._parts_target() is not None):
+            # faces and edges together: the three arrows move them as one
+            # change; turning or scaling a set as one is not yet something
+            # the geometry can do, so no rings or boxes are offered
+            return {("move", i) for i in range(3)}
+        out = {(kind, i) for kind in ("move", "pad", "rot", "scale")
+               for i in range(3)} | {("center", 0)}
+        state = self.anchor_and_axes()
+        if state is not None:
+            out |= {("ext", i) for i in range(3)
+                    if self._can_extrude(state[1][i])}
+        return out
+
+    @staticmethod
+    def _face_verb(handle, grow: bool, out_of_face: bool) -> str:
+        kind, _ = handle
+        if grow:
+            return "extrude face"
+        if kind == "rot":
+            return "tilt face"
+        if kind == "scale":
+            return "scale face"
+        if kind == "pad" or not out_of_face:
+            return "slide face"
+        return "move face"
+
+    def _face_handles(self, planar: bool, axes) -> set:
+        """A flat face's handles for these axes: the box that extrudes,
+        and the two-way arrow, only on an axis straight out of the face;
+        no ring or scale box on such an axis, since those could not change
+        the plane; everything on every other axis, which slides, lifts,
+        tilts or tapers by however much of it lies in the plane. A curved
+        face only knows how to offset, so it keeps one arrow."""
+        if not planar:
+            return {("move", 2)}
+        out_of = self._along_normal(axes)
+        on = {("move", i) for i in range(3)} | {("pad", i) for i in range(3)}
+        on |= {("rot", i) for i in range(3) if i not in out_of}
+        on |= {("scale", i) for i in range(3) if i not in out_of}
+        on |= {("ext", i) for i in out_of}
+        return on
+
+    def _face_normal(self):
+        """The held face's outward normal, or None when no face is held."""
+        d = self.drag
+        if d is not None and d.get("face_normal") is not None:
+            return np.asarray(d["face_normal"], float)
+        pp = self._pushpull_target()
+        if pp is not None:
+            return np.asarray(pp[3][2], float)
+        mf = self._multiface_target()
+        if mf is not None:
+            return np.asarray(mf[3][2], float)
+        return None
+
+    def _along_normal(self, axes) -> set:
+        """Indices of the axes that run straight out of the held face."""
+        n = self._face_normal()
+        if n is None:
+            return set()
+        return {i for i in range(3)
+                if abs(float(np.dot(np.asarray(axes[i], float), n)))
+                > 1.0 - 1e-6}
+
+    def _two_way_axes(self) -> set:
+        """Axes whose arrow has a head at each end: the one along a held
+        face's normal, because in and out are both something (carve, or
+        extrude)."""
+        if not self._face_mode():
+            return set()
+        state = self._draw_anchor()
+        return self._along_normal(state[1]) if state is not None else set()
+
+    def _axis_colours(self):
+        """Red, green and blue identify the X, Y and Z axes in every frame."""
+        return AXIS_COLORS
+
+    def _sweep_sources(self) -> list:
+        """Everything held that a filled box could sweep, or an empty list.
+
+        Held edges grow a surface each and leave the object they came off
+        alone. A curve keeps itself and hands you a new surface, so the
+        curve you were drawing with is still there to go on using. A
+        surface is consumed by the solid it becomes: a spare copy of it
+        buried in the solid's own face is clutter you cannot see to pick.
+        Anything else — a solid, a mesh, a held control point — has
+        nothing here to grow.
+
+        The answer is kept from one call to the next, because it reads
+        geometry and is asked once a frame and again on every mouse move.
+        The selection and the scene revision together say when it can
+        have changed.
+        """
+        sel = self.vp.selection
+        subs = list(getattr(sel, "subobjects", []))
+        key = (getattr(self.vp.scene, "revision", 0), tuple(sel.ids),
+               tuple(subs))
+        if self._sweep_key == key:
+            return self._sweep_cache
+        sources: list = []
+        kinds = {k for (_o, k, _i) in subs}
+        edges = [(oid, idx) for (oid, kind, idx) in subs if kind == "edge"]
+        if "cv" in kinds:
+            pass                             # the gumball is on the points
+        elif edges:
+            for oid, idx in edges:
+                obj = self.vp.scene.get(oid)
+                if obj is None:
+                    continue
+                try:
+                    elist = g.edges_of(obj.shape)
+                except g.GeometryError:
+                    continue
+                if 0 <= idx < len(elist):
+                    sources.append({"src": elist[idx], "cap": False,
+                                    "into": None, "layer": obj.layer_id})
+        else:
+            for obj in sel.objects():
+                if obj.kind == "curve":
+                    # cap so that a closed curve gives the box you were
+                    # after and not the four walls of it; extrude ignores
+                    # it when the curve is open.
+                    sources.append({"src": obj.shape, "cap": True,
+                                    "into": None, "layer": obj.layer_id})
+                elif obj.kind == "surface":
+                    sources.append({"src": obj.shape, "cap": False,
+                                    "into": obj.id, "layer": obj.layer_id})
+        self._sweep_key, self._sweep_cache = key, sources
+        self._sweep_axes = {}
+        return sources
+
+    def _extrude_target(self, handle, modifiers, direction=None):
+        """What a translate arrow with Ctrl held would grow, or None.
+
+        A line pulled sideways is a plane, and the gumball is already
+        standing on the line with an arrow pointing the way; without this
+        the only road from a line to a surface is to leave the gumball,
+        type extrude and pick the line again. Ctrl is the whole
+        difference.
+
+        With a direction, only what that direction would actually add to
+        is given back, so a Ctrl-drag along a line's own length falls
+        through to moving it rather than leaving a flattened surface lying
+        on top of it.
+        """
+        if handle[0] != "ext" and not (handle[0] == "move"
+                                       and _ctrl_held(modifiers)):
+            return None
+        sources = self._sweep_sources()
+        if direction is not None:
+            sources = [s for s in sources
+                       if not g.sweep_adds_nothing(s["src"], direction)]
+        return sources or None
+
+    def _can_extrude(self, direction=None) -> bool:
+        """Is there anything here a filled box could grow?
+
+        Asked per axis, given a direction: a flat surface swept within its
+        own plane, or a straight line swept along its own length, comes
+        back as what it already was, so no box is drawn on that axis and
+        the arrow that moves it is all that is there.
+        """
+        sources = self._sweep_sources()
+        if not sources or direction is None:
+            return bool(sources)
+        k = tuple(round(float(v), 6) for v in direction)
+        hit = self._sweep_axes.get(k)
+        if hit is None:
+            try:
+                hit = any(not g.sweep_adds_nothing(s["src"], k)
+                          for s in sources)
+            except g.GeometryError:
+                # This runs inside paint, once per axis. A shape the
+                # geometry cannot measure is not worth a pane that stops
+                # drawing for the rest of the session: draw the handle and
+                # let the extrude itself say what is wrong with it.
+                hit = True
+            self._sweep_axes[k] = hit
+        return hit
+
+    def _face_mode(self) -> bool:
+        """Is the gumball acting as a face push/pull or offset handle now?"""
+        if self.drag is not None:
+            return bool(self.drag.get("pp") or self.drag.get("multiface"))
+        if self._tf_target() is not None:    # the transform gumball instead
+            return False
+        return (self._pushpull_target() is not None
+                or self._multiface_target() is not None)
+
+    def _fillet_mode(self) -> bool:
+        """Is the gumball acting as an edge fillet handle right now?"""
+        if self.drag is not None:
+            return bool(self.drag.get("fillet") or self.drag.get("edge_move"))
+        if self._tf_target() is not None:    # the transform gumball instead
+            return False
+        return (self._pushpull_target() is None
+                and self._fillet_target() is not None)
+
+    def anchor_and_axes(self):
+        d = self.drag
+        if d is not None and d.get("tf") is not None:
+            return (np.asarray(d["anchor"], float)
+                    + np.asarray(d["offset"], float)), d["axes"]
+        tf = self._tf_target() if d is None else None
+        if tf is not None:                   # held parts: a whole gumball
+            return self._aligned(tf[1])
+        if self.drag is None:
+            cv = self._cv_target()
+            if cv is not None:               # a held control point comes first
+                cp = self._plane()
+                return cv[1], (np.asarray(cp.xdir), np.asarray(cp.ydir),
+                               np.asarray(cp.normal))
+            pp = self._pushpull_target()
+            if pp is not None:               # a held face: its own frame,
+                _, _, centroid, basis, _ = pp   # unless told otherwise
+                foreign = self._foreign_axes()
+                return centroid, (foreign if foreign is not None else basis)
+            parts = self._parts_target()
+            if parts is not None:            # faces and edges together: a
+                cp = self._plane()           # whole gumball on the plane's axes
+                return parts[3], (np.asarray(cp.xdir), np.asarray(cp.ydir),
+                                  np.asarray(cp.normal))
+            mf = self._multiface_target()
+            if mf is not None:               # then multi-face offset
+                _, _, anchor, basis = mf
+                return anchor, basis
+            ft = self._fillet_target()
+            if ft is not None:               # then edge fillet
+                _, _, anchor, basis = ft
+                return anchor, basis
+        seg = (self._segment_target() if self.drag is None
+               else self.drag.get("segments"))
+        if seg is not None and self.drag is None:
+            anchor = seg[1]                  # a held curve segment: on it
+        elif seg is not None:
+            anchor = self.drag["anchor"]
+        else:
+            objs = self.vp.selection.objects()
+            if not objs:
+                return None
+            # Once per frame while you orbit, and again on every mouse move
+            # for the hover test — so it asks each object for bounds it has
+            # already been asked for. SceneObject.bbox remembers them; the
+            # union is one array operation because a per-object numpy loop
+            # over a whole drawing costs more than the measuring used to.
+            boxes = np.array([o.bbox() for o in objs], float)
+            anchor = (boxes[:, 0].min(axis=0) + boxes[:, 1].max(axis=0)) / 2
+        if self.align == "world" and self.vp._detail_eye() is None:
+            return anchor, (np.array([1.0, 0.0, 0.0]),
+                            np.array([0.0, 1.0, 0.0]),
+                            np.array([0.0, 0.0, 1.0]))
+        if self.align == "view" and self.vp._detail_eye() is None:
+            right, up = self.vp._eye().right_up()
+            return anchor, (right, up, np.cross(right, up))
+        cp = self._plane()
+        if (self.align == "object" and self.drag is None and seg is None
+                and self.vp._detail_eye() is None and len(objs) == 1
+                and not getattr(self.vp.selection, "subobjects", None)):
+            axes = self._object_axes(objs[0], cp)
+            if axes is not None:
+                return anchor, axes
+        return anchor, (np.asarray(cp.xdir), np.asarray(cp.ydir),
+                        np.asarray(cp.normal))
+
+    def _aligned(self, anchor):
+        """`anchor` with the axes the alignment setting asks for, as for
+        a whole object."""
+        if self.align == "world" and self.vp._detail_eye() is None:
+            return anchor, (np.array([1.0, 0.0, 0.0]),
+                            np.array([0.0, 1.0, 0.0]),
+                            np.array([0.0, 0.0, 1.0]))
+        if self.align == "view" and self.vp._detail_eye() is None:
+            right, up = self.vp._eye().right_up()
+            return anchor, (right, up, np.cross(right, up))
+        cp = self._plane()
+        return anchor, (np.asarray(cp.xdir), np.asarray(cp.ydir),
+                        np.asarray(cp.normal))
+
+    def _plane(self):
+        """The plane the axes lie in.
+
+        Inside a detail it is the plane the detail looks at, so two arrows lie
+        along the view and the third runs away from you — which is the way the
+        drawing is being read. The construction plane the model window is set
+        to would put all three of them at an angle to a front view.
+        """
+        eye = self.vp._detail_eye()
+        if eye is None:
+            return self.vp.cplane
+        from .layout_view import detail_plane
+        return detail_plane(eye.detail)
+
+    def _project(self, pts):
+        """Where gumball geometry lands on screen, frame or no frame.
+
+        The handles are drawn over the drawing rather than in it, so a detail's
+        edge does not cut them off the way it cuts off the model they hold: an
+        object that nearly fills its window would otherwise have handles nobody
+        can reach.
+        """
+        vp = self.vp
+        return vp._eye().project(np.asarray(pts, float), vp.width(),
+                                 vp.height(), clipped=False)
+
+    def _view_dir(self, anchor):
+        """Which way the eye looks where the gumball is."""
+        vp = self.vp
+        scr = self._project([anchor])[0]
+        _origin, direction = vp._eye().ray_through(
+            float(scr[0]), float(scr[1]), vp.width(), vp.height())
+        return np.asarray(direction, float)
+
+    def _usable(self, kind, axis, axes, vdir) -> bool:
+        """Whether a handle can be dragged from where it is being looked at.
+
+        An arrow pointing straight away from you, and a circle or pad seen
+        exactly edge-on, are a ray parallel to the line or the plane it would
+        be dragged along: that has no answer, or every answer, so the drag is
+        refused. A handle that would be refused is better not drawn and not
+        hit at all — in a detail, which looks squarely down one axis, they
+        would otherwise lie right on top of the handles that do work.
+        """
+        if vdir is None:
+            return True
+        along = abs(float(np.dot(np.asarray(axes[axis], float), vdir)))
+        if kind in ("move", "scale", "ext"):
+            return along < 1.0 - 1e-6       # the line is not the line of sight
+        return along > 1e-6                 # the plane faces you at all
+
+    def _draw_anchor(self):
+        """Where the gumball is drawn this frame. During a move/pad drag
+        it tracks the geometry (frozen anchor + applied offset); rotate
+        and scale keep the anchor as the fixed pivot. An extrude stays put
+        too: the curve it is growing from has not gone anywhere.
+        """
+        if self.drag is None:
+            state = self.anchor_and_axes()
+            return None if state is None else (state[0], state[1])
+        d = self.drag
+        anchor = np.asarray(d["anchor"], float)
+        if (d["handle"][0] in ("move", "pad", "center")
+                and not d.get("extrude")):
+            anchor = anchor + d["offset"]
+        return anchor, d["axes"]
+
+    def _size_world(self, anchor) -> float:
+        """World length that projects to SIZE_PX pixels at the anchor."""
+        right, _ = self.vp._eye().right_up()
+        scr = self._project(np.stack([anchor, anchor + right]))
+        px = float(np.hypot(scr[1, 0] - scr[0, 0], scr[1, 1] - scr[0, 1]))
+        if px < 1e-6:
+            return 1.0
+        return SIZE_PX / px
+
+    # -------------------------------------------------------- painting
+
+    def paint(self, mvp):
+        if not self.active():
+            return
+        if self._fillet_mode():
+            self._paint_fillet(mvp)
+            return
+        state = self._draw_anchor()
+        if state is None:
+            return
+        anchor, axes = state
+        s = self._size_world(anchor)
+        vdir = self._view_dir(anchor)
+        on = self.handles()
+        two_way = self._two_way_axes()
+        colours = self._axis_colours()
+        reach = self.scale_reach(anchor, axes, s)
+        GL.glDisable(GL.GL_DEPTH_TEST)
+
+        for i in range(3):                    # rings
+            if ("rot", i) in on and self._usable("rot", i, axes, vdir):
+                self._ring(mvp, anchor, axes[(i + 1) % 3], axes[(i + 2) % 3],
+                           s, (*self._colour(("rot", i), colours[i]), 0.85))
+
+        for i in range(3):                    # pads
+            if ("pad", i) not in on or not self._usable("pad", i, axes, vdir):
+                continue
+            u, v = axes[(i + 1) % 3], axes[(i + 2) % 3]
+            c0 = anchor + (u + v) * PAD0 * s
+            c1 = anchor + u * PAD1 * s + v * PAD0 * s
+            c2 = anchor + (u + v) * PAD1 * s
+            c3 = anchor + u * PAD0 * s + v * PAD1 * s
+            tris = np.asarray([c0, c1, c2, c0, c2, c3], float)
+            self._tris(mvp, tris, (*self._colour(("pad", i), colours[i]),
+                                   PAD_ALPHA))
+
+        for i in range(3):                    # arrows and the two boxes
+            axis = axes[i]
+            if ("move", i) in on and self._usable("move", i, axes, vdir):
+                color = self._colour(("move", i), colours[i])
+                if i in two_way:
+                    self._double_arrow(mvp, anchor, axis, s, color)
+                else:
+                    a0 = anchor + axis * SHAFT0 * s
+                    a1 = anchor + axis * SHAFT1 * s
+                    self._lines(mvp, np.asarray([a0, a1], float),
+                                (*color, 1.0), 2.4)
+                    self._cone(mvp, anchor, axis, axes[(i + 1) % 3],
+                               axes[(i + 2) % 3], s, (*color, 1.0))
+            if ("scale", i) in on and self._usable("scale", i, axes, vdir):
+                kc = self._colour(("scale", i), colours[i])
+                self._leader(mvp, anchor, axis, s, reach[i], (*kc, 0.85))
+                self._knob(mvp, anchor - axis * reach[i] * s, s,
+                           (*kc, 1.0), fill=False)
+            if ("ext", i) in on and self._usable("ext", i, axes, vdir):
+                self._knob(mvp, anchor + axis * EXT_POS * s, s,
+                           (*self._colour(("ext", i), colours[i]), 1.0))
+
+        col = self._colour(("center", 0), CENTER_COLOR)
+        self._ring_at(mvp, anchor, CENTER_R * s, (*col, 1.0))
+        if self._face_mode():                 # a faint square in the plane
+            n = self._face_normal()
+            u, v = _frame(n if n is not None else axes[2])
+            r = PAD0 * s
+            c0, c1 = anchor + (u + v) * r, anchor + (u - v) * r
+            c2, c3 = anchor - (u + v) * r, anchor - (u - v) * r
+            self._lines(mvp, np.asarray([c0, c1, c1, c2, c2, c3, c3, c0],
+                                        float),
+                        (*self._colour(("move", 2), PP_COLOR), 0.5), 1.4)
+        GL.glEnable(GL.GL_DEPTH_TEST)
+        self.vp._line_width(1.0)
+
+    def _face_is_planar(self) -> bool:
+        if self.drag is not None:
+            return bool(self.drag.get("pp")) and self.drag.get("pp_planar",
+                                                               True)
+        pp = self._pushpull_target()
+        return pp is not None and bool(pp[4])
+
+    def _colour(self, handle, base):
+        """`base`, or the hover colour while this handle is hot."""
+        if self.hover == handle or (self.drag is not None
+                                    and self.drag["handle"] == handle):
+            return HOVER_COLOR
+        return base
+
+    def _ring(self, mvp, anchor, u, v, s, color):
+        arr = np.asarray(_arc(anchor, u, v, ARC_R * s, 16), float)
+        segs = np.stack([arr[:-1], arr[1:]], axis=1).reshape(-1, 3)
+        self._lines(mvp, segs, color, 1.6)
+
+    def _ring_at(self, mvp, centre, radius, color):
+        """A small circle facing you: the pivot."""
+        right, up = self.vp._eye().right_up()
+        pts = [centre + radius * (right * math.cos(k / 20 * 2 * math.pi)
+                                  + up * math.sin(k / 20 * 2 * math.pi))
+               for k in range(21)]
+        arr = np.asarray(pts, float)
+        segs = np.stack([arr[:-1], arr[1:]], axis=1).reshape(-1, 3)
+        self._lines(mvp, segs, color, 1.4)
+
+    def _double_arrow(self, mvp, anchor, axis, s, color):
+        """An arrow with a head at each end, for a handle that goes both
+        ways from where it stands."""
+        u, v = _frame(axis)
+        self._lines(mvp, np.asarray(
+            [anchor - axis * SHAFT1 * s, anchor + axis * SHAFT1 * s],
+            float), (*color, 1.0), 2.4)
+        self._cone(mvp, anchor, axis, u, v, s, (*color, 1.0))
+        self._cone(mvp, anchor, -axis, u, v, s, (*color, 1.0))
+
+    def _paint_fillet(self, mvp):
+        """A single outward arrow at the selected edges' midpoint whose length
+        sets the fillet radius, plus a small quarter-round arc as a hint."""
+        state = self._draw_anchor()
+        if state is None:
+            return
+        anchor, axes = state
+        s = self._size_world(anchor)
+        u, v, n = axes[0], axes[1], axes[2]
+        GL.glDisable(GL.GL_DEPTH_TEST)
+        hot = (self.hover == ("move", 2)
+               or (self.drag is not None
+                   and self.drag["handle"] == ("move", 2)))
+        col = HOVER_COLOR if hot else FILLET_COLOR
+        self._lines(mvp, np.asarray(
+            [anchor + n * SHAFT0 * s, anchor + n * SHAFT1 * s], float),
+            (*col, 1.0), 2.6)
+        self._cone(mvp, anchor, n, u, v, s, (*col, 1.0))
+        # quarter-round arc (fillet motif) in the n-u plane at the anchor
+        r = 0.42 * s
+        pts = []
+        for k in range(13):
+            a = k / 12 * (math.pi / 2)
+            pts.append(anchor + r * (n * math.cos(a) + u * math.sin(a)))
+        arr = np.asarray(pts, float)
+        segs = np.stack([arr[:-1], arr[1:]], axis=1).reshape(-1, 3)
+        self._lines(mvp, segs, (*col, 0.7), 1.6)
+        # The edge gets the same filled box as everything else, so it is not
+        # the one case left needing the keyboard: the arrow rounds the edge
+        # off, the box pulls a surface out of it.
+        ext = (HOVER_COLOR if self.hover == ("ext", 2) else PP_COLOR)
+        self._knob(mvp, anchor + n * EXT_POS * s, s, (*ext, 1.0))
+        if self._edge_move_target() is not None:
+            # and an arrow along each face the edge sits between, which
+            # moves the edge and lets that face lean to keep hold of it
+            vdir = self._view_dir(anchor)
+            for i in (0, 1):
+                if self._usable("move", i, axes, vdir):
+                    self._double_arrow(mvp, anchor, axes[i], s,
+                                       self._colour(("move", i), PP_COLOR))
+        GL.glEnable(GL.GL_DEPTH_TEST)
+        self.vp._line_width(1.0)
+
+    def _cone(self, mvp, anchor, axis, u, v, s, color):
+        tip = anchor + axis * CONE1 * s
+        base = anchor + axis * SHAFT1 * s
+        r = 0.055 * s
+        tris = []
+        n = 10
+        for k in range(n):
+            a0 = k / n * 2 * math.pi
+            a1 = (k + 1) / n * 2 * math.pi
+            p0 = base + r * (u * math.cos(a0) + v * math.sin(a0))
+            p1 = base + r * (u * math.cos(a1) + v * math.sin(a1))
+            tris.extend([tip, p0, p1])
+        self._tris(mvp, np.asarray(tris, float), color)
+
+    def _knob(self, mvp, center, s, color, fill: bool = True):
+        """A box facing you: filled to grow the thing, hollow to scale it."""
+        cam = self.vp._eye()
+        right, up = cam.right_up()
+        r = 0.06 * s
+        c0 = center - right * r - up * r
+        c1 = center + right * r - up * r
+        c2 = center + right * r + up * r
+        c3 = center - right * r + up * r
+        if fill:
+            self._tris(mvp, np.asarray([c0, c1, c2, c0, c2, c3], float),
+                       color)
+            return
+        self._lines(mvp, np.asarray([c0, c1, c1, c2, c2, c3, c3, c0],
+                                    float), color, 1.8)
+
+    def _leader(self, mvp, anchor, axis, s, reach, color):
+        """The dashed run back from the pivot to the scale box.
+
+        It leaves the anchor where the shaft does and goes the other way, so
+        the hollow box is not a stray mark floating behind the gumball: the
+        dashes say which axis it belongs to and that it is the other end of
+        the same handle the arrow is one end of.
+        """
+        run = reach - DASH0 - 0.06
+        if run <= 0:
+            return
+        n = max(1, round(run / DASH_PERIOD))
+        pts = []
+        for k in range(n):
+            t0 = DASH0 + run * (k / n)
+            t1 = t0 + run * 0.55 / n
+            pts.extend([anchor - axis * t0 * s, anchor - axis * t1 * s])
+        self._lines(mvp, np.asarray(pts, float), color, 1.4)
+
+    def scale_reach(self, anchor, axes, s) -> list:
+        """How far back along each axis the scale box stands, in gumball
+        sizes: at the selection's edge on that side, never closer to the
+        pivot than SCALE_MIN, and at SCALE_POS when nothing held has an
+        extent to measure."""
+        if s <= 0:
+            return [SCALE_POS] * 3
+        axes = np.asarray(axes, float)
+        try:
+            spans = self._held_spans(axes)
+        except Exception:                    # a shape that cannot be measured
+            spans = None
+        if not spans:
+            return [SCALE_POS] * 3
+        lo = np.min([sp[0] for sp in spans], axis=0)
+        at = axes @ np.asarray(anchor, float)
+        return [max(float(at[i] - lo[i]) / s, SCALE_MIN) for i in range(3)]
+
+    def _held_spans(self, axes) -> list:
+        """(lo, hi) along `axes` of each thing the gumball holds."""
+        vp, d = self.vp, self.drag
+        if d is None:
+            cv = self._cv_target()
+            cvs = cv[0] if cv is not None else None
+        else:
+            cvs = d.get("cvs")
+        if cvs:
+            pts = []
+            for oid, idxs in cvs.items():
+                obj = vp.scene.get(oid)
+                every = vp._cv_points(obj) if obj is not None else None
+                if every is None:
+                    continue
+                pts += [every[i] for i in idxs if 0 <= i < len(every)]
+            if not pts:
+                return []
+            along = np.asarray(pts, float) @ axes.T
+            return [(along.min(axis=0), along.max(axis=0))]
+        if d is None:
+            pp = self._pushpull_target()
+            face = pp[:2] if pp is not None else None
+        else:
+            face = d.get("pp")
+        if face is not None:
+            obj = vp.scene.get(face[0])
+            if obj is None:
+                return []
+            faces = g.faces_of(obj.shape)
+            if not 0 <= face[1] < len(faces):
+                return []
+            return [self._span(("face", *face), faces[face[1]], axes)]
+        if d is not None and any(d.get(k) is not None for k in (
+                "segments", "multiface", "parts", "fillet", "edge_move")):
+            return []
+        if d is None and (self._segment_target() is not None
+                          or self._parts_target() is not None):
+            return []
+        return [self._span(o.id, o, axes) for o in vp.selection.objects()]
+
+    def _span(self, key, held, axes):
+        """(lo, hi) of an object or a shape along each of `axes`, measured
+        once per scene revision and frame.
+
+        Along world axes an object's box already says it. Along any other
+        frame the shape is measured turned into that frame, which is as
+        tight as its own box would be had it been drawn square to it.
+        """
+        state = getattr(self.vp.scene, "revision", 0)
+        frame = tuple(np.round(axes, 9).ravel())
+        hit = self._spans.get(key)
+        if hit is not None and hit[0] == state and hit[1] == frame:
+            return hit[2]
+        shape = getattr(held, "shape", held)
+        if np.allclose(axes, np.eye(3), atol=1e-9):
+            box = held.bbox() if hasattr(held, "bbox") else g.bbox(shape)
+            lo, hi = np.asarray(box[0], float), np.asarray(box[1], float)
+        else:
+            lo, hi = self._turned_span(shape, axes)
+        if len(self._spans) > 4096:
+            self._spans.clear()
+        self._spans[key] = (state, frame, (lo, hi))
+        return lo, hi
+
+    @staticmethod
+    def _turned_span(shape, axes):
+        rot = np.array(axes, float)
+        flip = np.linalg.det(rot) < 0
+        if flip:                             # a turn, not a mirror
+            rot[2] = -rot[2]
+        if not np.allclose(rot @ rot.T, np.eye(3), atol=1e-6):
+            lo, hi = (np.asarray(c, float) for c in g.bbox(shape))
+            corners = np.array([[x, y, z] for x in (lo[0], hi[0])
+                                for y in (lo[1], hi[1])
+                                for z in (lo[2], hi[2])]) @ np.asarray(axes).T
+            return corners.min(axis=0), corners.max(axis=0)
+        from ..core import occ
+        if isinstance(shape, occ.TopoDS_Shape):
+            trsf = occ.gp_Trsf()
+            trsf.SetValues(*rot[0], 0.0, *rot[1], 0.0, *rot[2], 0.0)
+            turned = shape.Moved(occ.TopLoc_Location(trsf))
+        else:
+            m = np.eye(4)
+            m[:3, :3] = rot
+            turned = g.apply_matrix(shape, m)
+        lo, hi = (np.asarray(c, float) for c in g.bbox(turned))
+        if flip:
+            lo[2], hi[2] = -hi[2], -lo[2]
+        return lo, hi
+
+    def _paper(self, pts):
+        """The points to upload: as they are, or where they appear on a sheet.
+
+        The handles are built in the model, like everything a detail shows, so
+        on a sheet they come back out through the window that is showing them
+        rather than landing on the paper at the model's own numbers. Both
+        uploads go through here, so nothing drawn can miss it.
+        """
+        eye = self.vp._detail_eye()
+        return pts if eye is None else eye.to_paper(pts)
+
+    def _lines(self, mvp, pts, color, width):
+        from .viewport import rebased
+        vp = self.vp
+        # On paper the anchor is None and rebased is a plain cast; in the
+        # model it is the frame anchor already folded into `mvp`, so far
+        # handles hold as still as the geometry they stand on. The handles
+        # are built in float64 for the same reason the kernel keeps its
+        # coordinates there: the subtraction here needs digits to work on.
+        pts = self._paper(pts)
+        vp._preview.update(rebased(pts.reshape(-1, 3), vp._frame_anchor))
+        vp._set_line_uniforms(mvp, color)
+        vp._line_width(width)
+        GL.glBindVertexArray(vp._preview.vao)
+        GL.glDrawArrays(GL.GL_LINES, 0, len(pts.reshape(-1, 3)))
+
+    def _tris(self, mvp, pts, color):
+        from .viewport import rebased
+        vp = self.vp
+        pts = self._paper(pts)
+        vp._preview.update(rebased(pts, vp._frame_anchor))
+        vp._set_line_uniforms(mvp, color)
+        GL.glBindVertexArray(vp._preview.vao)
+        GL.glDrawArrays(GL.GL_TRIANGLES, 0, len(pts))
+
+    def readout(self):
+        """(text, (screen_x, screen_y)) for the value readout, pinned to
+        where the drag STARTED — a typed move sends the geometry (and its
+        live anchor) off screen, so the readout stays put. None if there
+        is nothing to show."""
+        d = self.drag
+        if d is None:
+            return None
+        anchor = np.asarray(d["anchor"], float)
+        scr = self._project([anchor])[0]
+        if scr[2] <= 0:
+            return None
+        kind = d["handle"][0]
+        if d["typed"]:
+            unit = {"move": "", "rot": "°", "scale": "×"}.get(kind, "")
+            prompt = {"move": "distance", "rot": "angle",
+                      "scale": "factor"}.get(kind, "")
+            text = f"{prompt}: {d['typed']}{unit}"
+        elif d.get("armed"):
+            prompt = {"move": "distance", "rot": "angle",
+                      "scale": "factor"}.get(kind, "")
+            text = f"type a {prompt}, Enter"
+        else:
+            text = d.get("last_label", "")
+        if not text:
+            return None
+        return text, (int(scr[0]) + 18, int(scr[1]) - 14)
+
+    # ------------------------------------------------------- hit testing
+
+    def hit_test(self, px, py):
+        if not self.active():
+            return None
+        state = self.anchor_and_axes()
+        if state is None:
+            return None
+        anchor, axes = state
+        s = self._size_world(anchor)
+        vdir = self._view_dir(anchor)     # what is not worth testing for
+
+        def scr(p):
+            out = self._project([p])[0]
+            return out[:2] if out[2] > 0 else None
+
+        cursor = np.array([px, py])
+
+        def on_ring(i):
+            u, v = axes[(i + 1) % 3], axes[(i + 2) % 3]
+            pts = [scr(p) for p in _arc(anchor, u, v, ARC_R * s, 12)]
+            pts = [p for p in pts if p is not None]
+            return any(_seg_dist(cursor, a, b) < 7
+                       for a, b in zip(pts, pts[1:]))
+
+        def on_arrow(i, both_ways):
+            a = scr(anchor - axes[i] * (CONE1 if both_ways else -SHAFT0) * s)
+            b = scr(anchor + axes[i] * CONE1 * s)
+            return (a is not None and b is not None
+                    and _seg_dist(cursor, a, b) < 8)
+
+        if self._fillet_mode():               # radius arrow, the box on it,
+            n = axes[2]                       # and the two that move the edge
+            p = scr(anchor + n * EXT_POS * s)
+            if p is not None and np.linalg.norm(p - cursor) < 6.5:
+                return ("ext", 2)
+            a = scr(anchor)
+            b = scr(anchor + n * CONE1 * s)
+            if a is not None and b is not None and _seg_dist(cursor, a, b) < 8:
+                return ("move", 2)
+            if self._edge_move_target() is not None:
+                for i in (0, 1):
+                    if (self._usable("move", i, axes, vdir)
+                            and on_arrow(i, True)):
+                        return ("move", i)
+            return None
+
+        c = scr(anchor)
+        if c is not None and np.linalg.norm(c - cursor) < 8:
+            return ("center", 0)
+        on = self.handles()
+        two_way = self._two_way_axes()
+        reach = self.scale_reach(anchor, axes, s)
+        # the boxes (smallest targets first, and the filled one sits on the
+        # shaft, so it has to be asked about before the arrow it lies along)
+        for kind in ("ext", "scale"):
+            for i in range(3):
+                if ((kind, i) not in on
+                        or not self._usable(kind, i, axes, vdir)):
+                    continue
+                along = EXT_POS if kind == "ext" else -reach[i]
+                p = scr(anchor + axes[i] * along * s)
+                if p is not None and np.linalg.norm(p - cursor) < 6.5:
+                    return (kind, i)
+        for i in range(3):                    # pads
+            if ("pad", i) not in on or not self._usable("pad", i, axes, vdir):
+                continue
+            u, v = axes[(i + 1) % 3], axes[(i + 2) % 3]
+            corners = [anchor + (u * a + v * b) * s
+                       for a, b in ((PAD0, PAD0), (PAD1, PAD0),
+                                    (PAD1, PAD1), (PAD0, PAD1))]
+            pts = [scr(c) for c in corners]
+            if all(p is not None for p in pts) and _in_poly(cursor, pts):
+                return ("pad", i)
+        for i in range(3):                    # arrows
+            if ("move", i) in on and self._usable("move", i, axes, vdir):
+                if on_arrow(i, i in two_way):
+                    return ("move", i)
+        for i in range(3):                    # rings
+            if ("rot", i) in on and self._usable("rot", i, axes, vdir):
+                if on_ring(i):
+                    return ("rot", i)
+        return None
+
+    def update_hover(self, px, py) -> bool:
+        new = self.hit_test(px, py)
+        if new != self.hover:
+            self.hover = new
+            return True
+        return False
+
+    # ----------------------------------------------------------- dragging
+
+    def context_menu(self, px, py) -> bool:
+        """A right-click on the pivot offers the alignments."""
+        if self.drag is not None or not self.active():
+            return False
+        if self.hit_test(px, py) != ("center", 0):
+            return False
+        self.open_menu(px, py)
+        return True
+
+    def _center_normal(self, anchor):
+        """The plane the pivot is dragged in: the construction plane, or
+        the screen when that plane is seen too nearly edge-on to aim in."""
+        normal = np.asarray(self._plane().normal, float)
+        vdir = self._view_dir(anchor)
+        if abs(float(np.dot(normal, vdir))) < 0.15:
+            return -vdir
+        return normal
+
+    def begin_drag(self, handle, px, py, modifiers) -> bool:
+        if handle == ("center", 0) and handle not in self.handles():
+            # held faces and edges have no free move; the press is still
+            # spent here so it does not pick what lies under the pivot
+            return True
+        state = self.anchor_and_axes()
+        if state is None:
+            return False
+        anchor, axes = state
+        vp = self.vp
+        copies = None
+        origin, direction = vp._eye().ray_through(px, py, vp.width(),
+                                                  vp.height())
+        kind, i = handle
+        ref = None
+        center_normal = None
+        if kind == "center":
+            center_normal = self._center_normal(anchor)
+            hit = ray_plane_any(origin, direction, anchor, center_normal)
+            if hit is None:
+                return False
+            ref = hit
+        elif kind in ("move", "scale", "ext"):
+            t = ray_line_parameter(origin, direction, anchor, axes[i])
+            if t is None:
+                return False
+            ref = t
+        elif kind == "pad":
+            hit = ray_plane_any(origin, direction, anchor, axes[i])
+            if hit is None:
+                return False
+            ref = hit
+        elif kind == "rot":
+            hit = ray_plane_any(origin, direction, anchor, axes[i])
+            if hit is None:
+                return False
+            vec = hit - anchor
+            if np.linalg.norm(vec) < 1e-9:
+                return False
+            ref = vec / np.linalg.norm(vec)
+        tf = None if _ctrl_held(modifiers) else self._tf_target()
+        if _ctrl_held(modifiers) and self._tf_target_of() is not None:
+            # On held parts Ctrl is what brought up this gumball, so it is
+            # not also asking to grow: the filled box extrudes, the arrow
+            # does what this gumball's arrow does (fillet, push/pull).
+            modifiers = Qt.KeyboardModifier(
+                int(getattr(modifiers, "value", modifiers))
+                & ~int(Qt.KeyboardModifier.ControlModifier.value))
+        cv = None if tf is not None else self._cv_target()
+        seg = None if (cv is not None or tf is not None) \
+            else self._segment_target()
+        pp = None if (cv is not None or seg is not None or tf is not None) \
+            else self._pushpull_target()
+        parts = (None if (cv is not None or seg is not None or pp is not None
+                          or tf is not None)
+                 else self._parts_target())
+        mf = (None if (cv is not None or seg is not None or pp is not None
+                       or parts is not None or tf is not None)
+              else self._multiface_target())
+        ex = (None if (cv is not None or pp is not None or mf is not None
+                       or parts is not None or tf is not None)
+              else self._extrude_target(handle, modifiers,
+                                       axes[handle[1]]))
+        if ex is not None:
+            seg = None                        # the box grows the segment
+        ft = (None if (cv is not None or seg is not None or pp is not None
+                       or mf is not None or ex is not None or tf is not None)
+              else self._fillet_target())
+        if handle[0] == "ext" and ex is None and pp is None:
+            # Nothing here grows. Doing nothing beats quietly moving the
+            # thing you were trying to grow.
+            return False
+        grow = False                          # a face growing new walls
+        em = None                             # a held edge being moved
+        tf_draft = None
+        if tf is not None:                    # held parts, transformed
+            if handle[0] not in ("move", "pad", "rot", "scale", "center"):
+                return False
+            originals = {}
+            for oid in tf[0]:
+                obj = vp.scene.get(oid)
+                if obj is not None:
+                    originals[oid] = obj.shape
+            if not originals:
+                return False
+            tf_draft = self._tf_draft(tf[0], _alt_held(modifiers))
+            if tf_draft is None:
+                return False
+            self.vp.window_checkpoint("gumball " + handle[0])
+        elif cv is not None:                  # held control points
+            originals = {}
+            for oid in cv[0]:
+                obj = vp.scene.get(oid)
+                if obj is not None:
+                    originals[oid] = obj.shape
+            if not originals:
+                return False
+            self.vp.window_checkpoint("gumball " + handle[0])
+        elif seg is not None:                 # held curve segments
+            originals = {}
+            for oid in list(seg[0]) + list(seg[2]):
+                obj = vp.scene.get(oid)
+                if obj is not None:
+                    originals[oid] = obj.shape
+            if not originals:
+                return False
+            self.vp.window_checkpoint("gumball " + handle[0])
+        elif pp is not None:                  # a held face
+            planar = bool(pp[4])
+            if handle not in self._face_handles(planar, axes):
+                return False
+            obj = vp.scene.get(pp[0])
+            if obj is None:
+                return False
+            originals = {pp[0]: obj.shape}
+            # The box grows the face with new walls; so does Ctrl and the
+            # arrow, the shortcut the rest of the gumball already answers.
+            out_of = self._along_normal(axes)
+            grow = planar and (handle[0] == "ext" or (
+                handle[0] == "move" and handle[1] in out_of
+                and _ctrl_held(modifiers)))
+            self.vp.window_checkpoint(
+                self._face_verb(handle, grow, handle[1] in out_of))
+        elif parts is not None:               # faces and edges together
+            if handle[0] != "move":
+                return False                  # arrows only: moved as one
+            obj = vp.scene.get(parts[0])
+            if obj is None:
+                return False
+            originals = {parts[0]: obj.shape}
+            self.vp.window_checkpoint("move parts")
+        elif mf is not None:                  # multi-face offset mode
+            if handle != ("move", 2):
+                return False
+            obj = vp.scene.get(mf[0])
+            if obj is None:
+                return False
+            originals = {mf[0]: obj.shape}
+            self.vp.window_checkpoint("push faces")
+        elif ex is not None:                  # Ctrl: grow it, do not move it
+            # Nothing is built here. A drag that never leaves the anchor has
+            # grown nothing, and a surface of no height is not something the
+            # drawing should be asked to hold even for a frame.
+            originals = {s["into"]: vp.scene.get(s["into"]).shape
+                         for s in ex if s["into"] is not None}
+            self.vp.window_checkpoint("gumball extrude")
+        elif ft is not None:                  # a held edge
+            obj = vp.scene.get(ft[0])
+            if obj is None:
+                return False
+            if handle == ("move", 2):         # the radius arrow
+                originals = {ft[0]: obj.shape}
+                self.vp.window_checkpoint("fillet")
+            elif handle in (("move", 0), ("move", 1)):
+                em = self._edge_move_target()
+                if em is None:
+                    return False
+                originals = {ft[0]: obj.shape}
+                self.vp.window_checkpoint("move edge")
+            else:
+                return False
+        else:
+            objs = vp.selection.objects()
+            if not objs:
+                return False
+            copy_mode = bool(modifiers & Qt.KeyboardModifier.AltModifier) and \
+                handle[0] in ("move", "pad", "rot", "scale", "center")
+            self.vp.window_checkpoint("gumball " + handle[0])
+            if copy_mode:
+                new_objs = []
+                for o in objs:
+                    new_objs.append(vp.scene.add(g.copy_shape(o.shape),
+                                                 layer_id=o.layer_id))
+                copies = ([o.id for o in objs], [o.id for o in new_objs])
+                vp.selection.set(copies[1])
+                objs = new_objs
+            originals = {o.id: o.shape for o in objs}
+        self.drag = {
+            "handle": handle, "anchor": anchor, "axes": axes,
+            "originals": originals,
+            "cvs": dict(cv[0]) if cv is not None else None,
+            "segments": ({k: list(v) for k, v in seg[0].items()}
+                         if seg is not None else None),
+            "segment_points": ({k: list(v) for k, v in seg[2].items()}
+                               if seg is not None else {}),
+            "segment_mids": {},
+            "parts": ((parts[0], list(parts[1]), list(parts[2]),
+                       list(parts[4]))
+                      if parts is not None else None),
+            "pp": (pp[0], pp[1]) if pp is not None else None,
+            "pp_planar": bool(pp[4]) if pp is not None else True,
+            "multiface": (mf[0], list(mf[1])) if mf is not None else None,
+            "fillet": ((ft[0], list(ft[1]))
+                       if ft is not None and em is None else None),
+            "chamfer": ft is not None and em is None and _alt_held(modifiers),
+            "edge_move": em,
+            "edge_dir": (np.asarray(self._edge_dir(em), float)
+                         if em is not None else None),
+            "face_grow": grow,
+            "face_normal": (np.asarray(pp[3][2], float) if pp is not None
+                            else None),
+            "turned": 0.0, "reshaped": False, "tilt_axis": None,
+            "extrude": ex, "made": {}, "copies": copies,
+            "tf": ({k: tuple(list(x) for x in v) for k, v in tf[0].items()}
+                   if tf is not None else None),
+            "tf_copy": tf is not None and _alt_held(modifiers),
+            "tf_draft": tf_draft, "tf_matrix": None, "tf_moved": None,
+            "center_normal": center_normal,
+            "ref": ref, "last_label": "", "offset": np.zeros(3),
+            "typed": "", "armed": False, "moved": False,
+        }
+        vp.selection.rebuilding = self.rebuilding_id()
+        self.drag["snap"] = self._snap_context()
+        return True
+
+    def _snap_context(self):
+        """(ids, points) for snapping while this drag lasts: the objects it
+        moves are left out, since a point cannot be snapped to itself, but
+        what a held part leaves where it was is put back in, so a mesh's
+        corner can be dragged onto its neighbour."""
+        from ..core.snaps import _static_snap_points
+        d = self.drag
+        extra = []
+        for oid, idxs in (d.get("cvs") or {}).items():
+            original = d["originals"].get(oid)
+            obj = self.vp.scene.get(oid)
+            if original is None or obj is None:
+                continue
+            try:
+                pts = (g.surface_control_points(original)[0]
+                       if obj.kind == "surface"
+                       else g.get_control_points(original))
+                moving = {tuple(np.round(pts[i], 6)) for i in idxs}
+                extra += [(p, kind) for p, kind
+                          in _static_snap_points(original)
+                          if tuple(np.round(p, 6)) not in moving]
+            except (g.GeometryError, IndexError):
+                continue
+        return set(d["originals"]), extra
+
+    def _snapped(self, px, py):
+        """The snap under the cursor while dragging, shown as the pane
+        shows any, or None."""
+        vp = self.vp
+        snaps = getattr(vp, "snaps", None)
+        context = self.drag.get("snap") if self.drag else None
+        if snaps is None or context is None:
+            return None
+        ids, extra = context
+        hider = getattr(vp, "snap_hider", None)
+        snap = snaps.find(vp._eye(), px, py, vp.width(), vp.height(),
+                          exclude_ids=ids, extra_points=extra,
+                          hidden=hider(exclude_ids=ids) if hider else None)
+        vp._active_snap = snap
+        return None if snap is None else np.asarray(snap[0], float)
+
+    def drag_to(self, px, py, modifiers) -> str:
+        d = self.drag
+        if d is None:
+            return ""
+        vp = self.vp
+        anchor, axes = d["anchor"], d["axes"]
+        kind, i = d["handle"]
+        origin, direction = vp._eye().ray_through(px, py, vp.width(),
+                                                  vp.height())
+        if d["typed"]:      # numeric entry overrides the mouse, bar its side
+            if kind in ("move", "ext"):
+                t = ray_line_parameter(origin, direction, anchor, axes[i])
+                if t is not None and abs(t - d["ref"]) > 1e-9:
+                    sign = 1.0 if t > d["ref"] else -1.0
+                    if sign != d.get("drag_sign", 1.0):
+                        d["drag_sign"] = sign
+                        self._preview_typed()
+            return d["last_label"]
+        uniform = bool(modifiers & Qt.KeyboardModifier.ShiftModifier)
+        d["moved"] = True
+        if d.get("fillet"):                  # hold Alt to chamfer instead
+            d["chamfer"] = _alt_held(modifiers)
+        if kind == "center":                 # free, onto whatever it snaps to
+            at = self._snapped(px, py)
+            if at is not None:
+                delta = at - anchor
+            else:
+                hit = ray_plane_any(origin, direction, anchor,
+                                    d["center_normal"])
+                if hit is None:
+                    return d["last_label"]
+                delta = hit - d["ref"]
+                if vp.grid_snap and vp.grid_snap_step > 0:
+                    step = vp.grid_snap_step
+                    delta = np.round(delta / step) * step
+            d["offset"] = np.asarray(delta, float)
+            self._move_by(delta)
+            d["last_label"] = ("move "
+                               + vp.scene.format_length(float(
+                                   np.linalg.norm(delta))))
+            return d["last_label"]
+        if kind == "pad":
+            hit = ray_plane_any(origin, direction, anchor, axes[i])
+            if hit is None:
+                return d["last_label"]
+            if uniform and not any(d.get(key) for key in (
+                    "cvs", "pp", "multiface", "fillet", "edge_move",
+                    "extrude")):
+                start_radius = float(np.linalg.norm(d["ref"] - anchor))
+                if start_radius < 1e-9:
+                    return d["last_label"]
+                factor = max(float(np.linalg.norm(hit - anchor))
+                             / start_radius, 0.01)
+                self._scale_in_plane_by(anchor, axes[i], factor)
+                d["reshaped"] = abs(factor - 1.0) > 1e-9
+                d["last_label"] = f"scale {factor:.3f} (in plane)"
+                return d["last_label"]
+            delta = hit - d["ref"]
+            at = self._snapped(px, py)
+            if at is not None:
+                # what it holds goes to the snap, as near as the plane allows
+                reach = at - anchor
+                delta = reach - axes[i] * float(np.dot(reach, axes[i]))
+            if d.get("pp"):                   # a held face: lift, then slide
+                oid, fidx = d["pp"]
+                orig = d["originals"].get(oid)
+                if self._rebuild(
+                        oid, orig, float(np.linalg.norm(delta)),
+                        lambda _v: self._face_slid(orig, fidx, delta)):
+                    d["offset"] = np.asarray(delta, float)
+                    d["reshaped"] = True
+                    d["last_label"] = (
+                        "slide face " + vp.scene.format_length(
+                            float(np.linalg.norm(delta))))
+                return d["last_label"]
+            d["offset"] = np.asarray(delta, float)
+            self._move_by(delta)
+            d["last_label"] = ("move "
+                               + vp.scene.format_length(float(
+                                   np.linalg.norm(delta))))
+            return d["last_label"]
+        if kind in ("move", "ext"):
+            t = ray_line_parameter(origin, direction, anchor, axes[i])
+            if t is None:
+                return d["last_label"]
+            value = t - d["ref"]
+            at = self._snapped(px, py) if kind == "move" else None
+            if at is not None:
+                # along the arrow to where the snap stands across from it
+                value = float(np.dot(at - anchor, axes[i]))
+            elif vp.grid_snap and vp.grid_snap_step > 0:
+                value = round(value / vp.grid_snap_step) * vp.grid_snap_step
+            if abs(value) > 1e-9:
+                d["drag_sign"] = 1.0 if value > 0 else -1.0
+        elif kind == "rot":
+            hit = ray_plane_any(origin, direction, anchor, axes[i])
+            if hit is None:
+                return d["last_label"]
+            vec = hit - anchor
+            n = np.linalg.norm(vec)
+            if n < 1e-9:
+                return d["last_label"]
+            vec = vec / n
+            cosv = float(np.clip(np.dot(d["ref"], vec), -1, 1))
+            sign = float(np.dot(np.cross(d["ref"], vec), axes[i]))
+            value = math.degrees(math.acos(cosv)) * (1 if sign >= 0 else -1)
+            if uniform:
+                value = round(value / 15.0) * 15.0
+        elif kind == "scale":
+            t = ray_line_parameter(origin, direction, anchor, axes[i])
+            if t is None or abs(d["ref"]) < 1e-9:
+                return d["last_label"]
+            value = t / d["ref"]
+        else:
+            return d["last_label"]
+        return self.apply_scalar(value, uniform=uniform)
+
+    def apply_scalar(self, value: float, uniform: bool = False) -> str:
+        """Apply the move/rotate/scale transform for a single value and
+        return its label. Shared by mouse drag and typed entry."""
+        d = self.drag
+        if d is None:
+            return ""
+        vp = self.vp
+        kind, i = d["handle"]
+        anchor, axes = d["anchor"], d["axes"]
+        if kind in ("move", "ext"):
+            if d.get("extrude"):              # the box, or Ctrl and an arrow
+                self._extrude_by(axes[i], float(value))
+                d["offset"] = np.asarray(axes[i] * value, float)
+                label = "extrude " + vp.scene.format_length(float(value))
+            elif d.get("pp") and i not in self._along_normal(axes):
+                oid, fidx = d["pp"]           # a held face, along an axis
+                orig = d["originals"].get(oid)   # that lies in it, or leans
+                if not self._rebuild(
+                        oid, orig, value,
+                        lambda v: self._face_slid(orig, fidx, axes[i] * v)):
+                    return d["last_label"]
+                d["offset"] = np.asarray(axes[i] * value, float)
+                label = "slide face " + vp.scene.format_length(float(value))
+            elif d.get("pp"):                 # a held face, in or out
+                oid, fidx = d["pp"]
+                orig = d["originals"].get(oid)
+                planar = d.get("pp_planar", True)
+                grow = bool(d.get("face_grow"))
+                n = d.get("face_normal")
+                sign = (1.0 if n is None
+                        else float(np.sign(np.dot(axes[i], n)) or 1.0))
+                if not self._rebuild(
+                        oid, orig, value, lambda v: self._face_moved(
+                            orig, fidx, v * sign, planar, grow)):
+                    return d["last_label"]
+                d["offset"] = np.asarray(axes[i] * value, float)
+                verb = ("extrude face" if grow else "move face" if planar
+                        else "offset")
+                label = verb + " " + vp.scene.format_length(float(value))
+            elif d.get("edge_move"):          # a held edge, along a face
+                oid, eidx = d["edge_move"]
+                orig = d["originals"].get(oid)
+                delta = np.asarray(axes[i] * value, float)
+                if not self._rebuild(
+                        oid, orig, value,
+                        lambda v: g.move_edge(orig, eidx, tuple(delta))):
+                    return d["last_label"]
+                d["offset"] = delta
+                label = "move edge " + vp.scene.format_length(float(value))
+            elif d.get("parts"):              # faces and edges, as one change
+                oid, fidx, eidx, vidx = d["parts"]
+                orig = d["originals"].get(oid)
+                delta = np.asarray(axes[i] * value, float)
+                if not self._rebuild(
+                        oid, orig, value,
+                        lambda v: g.move_parts(orig, fidx, eidx, tuple(delta),
+                                               vertices=vidx)):
+                    return d["last_label"]
+                d["offset"] = delta
+                label = "move parts " + vp.scene.format_length(float(value))
+            elif d.get("multiface"):          # offset every selected face
+                oid, idxs = d["multiface"]
+                orig = d["originals"].get(oid)
+                if orig is not None and vp.scene.get(oid) is not None:
+                    if abs(value) > 1e-4:
+                        try:
+                            vp.scene.replace_shape(
+                                oid, g.offset_faces(orig,
+                                                    {k: value for k in idxs}))
+                        except g.GeometryError:
+                            pass          # too big — keep last good
+                    else:
+                        vp.scene.replace_shape(oid, orig)   # 0 → original
+                d["offset"] = np.asarray(axes[i] * value, float)
+                label = (f"push {len(idxs)} faces "
+                         + vp.scene.format_length(float(value)))
+            elif d.get("fillet"):             # edge fillet/chamfer, radius=value
+                oid, idxs = d["fillet"]
+                orig = d["originals"].get(oid)
+                radius = float(value)
+                chamfer = bool(d.get("chamfer"))
+                failed = None
+                if orig is not None and vp.scene.get(oid) is not None:
+                    if radius > 1e-4:
+                        try:
+                            edges = [g.edges_of(orig)[k] for k in idxs]
+                            vp.scene.replace_shape(
+                                oid, g.fillet_edges(orig, radius, edges=edges,
+                                                    chamfer=chamfer))
+                            d["fillet_done"] = True
+                        except (g.GeometryError, IndexError) as exc:
+                            failed = str(exc)   # too big — keep last good
+                    else:
+                        vp.scene.replace_shape(oid, orig)   # 0 → no fillet
+                d["offset"] = np.asarray(axes[i] * max(radius, 0.0), float)
+                verb = "chamfer" if chamfer else "fillet"
+                label = verb + " " + vp.scene.format_length(float(radius))
+                if failed is not None and not d.get("fillet_done"):
+                    # nothing has rounded yet: say why rather than a size
+                    # that is not there
+                    d["fillet_failed"] = failed
+                    label = verb + ": " + failed.split(" — ")[0]
+            else:
+                delta = axes[i] * value
+                d["offset"] = np.asarray(delta, float)
+                self._move_by(delta)
+                label = "move " + vp.scene.format_length(float(value))
+        elif kind == "rot" and d.get("pp"):   # tilt a held face
+            oid, fidx = d["pp"]
+            orig = d["originals"].get(oid)
+            n = d.get("face_normal")
+            axis = np.asarray(axes[i], float)
+            if n is not None:                 # about the axis laid into it
+                axis = axis - n * float(np.dot(axis, n))
+                axis = axis / (np.linalg.norm(axis) or 1.0)
+            if not self._rebuild(oid, orig, value, lambda v: g.tilt_face(
+                    orig, fidx, tuple(anchor), tuple(axis), v)):
+                return d["last_label"]
+            d["tilt_axis"] = axis
+            d["turned"] = float(value)
+            label = f"tilt {value:.1f}°"
+        elif kind == "rot":
+            self._turn_by(anchor, axes[i], value)
+            label = f"rotate {value:.1f}°"
+            if d.get("copies"):
+                d["turned"] = float(value)
+        elif kind == "scale" and d.get("pp"):  # taper a held face
+            if abs(value) < 1e-4:
+                return d["last_label"]
+            oid, fidx = d["pp"]
+            orig = d["originals"].get(oid)
+            if not self._rebuild(
+                    oid, orig, value - 1.0,
+                    lambda _v: g.scale_face(
+                        orig, fidx, float(value),
+                        axis=None if uniform else tuple(axes[i]))):
+                return d["last_label"]
+            d["reshaped"] = True
+            label = f"scale face {value:.3f}" + (" (uniform)" if uniform
+                                                 else "")
+        elif kind == "scale":
+            if abs(value) < 1e-4:
+                return d["last_label"]
+            if uniform:
+                self._scale_by(anchor, None, value)
+                label = f"scale {value:.3f} (uniform)"
+            else:
+                self._scale_by(anchor, axes[i], value)
+                label = f"scale {value:.3f}"
+            if d.get("copies"):
+                d["reshaped"] = abs(value - 1.0) > 1e-9
+        else:
+            return d["last_label"]
+        d["last_label"] = label
+        return label
+
+    # -------------------------------------------------------- numeric entry
+
+    def accepts_typing(self) -> bool:
+        return self.drag is not None and self.drag["handle"][0] in _ONE_DOF
+
+    def type_char(self, ch: str) -> bool:
+        """Feed a keystroke ('0'..'9', '.', '-', 'back') to numeric entry.
+        Returns True if consumed."""
+        d = self.drag
+        if d is None or d["handle"][0] not in _ONE_DOF:
+            return False
+        if ch == "back":
+            d["typed"] = d["typed"][:-1]
+        elif ch in "0123456789.-":
+            d["typed"] += ch
+        else:
+            return False
+        self._preview_typed()
+        return True
+
+    def _parse_typed(self):
+        d = self.drag
+        s = d["typed"]
+        if s in ("", "-", ".", "-.", "+"):
+            return None
+        try:
+            val = float(s)
+        except ValueError:
+            return None
+        # a positive length runs the way the arrow is being dragged
+        if d["handle"][0] in ("move", "ext") and not d.get("fillet"):
+            val *= d.get("drag_sign", 1.0)
+        return val
+
+    def _preview_typed(self):
+        val = self._parse_typed()
+        if val is None:
+            self._apply(lambda s: s)          # revert to originals
+            self.drag["offset"] = np.zeros(3)
+            self.drag["last_label"] = ""
+        else:
+            self.apply_scalar(val)
+
+    def commit_typed(self) -> bool:
+        d = self.drag
+        if d is None:
+            return False
+        val = self._parse_typed()
+        if val is None:
+            return False
+        self.apply_scalar(val)
+        self.end_drag()
+        return True
+
+    def arm(self):
+        """Keep an un-dragged handle click alive so a value can be typed."""
+        if self.drag is not None and self.drag["handle"][0] in _ONE_DOF:
+            self.drag["armed"] = True
+
+    # What is being held is either whole objects or some of one object's
+    # control points, and every handle has to do the same thing to both. A
+    # shape transform says nothing about where a single pole should end up,
+    # so each of these says it once, in the two ways it has to be said.
+
+    def _apply_points(self, at, whole):
+        """Held control points and held curve segments take the transform
+        as a point map `at`; whole objects take it as the shape transform
+        `whole`."""
+        if self.drag.get("tf") is not None:
+            self._apply_tf(whole)
+        elif self.drag.get("cvs"):
+            self._apply_cvs(at)
+        elif self.drag.get("segments") is not None:
+            self._apply_segments(at)
+        else:
+            self._apply(whole)
+
+    def _tf_draft(self, held, copying):
+        """The fast stand-in a held-parts drag shows: a function from a 3x4
+        matrix to what every pane draws, the moving edges and corners, or
+        for an Alt copy the detached parts. None if there is nothing to draw."""
+        from types import SimpleNamespace
+
+        from ..commands.transform import _detached_parts, _parts_draft
+        from ..core.tessellate import DisplayMesh, tessellate
+        ctx = SimpleNamespace(scene=self.vp.scene)
+        named = {"face": {}, "edge": {}, "point": {}}
+        for oid, (fidx, eidx, vidx) in held.items():
+            for key, idxs in zip(("face", "edge", "point"), (fidx, eidx, vidx)):
+                if idxs:
+                    named[key][oid] = list(idxs)
+        named = {k: v for k, v in named.items() if v}
+        if not copying:
+            return _parts_draft(ctx, named, lambda matrix: matrix)
+        pieces = _detached_parts(ctx, named)
+        if not pieces:
+            return None
+        drawn = tessellate(g.make_compound([shape for shape, _ in pieces]))
+        tris = drawn.triangles.copy()
+        verts = np.asarray(drawn.vertices, float)
+        ends = np.asarray(drawn.edge_segments, float)
+
+        def draft(matrix):
+            linear, shift = matrix[:, :3], matrix[:, 3]
+            mesh = DisplayMesh()
+            mesh.place(vertices=verts @ linear.T + shift,
+                       edge_segments=ends @ linear.T + shift)
+            mesh.triangles = tris
+            mesh.normals = np.zeros_like(verts, np.float32)
+            return mesh
+        return draft
+
+    def _panes(self):
+        panes = getattr(getattr(self.vp, "window", lambda: None)(),
+                        "all_viewports", None)
+        return list(panes()) if panes else [self.vp]
+
+    def _apply_tf(self, whole):
+        """Show where the held parts go: the transform read as a matrix
+        near them and drawn as edges in every pane. The faces are rebuilt
+        on release (end_drag), not on every mouse move."""
+        d = self.drag
+        matrix = g.affine_of(whole, tuple(d["anchor"]))
+        d["tf_matrix"] = matrix
+        d["tf_whole"] = whole
+        d["reshaped"] = True
+        ghost = d["tf_draft"](matrix)
+        for pane in self._panes():
+            if hasattr(pane, "set_ghost"):
+                pane.set_ghost(ghost)
+
+    def _clear_tf_ghost(self):
+        for pane in self._panes():
+            if hasattr(pane, "set_ghost"):
+                pane.set_ghost(None)
+
+    def _finish_tf(self, d):
+        """Build what a held-parts drag showed: the parts reshaped into
+        place, or with Alt copies of them as objects of their own. What is
+        held is found again on the rebuilt objects."""
+        from types import SimpleNamespace
+
+        from ..commands.transform import (
+            _add_pieces, _detached_parts, _solid_parts_shape)
+        vp = self.vp
+        whole = d.get("tf_whole")
+        matrix = d.get("tf_matrix")
+        if whole is None or matrix is None:
+            return
+        named = {"face": {}, "edge": {}, "point": {}}
+        for oid, (fidx, eidx, vidx) in d["tf"].items():
+            for key, idxs in zip(("face", "edge", "point"), (fidx, eidx, vidx)):
+                if idxs:
+                    named[key][oid] = list(idxs)
+        named = {k: v for k, v in named.items() if v}
+        if d.get("tf_copy"):
+            ctx = SimpleNamespace(scene=vp.scene)
+            _add_pieces(ctx, _detached_parts(ctx, named), whole)
+            return
+        moving = d["handle"][0] in ("move", "pad", "center")
+        refused = []
+        rebuilt = {}
+        for oid, (fidx, eidx, vidx) in d["tf"].items():
+            original = d["originals"].get(oid)
+            if original is None or vp.scene.get(oid) is None:
+                continue
+            action = (("move", tuple(float(c) for c in d["offset"]))
+                      if moving else None)
+            try:
+                shape = _solid_parts_shape(original, fidx, eidx, whole, action,
+                                           vidx=vidx)
+            except g.GeometryError as exc:
+                refused.append(str(exc))
+                continue
+            vp.scene.replace_shape(oid, shape)
+            rebuilt[oid] = (original, shape, fidx, eidx, vidx)
+        self._resync_tf(rebuilt, matrix)
+        if refused:
+            window = getattr(vp, "window", lambda: None)()
+            line = getattr(window, "command_line", None)
+            if line is not None:
+                for why in refused:
+                    line.echo(why + ".")
+
+    def _resync_tf(self, rebuilt, matrix):
+        """Hold each part again on its rebuilt object: the face, edge or
+        corner nearest where the drag carried it."""
+        sel = self.vp.selection
+        linear, shift = matrix[:, :3], matrix[:, 3]
+        held = [e for e in sel.subobjects if e[0] not in rebuilt]
+        for oid, (orig, now, fidx, eidx, vidx) in rebuilt.items():
+            try:
+                for kind, idxs, was_of, now_of in (
+                        ("face", fidx, lambda s: [np.asarray(g.centroid(f))
+                                                  for f in g.faces_of(s)],
+                         None),
+                        ("edge", eidx, lambda s: [np.asarray(g.centroid(e))
+                                                  for e in g.edges_of(s)],
+                         None),
+                        ("vertex", vidx, lambda s: [np.asarray(p) for p in
+                                                    g.vertex_points(s)],
+                         None)):
+                    if not idxs:
+                        continue
+                    before = was_of(orig)
+                    after = np.asarray(was_of(now), float)
+                    for i in idxs:
+                        want = linear @ before[i] + shift
+                        held.append((oid, kind, int(np.argmin(
+                            np.linalg.norm(after - want, axis=1)))))
+            except (g.GeometryError, IndexError, ValueError):
+                continue
+        sel.set_subobjects(list(dict.fromkeys(held)))
+
+    def _move_by(self, delta):
+        d = self.drag
+        if d.get("parts"):
+            # faces and edges held together move as one change, from the
+            # shape the drag began on every time (see _apply_cvs)
+            oid, fidx, eidx, vidx = d["parts"]
+            self._rebuild(oid, d["originals"].get(oid),
+                          float(np.linalg.norm(delta)),
+                          lambda v: g.move_parts(d["originals"][oid], fidx,
+                                                 eidx, tuple(delta),
+                                                 vertices=vidx))
+            return
+        self._apply_points(lambda p: p + delta,
+                           lambda s: g.translate(s, tuple(delta)))
+
+    def _turn_by(self, anchor, axis, degrees):
+        self._apply_points(
+            lambda p: _turned(p, anchor, axis, degrees),
+            lambda s: g.rotate(s, tuple(anchor), tuple(axis), degrees))
+
+    def _scale_by(self, anchor, axis, value):
+        """About `anchor`, along `axis`, or every way if `axis` is None."""
+        if axis is None:
+            self._apply_points(
+                lambda p: anchor + (p - anchor) * value,
+                lambda s: g.scale(s, tuple(anchor), value))
+        else:
+            self._apply_points(
+                lambda p: p + axis * float(np.dot(p - anchor, axis))
+                * (value - 1.0),
+                lambda s: g.scale_along_axis(
+                    s, tuple(anchor), tuple(axis), value))
+
+    def _scale_in_plane_by(self, anchor, normal, value):
+        """Scale equally in the plane through `anchor`, preserving normal."""
+        anchor = np.asarray(anchor, float)
+        normal = np.asarray(normal, float)
+        normal = normal / (np.linalg.norm(normal) or 1.0)
+        plane = np.eye(3) - np.outer(normal, normal)
+        linear = np.eye(3) + (float(value) - 1.0) * plane
+        matrix = np.eye(4)
+        matrix[:3, :3] = linear
+        matrix[:3, 3] = anchor - linear @ anchor
+        self._apply_points(lambda p: linear @ p + matrix[:3, 3],
+                           lambda s: g.apply_matrix(s, matrix))
+
+    def _rebuild(self, oid, orig, value, make):
+        """Show `make(value)` in place of the held solid, or the original
+        at zero. A value the kernel cannot build keeps whatever was showing:
+        too far is not an error worth losing the drag over. Return whether
+        the scene accepted this value so the handles track the same shape."""
+        vp = self.vp
+        if orig is None or vp.scene.get(oid) is None:
+            return False
+        if abs(float(value)) < 1e-9:
+            vp.scene.replace_shape(oid, orig)
+            return True
+        try:
+            vp.scene.replace_shape(oid, make(float(value)))
+        except (g.GeometryError, IndexError):
+            return False
+        return True
+
+    @staticmethod
+    def _face_moved(orig, fidx, value, planar, grow):
+        """The solid with one face carried `value` along its normal.
+
+        Growing puts new walls under the face on its old outline. Moving
+        lets the faces beside it stretch to meet it instead, so a chamfer
+        stays a chamfer and a leaning wall keeps leaning; when the kernel
+        cannot manage that for a flat face, new walls are still better
+        than nothing. A curved face only knows how to offset.
+        """
+        if not planar:
+            return g.offset_face(orig, fidx, value)
+        if grow:
+            return g.push_pull(orig, fidx, value)
+        try:
+            return g.offset_face(orig, fidx, value)
+        except g.GeometryError:
+            return g.push_pull(orig, fidx, value)
+
+    def _face_slid(self, orig, fidx, delta):
+        """A held face carried by a pad's vector: out along its normal
+        first, with the old walls stretching, then along itself, with the
+        faces beside it leaning. Either part alone is fine."""
+        normal = np.asarray(self.drag["face_normal"], float)
+        delta = np.asarray(delta, float)
+        out = float(np.dot(delta, normal))
+        flat = delta - normal * out
+        shape, idx = orig, fidx
+        if abs(out) > 1e-9:
+            shape = self._face_moved(orig, fidx, out, True, False)
+            idx = self._face_like(shape, normal,
+                                  np.asarray(self.drag["anchor"], float)
+                                  + normal * out)
+            if idx is None:
+                raise g.GeometryError("Lost the face")
+        if np.linalg.norm(flat) > 1e-9:
+            shape = g.slide_face(shape, idx, tuple(flat))
+        return shape
+
+    @staticmethod
+    def _face_like(shape, normal, near):
+        """Index of the flat face of `shape` facing `normal` nearest to
+        `near`, or None."""
+        best_i, best = None, np.inf
+        try:
+            faces = g.faces_of(shape)
+        except g.GeometryError:
+            return None
+        for i, f in enumerate(faces):
+            try:
+                fn = np.asarray(g.face_normal(f), float)
+                c = np.asarray(g.centroid(f), float)
+            except g.GeometryError:
+                continue
+            fn = fn / (np.linalg.norm(fn) or 1.0)
+            if np.dot(fn, normal) < 0.9:
+                continue
+            score = float(np.linalg.norm(c - near))
+            if score < best:
+                best, best_i = score, i
+        return best_i
+
+    def _edge_dir(self, em):
+        oid, eidx = em
+        obj = self.vp.scene.get(oid)
+        try:
+            return g.edge_line(g.edges_of(obj.shape)[eidx])[1]
+        except (g.GeometryError, IndexError, AttributeError):
+            return (0.0, 0.0, 0.0)
+
+    def _apply_cvs(self, at):
+        """Put each held control point where `at` says it goes.
+
+        Measured from the shape the drag began with every time, so what the
+        curve looks like depends on the drag so far and not on how many mouse
+        moves it took to get here: run the point out and back and the curve is
+        the one you started with.
+        """
+        d = self.drag
+        vp = self.vp
+        for obj_id, idxs in d["cvs"].items():
+            original = d["originals"].get(obj_id)
+            obj = vp.scene.get(obj_id)
+            if original is None or obj is None:
+                continue
+            if obj.kind == "mesh":
+                # all its held points in one go, the mesh welded once
+                vp.scene.replace_shape(obj_id, original.points_moved(
+                    idxs, lambda p: at(np.asarray(p, float))))
+                continue
+            surface = obj.kind == "surface"
+            try:
+                was = (g.surface_control_points(original)[0] if surface
+                       else g.get_control_points(original))
+                shape = original
+                for i in idxs:
+                    to = tuple(float(v) for v in at(np.asarray(was[i], float)))
+                    shape = (g.move_surface_control_point(shape, i, to)
+                             if surface
+                             else g.move_control_point(shape, i, to))
+                vp.scene.replace_shape(obj_id, shape)
+            except (g.GeometryError, IndexError):
+                pass
+
+    def _apply_segments(self, at):
+        """Put each held segment where `at` says, from the shape the drag
+        began with every time (see _apply_cvs), and note where its middle
+        went so the selection can find it again when the drag ends."""
+        d = self.drag
+        vp = self.vp
+        points = d.get("segment_points") or {}
+        for obj_id in dict.fromkeys(list(d["segments"]) + list(points)):
+            idxs = d["segments"].get(obj_id, [])
+            vidx = points.get(obj_id, [])
+            original = d["originals"].get(obj_id)
+            if original is None or vp.scene.get(obj_id) is None:
+                continue
+            try:
+                edges = g.edges_of(original)
+                mids = {i: at(np.asarray(g.centroid(edges[i]), float))
+                        for i in idxs}
+                corners = g.curve_points(original)
+                d.setdefault("point_targets", {})[obj_id] = {
+                    i: at(np.asarray(corners[i], float)) for i in vidx}
+                vp.scene.replace_shape(
+                    obj_id, g.transform_segments(original, idxs, at,
+                                                 vertices=vidx))
+            except (g.GeometryError, IndexError):
+                continue
+            d["segment_mids"][obj_id] = mids
+
+    def _apply(self, fn):
+        d = self.drag
+        vp = self.vp
+        for obj_id, original in d["originals"].items():
+            if vp.scene.get(obj_id) is None:
+                continue
+            try:
+                vp.scene.replace_shape(obj_id, fn(original))
+            except g.GeometryError:
+                pass
+
+    def _extrude_by(self, axis, value):
+        """Rebuild what the drag is growing, at the distance it stands at now.
+
+        Back at nothing is back at nothing: whatever the drag made goes, so
+        that pulling out and changing your mind leaves the drawing as it was
+        rather than with a duplicate of the line lying on the line. That is
+        also what makes a drag that ends at zero cost nothing to undo.
+        """
+        d, vp = self.drag, self.vp
+        for k, s in enumerate(d["extrude"]):
+            oid = d["made"].get(k, s["into"])
+            if abs(value) < 1e-9:
+                if s["into"] is None and oid is not None:
+                    vp.scene.remove(oid)
+                    d["made"].pop(k, None)
+                elif s["into"] is not None:
+                    vp.scene.replace_shape(oid, s["src"])
+                continue
+            try:
+                grown = self._grown(s, axis, value)
+            except g.GeometryError:
+                continue                     # too far — keep the last good one
+            if oid is None:
+                d["made"][k] = vp.scene.add(grown, layer_id=s["layer"]).id
+            elif vp.scene.get(oid) is not None:
+                vp.scene.replace_shape(oid, grown)
+
+    def _grown(self, source, axis, value):
+        """One source at this distance, capped if it is a curve that closes.
+
+        A closed curve that does not lie flat has no face to cap with, and it
+        is still worth the open extrusion rather than nothing at all.
+        """
+        try:
+            return g.extrude(source["src"], tuple(axis), value,
+                             cap=source["cap"])
+        except g.GeometryError:
+            if not source["cap"]:
+                raise
+            return g.extrude(source["src"], tuple(axis), value, cap=False)
+
+    def rebuilding_id(self):
+        """The object a live drag is rebuilding, or None.
+
+        A fillet, push/pull or multi-face drag calls replace_shape on
+        every mouse move, so the picked edge or face indices refer to
+        the shape the drag started from, not to whatever is on screen
+        this frame. The viewport quiets that object's sub-object
+        highlight until the drag settles; end_drag then drops or
+        re-points the picks (_clear_filleted_edges, _resync_face).
+        """
+        d = self.drag
+        if not d:
+            return None
+        for key in ("fillet", "pp", "multiface", "edge_move", "parts"):
+            v = d.get(key)
+            if v:
+                return v[0]
+        return None
+
+    def end_drag(self):
+        self.vp._active_snap = None
+        d = self.drag
+        changed = d is not None and (
+            float(np.linalg.norm(d["offset"])) > 1e-9
+            or abs(float(d.get("turned", 0.0))) > 1e-9
+            or bool(d.get("reshaped")))
+        if d is not None and d.get("tf") is not None:
+            self._clear_tf_ghost()
+            if changed:
+                self._finish_tf(d)
+            else:
+                self.vp.window_discard_checkpoint()
+            self.vp.selection.rebuilding = None
+            self.drag = None
+            return
+        if changed:
+            if d.get("pp") and d.get("pp_planar", True):
+                self._resync_face(d)         # curved offsets keep their index
+            elif d.get("edge_move"):
+                self._resync_edge(d)
+            elif d.get("segments") is not None:
+                self._resync_segments(d)
+            elif d.get("parts"):
+                self._resync_parts(d)
+            elif d.get("fillet"):
+                if d.get("fillet_done"):
+                    self._clear_filleted_edges(d)
+                elif d.get("fillet_failed"):
+                    window = getattr(self.vp, "window", lambda: None)()
+                    line = getattr(window, "command_line", None)
+                    if line is not None:
+                        line.echo(d["fillet_failed"])
+            elif d.get("made"):
+                # You are holding what you just grew, not the line you grew it
+                # from: the next thing anyone does is to the new surface.
+                made = [i for i in d["made"].values()
+                        if self.vp.scene.get(i) is not None]
+                if made:
+                    self.vp.selection.set(made)
+        elif d is not None and d.get("copies"):
+            self._drop_copies(d)             # an Alt-click is not a copy
+            self.vp.window_discard_checkpoint()
+        self.vp.selection.rebuilding = None
+        self.drag = None
+
+    def _drop_copies(self, d):
+        """Take an Alt-drag's copies away again and hold the originals."""
+        held, made = d["copies"]
+        for obj_id in made:
+            self.vp.scene.remove(obj_id)
+        self.vp.selection.set([i for i in held
+                               if self.vp.scene.get(i) is not None])
+
+    def _clear_filleted_edges(self, d):
+        """A committed fillet consumes the picked edges (their indices now
+        point at unrelated edges of the rebuilt solid), so drop them from the
+        sub-object selection rather than leave the handle on stale edges."""
+        oid, idxs = d["fillet"]
+        sel = self.vp.selection
+        for i in idxs:
+            if (oid, "edge", i) in sel.subobjects:
+                sel.toggle_subobject(oid, "edge", i)
+
+    def _resync_face(self, d):
+        """push_pull rebuilds the solid, so the picked face index goes stale.
+        Re-point the sub-object selection at the moved face on the new solid
+        (nearest same-facing planar face to where it ended up) so repeated
+        pulls keep working."""
+        oid, old = d["pp"]
+        obj = self.vp.scene.get(oid)
+        if obj is None:
+            return
+        normal = np.asarray(d.get("face_normal") if d.get("face_normal")
+                            is not None else d["axes"][2], float)
+        if d.get("turned"):                  # tilted: it faces a new way now
+            axis = d.get("tilt_axis")
+            if axis is None:
+                axis = d["axes"][d["handle"][1]]
+            normal = _turned(normal, np.zeros(3), axis, float(d["turned"]))
+        target = np.asarray(d["anchor"], float) + np.asarray(d["offset"], float)
+        try:
+            faces = g.faces_of(obj.shape)
+        except g.GeometryError:
+            return
+        best_i, best_score = None, np.inf
+        for i, f in enumerate(faces):
+            try:
+                fn = np.asarray(g.face_normal(f), float)
+                c = np.asarray(g.centroid(f), float)
+            except g.GeometryError:
+                continue
+            fn = fn / (np.linalg.norm(fn) or 1.0)
+            if np.dot(fn, normal) < 0.9:        # same orientation only
+                continue
+            score = float(np.linalg.norm(c - target))
+            if score < best_score:
+                best_score, best_i = score, i
+        if best_i is None or best_i == old:
+            return
+        sel = self.vp.selection
+        if (oid, "face", old) in sel.subobjects:
+            sel.toggle_subobject(oid, "face", old)
+        if (oid, "face", best_i) not in sel.subobjects:
+            sel.toggle_subobject(oid, "face", best_i)
+
+    def _resync_parts(self, d):
+        """Moving parts rebuilds the solid and renumbers its faces and
+        edges, so find each held part again on the new solid: a face by
+        facing the same way and lying nearest where the drag put it, an
+        edge by running the same way likewise. One that cannot be found
+        is let go of rather than left pointing at something else."""
+        oid, fidx, eidx, vidx = d["parts"]
+        obj = self.vp.scene.get(oid)
+        orig = d["originals"].get(oid)
+        if obj is None or orig is None:
+            return
+        delta = np.asarray(d.get("offset", np.zeros(3)), float)
+        sel = self.vp.selection
+        held = [e for e in sel.subobjects if e[0] != oid]
+        if vidx:
+            was = g.vertex_points(orig)
+            now = self.vp.held_points(obj)
+            for i in vidx:
+                if 0 <= i < len(was) and len(now):
+                    want = np.asarray(was[i], float) + delta
+                    held.append((oid, "vertex", int(np.argmin(
+                        np.linalg.norm(now - want, axis=1)))))
+        try:
+            was_f, now_f = g.faces_of(orig), g.faces_of(obj.shape)
+            was_e, now_e = g.edges_of(orig), g.edges_of(obj.shape)
+            for i in fidx:
+                n = np.asarray(g.face_normal(was_f[i]), float)
+                want = np.asarray(g.centroid(was_f[i]), float) + delta
+                best, score = None, np.inf
+                for j, f in enumerate(now_f):
+                    if np.dot(np.asarray(g.face_normal(f), float), n) < 0.9:
+                        continue
+                    dist = np.linalg.norm(np.asarray(g.centroid(f)) - want)
+                    if dist < score:
+                        best, score = j, dist
+                if best is not None:
+                    held.append((oid, "face", best))
+            for i in eidx:
+                _, e_dir = g.edge_line(was_e[i])
+                want = np.asarray(g.centroid(was_e[i]), float) + delta
+                best, score = None, np.inf
+                for j, e in enumerate(now_e):
+                    try:
+                        _, d2 = g.edge_line(e)
+                    except g.GeometryError:
+                        continue
+                    if abs(np.dot(np.asarray(d2), np.asarray(e_dir))) < 0.99:
+                        continue
+                    dist = np.linalg.norm(np.asarray(g.centroid(e)) - want)
+                    if dist < score:
+                        best, score = j, dist
+                if best is not None:
+                    held.append((oid, "edge", best))
+        except g.GeometryError:
+            pass
+        sel.set_subobjects(held)
+
+    def _resync_points(self, targets):
+        """Hold again each point a rebuild may have renumbered: the one now
+        nearest where the drag put it. `targets` is {obj_id: {old: where}}."""
+        sel = self.vp.selection
+        for oid, wants in targets.items():
+            obj = self.vp.scene.get(oid)
+            if obj is None or not wants:
+                continue
+            now = self.vp.held_points(obj)
+            if not len(now):
+                continue
+            for old, want in wants.items():
+                best = int(np.argmin(np.linalg.norm(
+                    now - np.asarray(want, float), axis=1)))
+                if best == old:
+                    continue
+                if (oid, "vertex", old) in sel.subobjects:
+                    sel.toggle_subobject(oid, "vertex", old)
+                if (oid, "vertex", best) not in sel.subobjects:
+                    sel.toggle_subobject(oid, "vertex", best)
+
+    def _resync_segments(self, d):
+        """The curve was put back together, so a held segment's index may
+        point at a different segment now: hold the one whose middle is
+        where the drag left it."""
+        self._resync_points(d.get("point_targets") or {})
+        sel = self.vp.selection
+        for oid, mids in d["segment_mids"].items():
+            obj = self.vp.scene.get(oid)
+            if obj is None:
+                continue
+            try:
+                edges = g.edges_of(obj.shape)
+                centres = [np.asarray(g.centroid(e), float) for e in edges]
+            except g.GeometryError:
+                continue
+            for old, want in mids.items():
+                best = int(np.argmin([np.linalg.norm(c - want)
+                                      for c in centres]))
+                if best == old:
+                    continue
+                if (oid, "edge", old) in sel.subobjects:
+                    sel.toggle_subobject(oid, "edge", old)
+                if (oid, "edge", best) not in sel.subobjects:
+                    sel.toggle_subobject(oid, "edge", best)
+
+    def _resync_edge(self, d):
+        """Moving an edge rebuilds the solid and the picked index goes
+        stale, so find the edge again: the straight one running the same
+        way, nearest to where the drag put it."""
+        oid, old = d["edge_move"]
+        obj = self.vp.scene.get(oid)
+        if obj is None:
+            return
+        want = np.asarray(d["anchor"], float) + np.asarray(d["offset"], float)
+        along = np.asarray(d["edge_dir"], float)
+        try:
+            edges = g.edges_of(obj.shape)
+        except g.GeometryError:
+            return
+        best_i, best_score = None, np.inf
+        for i, e in enumerate(edges):
+            try:
+                mid, direction = g.edge_line(e)
+            except g.GeometryError:
+                continue
+            if abs(float(np.dot(direction, along))) < 0.999:
+                continue
+            score = float(np.linalg.norm(np.asarray(mid) - want))
+            if score < best_score:
+                best_score, best_i = score, i
+        if best_i is None or best_i == old:
+            return
+        sel = self.vp.selection
+        if (oid, "edge", old) in sel.subobjects:
+            sel.toggle_subobject(oid, "edge", old)
+        if (oid, "edge", best_i) not in sel.subobjects:
+            sel.toggle_subobject(oid, "edge", best_i)
+
+    def cancel_drag(self):
+        self.vp._active_snap = None
+        d = self.drag
+        if d is None:
+            return
+        vp = self.vp
+        if d.get("tf") is not None:
+            self._clear_tf_ghost()
+        for obj_id in (d.get("made") or {}).values():
+            vp.scene.remove(obj_id)          # nothing grew, so nothing stays
+        for obj_id, original in d["originals"].items():
+            if vp.scene.get(obj_id) is not None:
+                vp.scene.replace_shape(obj_id, original)
+        if d.get("copies"):
+            self._drop_copies(d)
+        self.vp.window_discard_checkpoint()
+        self.vp.selection.rebuilding = None
+        self.drag = None
+
+
+def _frame(axis):
+    """Two unit vectors square to `axis` and to each other."""
+    axis = np.asarray(axis, float)
+    ref = (np.array([1.0, 0.0, 0.0]) if abs(axis[0]) < 0.9
+           else np.array([0.0, 1.0, 0.0]))
+    u = np.cross(axis, ref)
+    u = u / (np.linalg.norm(u) or 1.0)
+    return u, np.cross(axis, u)
+
+
+def _seg_dist(p, a, b) -> float:
+    ab = b - a
+    denom = float(np.dot(ab, ab))
+    if denom < 1e-12:
+        return float(np.linalg.norm(p - a))
+    t = float(np.clip(np.dot(p - a, ab) / denom, 0, 1))
+    return float(np.linalg.norm(p - (a + ab * t)))
+
+
+def _in_poly(p, poly) -> bool:
+    inside = False
+    n = len(poly)
+    for i in range(n):
+        a, b = poly[i], poly[(i + 1) % n]
+        if ((a[1] > p[1]) != (b[1] > p[1])):
+            x = a[0] + (p[1] - a[1]) / (b[1] - a[1]) * (b[0] - a[0])
+            if p[0] < x:
+                inside = not inside
+    return inside

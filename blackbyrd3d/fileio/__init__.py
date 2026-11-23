@@ -1,0 +1,587 @@
+"""File import/export."""
+
+import os
+
+from . import native, obj, step
+from .progress import (Cancelled, Progress,  # noqa: F401  (re-exported)
+                       throttled)
+
+# The formats this module handles, as (label, extensions) — the single source
+# of truth behind the file dialogs. Anything dispatched below belongs here, or
+# the chooser silently stops offering it (GitHub #2: .3dm imported fine but was
+# never listed, so Rhino files looked unsupported).
+IMPORT_FORMATS = [
+    ("Blackbyrd3D", (".byrd",)),
+    ("Serpentine3D", (".serp",)),
+    ("STEP", (".step", ".stp")),
+    ("Rhino", (".3dm",)),
+    ("Wavefront OBJ", (".obj",)),
+    ("Autodesk FBX", (".fbx",)),
+    ("STL", (".stl",)),
+    ("DXF", (".dxf",)),
+    ("SVG", (".svg",)),
+    ("PLY point cloud", (".ply",)),
+    ("E57 point cloud", (".e57",)),
+    ("SketchUp", (".skp",)),
+]
+
+EXPORT_FORMATS = [
+    ("Blackbyrd3D", (".byrd",)),
+    ("STEP", (".step", ".stp")),
+    # One entry per Rhino version: the version is picked where the format is,
+    # because a file for a colleague on Rhino 6 must not need 8 to open (#5).
+    ("Rhino 8", (".3dm",)),
+    ("Rhino 7", (".3dm",)),
+    ("Rhino 6", (".3dm",)),
+    ("Rhino 5", (".3dm",)),
+    ("Wavefront OBJ", (".obj",)),
+    ("Autodesk FBX", (".fbx",)),
+    ("STL — 3D printing", (".stl",)),
+    ("3MF — 3D printing", (".3mf",)),
+    ("DXF", (".dxf",)),
+    ("glTF binary", (".glb",)),
+    ("USD", (".usda", ".usd")),
+    ("PLY point cloud", (".ply",)),
+]
+
+IMPORT_EXTS = {e for _, exts in IMPORT_FORMATS for e in exts}
+EXPORT_EXTS = {e for _, exts in EXPORT_FORMATS for e in exts}
+
+# Pictures need user-chosen corners, so the interactive Import chooser offers
+# them separately from the model formats that import_file can read directly.
+PICTURE_FORMATS = [("Images", (".png", ".jpg", ".jpeg", ".webp"))]
+PICTURE_EXTS = {e for _, exts in PICTURE_FORMATS for e in exts}
+
+
+def _filter(formats, catch_alls: bool) -> str:
+    """Build a Qt name-filter string.
+
+    Catch-alls ("All supported", "All files") belong to reading only: they let
+    you reach a file whatever it's called, and a bad guess just fails loudly on
+    import. Saving is the opposite — the filter *is* the format choice, and a
+    catch-all names none, leaving a typed "part" with no extension to dispatch
+    on. So export lists real formats only, led (Qt selects the first) by the
+    native one."""
+    parts = []
+    if catch_alls:
+        every = " ".join(f"*{e}" for _, exts in formats for e in exts)
+        parts.append(f"All supported ({every})")
+    parts += [f"{label} ({' '.join('*' + e for e in exts)})"
+              for label, exts in formats]
+    if catch_alls:
+        parts.append("All files (*)")
+    return ";;".join(parts)
+
+
+def import_filter(*, pictures: bool = False) -> str:
+    """Name filter for models, optionally including interactive pictures."""
+    formats = IMPORT_FORMATS + PICTURE_FORMATS if pictures else IMPORT_FORMATS
+    return _filter(formats, catch_alls=True)
+
+
+def picture_filter() -> str:
+    """Name filter for placing a reference picture."""
+    return _filter(PICTURE_FORMATS, catch_alls=False)
+
+
+def export_filter() -> str:
+    """Name filter for Export dialogs."""
+    return _filter(EXPORT_FORMATS, catch_alls=False)
+
+
+def suffix_for_filter(name_filter: str) -> str:
+    """The extension a chosen filter writes, without the dot — so a typed
+    filename with no extension still saves in the selected format. The first
+    extension wins when a filter lists several ("STEP (*.step *.stp)"); a
+    filter naming no extension at all ("All files (*)") yields "", leaving
+    whatever the user typed alone."""
+    head, _, tail = name_filter.partition("(*.")
+    if not head or not tail:
+        return ""
+    return tail.split()[0].rstrip(")").lower()
+
+
+def rhino_version_from_filter(name_filter: str) -> int:
+    """The Rhino version a chosen export filter names; 8 when it names none.
+
+    Parsed leniently — a filter that is not "Rhino N (…)" (another format,
+    old saved filter text, nothing at all) means current, never a crash.
+    """
+    head = name_filter.partition("(")[0].split()
+    if len(head) == 2 and head[0] == "Rhino":
+        try:
+            version = int(head[1])
+            if 2 <= version <= 8:
+                return version
+        except ValueError:
+            pass
+    return 8
+
+
+def _filter_exts(name_filter: str) -> set:
+    """Every extension a name filter lists, with its dot:
+    "Images (*.png *.jpg)" -> {".png", ".jpg"}."""
+    _, _, globs = name_filter.partition("(")
+    return {g[1:].lower() for g in globs.rstrip(")").split()
+            if g.startswith("*.")}
+
+
+def ensure_suffix(path: str, name_filter: str) -> str:
+    """Give a saved path an extension when the user typed none, so a bare
+    "part" saves as the format they picked instead of failing to dispatch. A
+    typed extension we can actually write wins over the dropdown, and so does
+    one the chosen filter itself names: a command's own chooser, PDF or SVG
+    or a video, writes formats Export does not, and "sheets.pdf" came back
+    as "sheets.pdf.pdf" (#39). Anything else ("my.part") keeps its text and
+    gains the chosen suffix."""
+    suffix = suffix_for_filter(name_filter)
+    if not suffix:
+        return path
+    ext = os.path.splitext(path)[1].lower()
+    if ext in EXPORT_EXTS or ext in _filter_exts(name_filter):
+        return path
+    return f"{path}.{suffix}"
+
+
+def import_file(scene, path: str, progress=None, *, replace: bool = False,
+                notes: list | None = None) -> int:
+    """Import any supported file into the scene. Returns object count added.
+
+    A .byrd is added to what is there, like every other format, unless
+    `replace` is set: that is Open, which swaps the scene for the file's.
+    Other formats always add; Open on one of them adds too, as it always has.
+
+    `progress` is called as `progress(fraction, message)` while the work runs;
+    answering False cancels it, raising `Cancelled`. E57 and Rhino report as
+    they read; other formats bracket the read.
+
+    A file that says what unit it is in arrives at its real size in the
+    scene's units; `notes`, when given, hears what was converted.
+    """
+    ext = os.path.splitext(path)[1].lower()
+    report = Progress(progress,
+                      f"Opening {os.path.basename(path)}…")
+    report(0.0)
+    # One notification for the file, not one per object in it. Panels that
+    # answer a change by reading the whole scene made a big import cost
+    # objects squared — see Scene.batched.
+    with scene.batched():
+        n = _import_file(scene, path, ext, report, replace, notes)
+    report.done()
+    return n
+
+
+def _add_sheets(scene, sheets: list, notes: list | None):
+    """A file's layout pages added as sheets, each named as it was there
+    unless the drawing already has a sheet by that name."""
+    if not sheets:
+        return
+    taken = {lay.name for lay in scene.layouts}
+    for sheet in sheets:
+        name, n = sheet.name, 2
+        while sheet.name in taken:
+            sheet.name = f"{name} ({n})"
+            n += 1
+        taken.add(sheet.name)
+        scene.layouts.append(sheet)
+    scene.notify("layouts")
+    if notes is not None:
+        k = len(sheets)
+        notes.append(f"{k} layout page{'s' if k != 1 else ''} as "
+                     f"sheet{'s' if k != 1 else ''}")
+
+
+def _import_file(scene, path: str, ext: str, report, replace: bool = False,
+                 notes: list | None = None) -> int:
+    if ext in (".byrd", ".serp"):
+        if not replace:
+            return native.merge_scene(scene, path, notes, progress=report)
+        native.load_scene(scene, path, progress=report)
+        return len(scene.all())
+    if ext in (".step", ".stp"):
+        shapes = step.import_step(path, scene.units, notes)
+        base = os.path.splitext(os.path.basename(path))[0]
+        for i, shape in enumerate(shapes, 1):
+            name = base if len(shapes) == 1 else f"{base} {i:02d}"
+            scene.add(shape, name=name)
+        return len(shapes)
+    if ext == ".obj":
+        named = obj.import_obj(path)
+        for name, shape in named:
+            scene.add(shape, name=name)
+        return len(named)
+    if ext == ".fbx":
+        from . import fbx
+        named = fbx.import_fbx(path)
+        for name, shape in named:
+            scene.add(shape, name=name)
+        return len(named)
+    if ext == ".stl":
+        from . import stl
+        named = stl.import_stl(path)
+        for name, shape in named:
+            scene.add(shape, name=name)
+        return len(named)
+    if ext == ".dxf":
+        from . import dxf as dxf_mod
+        return dxf_mod.import_dxf(scene, path, progress=report,
+                                  units=scene.units, notes=notes)
+    if ext == ".svg":
+        from . import svg as svg_mod
+        return svg_mod.import_svg(scene, path)
+    if ext == ".ply":
+        from . import ply
+        named = ply.import_ply(path)
+        for name, shape in named:
+            scene.add(shape, name=name)
+        return len(named)
+    if ext == ".e57":
+        from . import e57
+        named = e57.import_e57(path, units=scene.units,
+                               progress=report.part(0.0, 0.95))
+        # Reading and cancellation finish before mutating the scene, so a bad
+        # later station or Cancel cannot leave half a survey imported.
+        adding = report.part(0.95, 1.0)
+        for done, (name, shape) in enumerate(named, 1):
+            scene.add(shape, name=name)
+            adding.tick(done / len(named), f"Adding scan {done} of {len(named)}")
+        return len(named)
+    if ext == ".3dm":
+        from . import rhino
+        pages, cameras = [], {}
+        # Opened into an empty drawing, the drawing takes the file's units,
+        # as Rhino would open it; added to one, the file is converted.
+        adopt = {} if replace and not scene.all() else None
+        items = rhino.import_3dm(path, progress=report.part(0.0, 0.95),
+                                 units=scene.units, notes=notes, pages=pages,
+                                 cameras=cameras, adopt=adopt)
+        if adopt and adopt.get("units") != scene.units:
+            scene.units = adopt["units"]
+            # the new units' lettering, as a drawing set to them is given
+            scene.annot_style_set = None
+        n = _add_items(scene, items, report.part(0.95, 1.0))
+        _add_sheets(scene, pages, notes)
+        if replace:
+            # Opened, not imported: the panes look where Rhino's did
+            for key, state in cameras.items():
+                scene.view_settings.pane(key)["camera"] = state
+        return n
+    if ext == ".skp":
+        from . import skp
+        items = skp.import_skp(path, units=scene.units,
+                               progress=report.part(0.0, 0.95))
+        return _add_items(scene, items, report.part(0.95, 1.0))
+    raise ValueError(f"Unsupported import format: {ext}")
+
+
+def _add_items(scene, items: list, adding) -> int:
+    """Put an importer's (name, shape, meta) into the scene, each on its
+    layer, made where the file names one this scene lacks.
+
+    Adding is the last stretch and it is not free. The bar used to stop
+    wherever the converter left it and sit there while thousands of
+    objects went into the scene, which read as a hang at 98%.
+    """
+    count = len(items) or 1
+    layer_map = {}
+    for done, (name, shape, meta) in enumerate(items, 1):
+        layer_id = _layer_for(scene, meta, layer_map)
+        adopt_hatch_pattern(scene, shape)
+        added = scene.add(shape, name=name, layer_id=layer_id)
+        # An override only: leaving it None keeps the object following its
+        # layer, the way it does in Rhino.
+        if meta.get("color"):
+            added.color = meta["color"]
+        if meta.get("material"):
+            added.material = dict(meta["material"])
+        if not meta.get("visible", True):
+            added.visible = False
+        if meta.get("group"):
+            # what the file held together stays together: clicking one
+            # selects them all, as the group command's own ids do
+            added.group_id = meta["group"]
+        if meta.get("user_text"):
+            # each object its own copy: several share one meta
+            added.user_text = dict(meta["user_text"])
+        if meta.get("clip_plane"):
+            added.clip_plane = {**meta["clip_plane"],
+                                "on_in": list(meta["clip_plane"]["on_in"])}
+        adding.tick(done / count, f"Adding object {done} of {count}")
+    return len(items)
+
+
+def adopt_hatch_pattern(scene, shape):
+    """Offer an imported hatch's pattern in the drawing from then on, as
+    Rhino's and AutoCAD's own lists would (#92). A pattern the drawing
+    already has by that name is left as the drawing has it; the hatch
+    carries its own either way, so it is drawn as the file drew it."""
+    from ..core.hatch import HatchShape
+    from ..core.hatch_patterns import is_builtin, lookup
+    definition = getattr(shape, "definition", None) \
+        if isinstance(shape, HatchShape) else None
+    if definition is None or is_builtin(definition.name):
+        return
+    if lookup(scene.hatch_patterns, definition.name) is None:
+        scene.hatch_patterns[definition.name] = definition
+
+
+def _layer_for(scene, meta: dict, made: dict) -> str | None:
+    """The layer an imported object belongs on, made if it is not there.
+
+    Keyed by the layer's whole path, not its name: Walls::Interior and
+    Roof::Interior are two different layers, and reading only the name
+    landed half a drawing on the wrong one, wearing the wrong colour (#6).
+
+    The branch is walked from the top down, so a parent that holds no
+    objects itself is still made, with the colour and the switches the
+    file gives it. Older meta, and any file whose layer index points at
+    nothing, has no branch to walk and falls back to the plain name.
+    """
+    chain = meta.get("layer_chain")
+    if not chain:
+        name = meta.get("layer")
+        if not name:
+            return None
+        chain = ({"name": name, "path": name,
+                  "color": meta.get("layer_color"),
+                  "visible": meta.get("layer_visible", True),
+                  "locked": meta.get("layer_locked", False),
+                  "print_width": meta.get("layer_print_width", 0.0)},)
+
+    layer_id = None
+    for rung in chain:
+        path = rung["path"]
+        if path not in made:
+            made[path] = _make_layer(scene, rung, layer_id)
+        layer_id = made[path]
+    return layer_id
+
+
+def _make_layer(scene, rung: dict, parent_id: str | None) -> str:
+    """One layer of a branch, found by its path or made under its parent."""
+    existing = scene.layers.find_by_path(rung["path"])
+    # A reference layer arrives switched off, the way the file keeps it
+    # (GitHub #5). Also when the layer is one the scene already had: every
+    # scene starts with an empty Default, and a file whose own Default is
+    # off would otherwise have it drawn. Only while that layer is empty,
+    # though — importing into a drawing must not hide work already on it.
+    fresh = existing is None or not any(
+        o.layer_id == existing.id for o in scene.all())
+    if existing is None:
+        existing = scene.layers.create(rung["name"], rung.get("color"),
+                                       parent=parent_id)
+    if fresh:
+        if not rung.get("visible", True):
+            scene.layers.set_visible(existing.id, False)
+        if rung.get("locked"):
+            scene.layers.set_locked(existing.id, True)
+        if rung.get("print_width"):
+            scene.layers.set_print_width(existing.id, rung["print_width"])
+    return existing.id
+
+
+class _Only:
+    """The scene as a .byrd of some of its objects sees it: those objects,
+    with every layer, block and style, and the history that builds them
+    from one another. No sheets: a sheet shows the whole model."""
+
+    def __init__(self, scene, ids):
+        self._scene = scene
+        self._ids = set(ids)
+        self.layouts = []
+        self.sheet_groups = []
+        self.trajectories = []
+        self.session = None
+
+    def __getattr__(self, name):
+        return getattr(self._scene, name)
+
+    def all(self):
+        return [o for o in self._scene.all() if o.id in self._ids]
+
+    @property
+    def history_records(self):
+        return [r for r in self._scene.history_records
+                if r["output"] in self._ids
+                and all(i in self._ids for i in r["inputs"])]
+
+
+def export_file(scene, path: str, only_ids: list | None = None,
+                thumbnail: bytes | None = None, stl_quality: str = "standard",
+                rhino_version: int = 8, progress=None):
+    """Export scene (or subset) to a file, format by extension.
+
+    Returns a note about anything the format could not carry, or None
+    when everything went in. `progress` is called as for `import_file`;
+    answering False cancels, raising `Cancelled`, before the file is
+    written.
+    """
+    ext = os.path.splitext(path)[1].lower()
+    report = Progress(progress, f"Saving {os.path.basename(path)}…")
+    report(0.0)
+    writing = report
+    if ext != ".byrd":
+        # A .byrd keeps what was never converted as it is; every other
+        # format needs the geometry, and some of it converts to nothing
+        # (a hidden layer's text) and leaves the scene, so this comes
+        # before the list of what to write is taken.
+        ids = scene._order if only_ids is None else only_ids
+        if any(i in scene.objects and not scene.objects[i].shape_ready
+               for i in ids):
+            scene.realise_all(only_ids, progress=report.part(
+                0.0, 0.4, "Converting hidden objects…"))
+            writing = report.part(0.4, 1.0)
+    note = _export_file(scene, path, ext, only_ids, thumbnail, stl_quality,
+                        rhino_version, writing)
+    report.done()
+    return note
+
+
+def _export_file(scene, path, ext, only_ids, thumbnail, stl_quality,
+                 rhino_version, progress):
+    objs = scene.all()
+    if only_ids:
+        objs = [o for o in objs if o.id in only_ids]
+    if ext == ".byrd":
+        native.save_scene(_Only(scene, only_ids) if only_ids else scene,
+                          path, thumbnail=thumbnail, progress=progress)
+        return
+    if ext == ".ply":
+        from . import ply
+        clouds = [(o.name, o.shape) for o in objs if o.kind == "pointcloud"]
+        ply.export_ply(clouds, path)
+        left = len(objs) - len(clouds)
+        return (f"{left} object(s) left out: PLY carries point clouds only"
+                if left else None)
+    # Every format below carries curves, surfaces and meshes; none of them
+    # has a place for a scan's points, so those are set aside and said so.
+    clouds = [o for o in objs if o.kind == "pointcloud"]
+    if clouds:
+        objs = [o for o in objs if o.kind != "pointcloud"]
+        only_ids = [o.id for o in objs]
+        left_note = (f"{len(clouds)} point cloud(s) left out: {ext[1:]} "
+                     "cannot carry them (export them as PLY)")
+        note = _export_shapes(scene, path, ext, objs, only_ids, thumbnail,
+                              stl_quality, rhino_version, progress)
+        return f"{note}; {left_note}" if note else left_note
+    return _export_shapes(scene, path, ext, objs, only_ids, thumbnail,
+                          stl_quality, rhino_version, progress)
+
+
+# Formats whose own coordinates are single precision: a Rhino mesh's
+# vertices and a binary STL's floats are float32 however many digits we
+# hand them, so a model far from the world's origin lands on that grid
+# whatever this program does with it. Everything else carries doubles, or
+# (glTF) places a far mesh by its node instead. Saying so is the only
+# thing left to do for these two.
+_SINGLE_PRECISION = {".3dm": "Rhino mesh vertices",
+                     ".stl": "STL coordinates"}
+
+
+def _written_as_a_mesh(obj) -> bool:
+    """Whether this object leaves as mesh vertices rather than as curves.
+
+    A curve goes into a .3dm as a NURBS curve, in full precision, and
+    into an STL not at all; a line hatch leaves as the curves it is drawn
+    with. Only what is tessellated meets the format's float32, so only
+    that is worth warning about.
+    """
+    if obj.kind == "curve":
+        return False
+    if obj.kind == "hatch":
+        return bool(getattr(obj.shape, "solid", False))
+    return True
+
+
+def _precision_note(objs, ext) -> str | None:
+    """What a single-precision format will do to a far model, or None."""
+    import numpy as np
+
+    from ..utils.math3d import ANCHOR_NEAR
+    what = _SINGLE_PRECISION.get(ext)
+    if what is None:
+        return None
+    reach = 0.0
+    for o in objs:
+        if not _written_as_a_mesh(o):
+            continue
+        try:
+            mn, mx = o.bbox()
+        except Exception:                                  # noqa: BLE001
+            continue
+        reach = max(reach, max(abs(float(c)) for c in (*mn, *mx)))
+    if reach <= ANCHOR_NEAR:
+        return None
+    step = float(np.spacing(np.float32(reach)))
+    return (f"{what} are single precision: this model reaches "
+            f"{reach:,.0f} units from the origin, where they step "
+            f"{step:.3g} units. Move it near the origin, or export STEP, "
+            "to keep detail finer than that.")
+
+
+class _Reporting(list):
+    """A writer's list of objects that says how far through it the writer
+    is, each time it takes the next one. Never backwards: a writer that
+    goes through twice does not send the bar back to the start."""
+
+    def __init__(self, items, progress):
+        super().__init__(items)
+        self._progress = progress
+        self._best = 0.0
+
+    def __iter__(self):
+        for n, item in enumerate(super().__iter__()):
+            self._best = max(self._best, n / len(self))
+            self._progress(self._best)
+            yield item
+
+
+def _export_shapes(scene, path, ext, objs, only_ids, thumbnail, stl_quality,
+                   rhino_version, progress=None):
+    def counted(items):
+        return items if progress is None else _Reporting(items, progress)
+
+    if ext in (".step", ".stp"):
+        n = step.export_step(counted([o.shape for o in objs]), path,
+                             scene.units)
+        return (f"{n} mesh object(s) left out: STEP cannot carry them"
+                if n else None)
+    if ext == ".obj":
+        obj.export_obj(counted([(o.name, o.shape, scene.color_of(o))
+                                for o in objs]), path)
+        return
+    if ext == ".fbx":
+        from . import fbx
+        fbx.export_fbx(counted([(o.name, o.shape, scene.color_of(o))
+                                for o in objs]), path, units=scene.units)
+        return
+    if ext == ".stl":
+        from . import stl
+        stl.export_stl(counted([(o.name, o.shape) for o in objs]), path,
+                       quality=stl_quality)
+        return _precision_note(objs, ext)
+    if ext == ".3mf":
+        from . import threemf
+        threemf.export_3mf(
+            counted([(o.name, o.shape, scene.color_of(o)) for o in objs]),
+            path,
+            unit=threemf.UNIT_3MF.get(scene.units, "millimeter"))
+        return
+    if ext == ".3dm":
+        from . import rhino
+        rhino.export_3dm(scene, path, only_ids=only_ids,
+                         version=rhino_version, progress=progress)
+        return _precision_note(objs, ext)
+    if ext == ".dxf":
+        from . import dxf as dxf_mod
+        dxf_mod.export_dxf(scene, path, only_ids=only_ids)
+        return
+    if ext == ".glb":
+        from . import gltf
+        gltf.export_glb(scene, path, only_ids=only_ids)
+        return
+    if ext in (".usda", ".usd"):
+        from . import usd
+        usd.export_usda(scene, path, only_ids=only_ids)
+        return
+    raise ValueError(f"Unsupported export format: {ext}")

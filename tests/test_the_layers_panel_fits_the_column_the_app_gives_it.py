@@ -1,0 +1,174 @@
+"""Every layer column is on screen in the panel width a fresh window gives.
+
+A fresh window hands Properties and Layers a 280px column (`PANEL_WIDTH`),
+deliberately: extra window width belongs to the drawing, not to a panel of
+fixed-content fields. When the tree grew Type and Print columns its five
+columns wanted more than 280, so the Print column sat off the right-hand
+edge behind a horizontal scrollbar. A column you have to scroll sideways to
+find is one nobody finds. Type and Print have since moved to the layer page
+in Properties, but the rule stands for the columns that are left.
+
+The name is the only column whose content has no natural width, so the name
+is what gives: the narrow columns (the two switches and the colour) keep
+the width their content needs and the name takes whatever is left over.
+"""
+
+from __future__ import annotations
+
+from PySide6.QtWidgets import QApplication
+
+from blackbyrd3d.app import PANEL_WIDTH, MainWindow
+from blackbyrd3d.core.history import History
+from blackbyrd3d.core.layers import DEFAULT_LAYER_ID
+from blackbyrd3d.core.linetype import LINETYPES
+from blackbyrd3d.core.scene import Scene
+from blackbyrd3d.ui import theme
+from blackbyrd3d.ui.layers_panel import LayersPanel
+
+NAME_COL = 0
+COLOR_COL = 3   # the last column, the one a short panel would push off
+
+
+def _panel(width=PANEL_WIDTH):
+    scene = Scene()
+    panel = LayersPanel(scene, History(scene))
+    panel.resize(width, 300)
+    panel.show()
+    QApplication.processEvents()
+    return scene, panel
+
+
+def _item_for(panel, layer_id):
+    for i in range(panel.tree.topLevelItemCount()):
+        item = panel.tree.topLevelItem(i)
+        if panel._layer_id(item) == layer_id:
+            return item
+    raise AssertionError("no row for that layer")
+
+
+def _columns(panel):
+    tree = panel.tree
+    return [tree.columnWidth(c) for c in range(tree.columnCount())]
+
+
+def test_the_columns_fit_the_width_a_fresh_window_gives_the_panel():
+    _scene, panel = _panel()
+    tree = panel.tree
+    total = sum(_columns(panel))
+    assert total <= tree.viewport().width(), (
+        f"the columns want {total}px of the {tree.viewport().width()}px "
+        "the panel column has")
+
+
+def test_the_last_column_is_there_without_scrolling_sideways():
+    _scene, panel = _panel()
+    tree = panel.tree
+    index = tree.indexFromItem(_item_for(panel, DEFAULT_LAYER_ID), COLOR_COL)
+    assert tree.visualRect(index).right() <= tree.viewport().rect().right(), \
+        "the colour cell runs past the right-hand edge of the panel"
+    assert not tree.horizontalScrollBar().isVisible(), \
+        "the layers tree needs a sideways scrollbar to show its own columns"
+
+
+def test_the_room_left_over_goes_to_the_layer_name():
+    _scene, narrow = _panel()
+    _scene2, wide = _panel(PANEL_WIDTH + 120)
+    assert wide.tree.columnWidth(NAME_COL) > narrow.tree.columnWidth(NAME_COL), \
+        "a wider panel did not give the extra room to the layer name"
+
+
+def test_widening_the_panel_leaves_the_narrow_columns_alone():
+    """The switches and the swatch are sized for their content, so more
+    room is not theirs to take: a 200px-wide eye would be a waste of the
+    panel."""
+    _scene, narrow = _panel()
+    _scene2, wide = _panel(PANEL_WIDTH + 120)
+    assert _columns(narrow)[1:] == _columns(wide)[1:], \
+        "widening the panel changed a column that has a content width"
+
+
+# -- the window the app actually builds --
+
+def test_the_columns_fit_the_dock_of_a_real_window_under_the_real_theme():
+    """The one that caught it. A panel resized by a test proves nothing
+    about the width the app gives it, and a panel built without the
+    stylesheet proves nothing about the font it paints with: in the
+    packaged build all five columns were on screen and "Continuous" still
+    read "Continuo...". `run()` sets the theme, then builds the window, so
+    do that.
+    """
+    app = QApplication.instance()
+    was = app.styleSheet()
+    app.setStyleSheet(theme.QSS)
+    try:
+        win = MainWindow()
+        win.resize(1600, 900)
+        win.show()
+        QApplication.processEvents()
+        panel = win.layers_panel
+        panel.scene.layers.set_linetype(DEFAULT_LAYER_ID,
+                                        max(LINETYPES, key=len))
+        panel.scene.notify()
+        QApplication.processEvents()
+        tree = panel.tree
+        try:
+            assert sum(_columns(panel)) <= tree.viewport().width(), (
+                f"the columns want {sum(_columns(panel))}px of the "
+                f"{tree.viewport().width()}px the Layers dock has")
+            assert not tree.horizontalScrollBar().isVisible(), \
+                "the Layers dock needs a sideways scrollbar in a fresh window"
+            # The name column is the one that stretches, so it is the one
+            # anything else takes its width out of. Sublayers gave every
+            # row an indent for its expander, which is charged to this
+            # column, and a fresh window's own layer came out as "Defa...".
+            needed = tree.sizeHintForColumn(NAME_COL)
+            assert tree.columnWidth(NAME_COL) >= needed, (
+                f"the Layer column is {tree.columnWidth(NAME_COL)}px where "
+                f"a fresh window's own layer needs {needed}px, so the name "
+                f"of the layer everything is drawn on reads cut short")
+        finally:
+            win.mark_saved()
+            win.close()
+    finally:
+        app.setStyleSheet(was)
+
+
+def test_the_columns_fit_on_a_machine_whose_font_is_wider_than_ours():
+    """280px is our font's number, not everyone's.
+
+    The columns are measured, but the dock they go in was a constant, and
+    the two only just fit here: the name column comes out two pixels wider
+    than the name needs. On the CI runner, whose sans-serif is a different
+    one, the same five columns wanted seven pixels more than the dock had
+    and the layer everything is drawn on read "Defa...". A bigger tree
+    font stands in for that font here, since the panel cannot pick which
+    fonts a Linux box has installed. The dock has to give.
+    """
+    app = QApplication.instance()
+    was = app.styleSheet()
+    app.setStyleSheet(theme.QSS + "\nQTreeWidget { font-size: 15px; }\n")
+    try:
+        win = MainWindow()
+        win.resize(1600, 900)
+        win.show()
+        QApplication.processEvents()
+        panel = win.layers_panel
+        panel.scene.layers.set_linetype(DEFAULT_LAYER_ID,
+                                        max(LINETYPES, key=len))
+        panel.scene.notify()
+        QApplication.processEvents()
+        tree = panel.tree
+        try:
+            for column, what in ((NAME_COL, "Layer"),):
+                needed = tree.sizeHintForColumn(column)
+                assert tree.columnWidth(column) >= needed, (
+                    f"the {what} column is {tree.columnWidth(column)}px "
+                    f"where its rows need {needed}px, so a wider font "
+                    f"reads cut short")
+            assert not tree.horizontalScrollBar().isVisible(), \
+                "a wider font puts the Layers dock behind a scrollbar"
+        finally:
+            win.mark_saved()
+            win.close()
+    finally:
+        app.setStyleSheet(was)

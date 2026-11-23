@@ -1,0 +1,451 @@
+"""User settings: JSON file at ~/.config/blackbyrd3d/settings.json."""
+
+from __future__ import annotations
+
+import copy
+import json
+import os
+import shutil
+
+
+def _adopt_serpentine_dirs():
+    """Take over Serpentine3D's settings and plugins on a first launch.
+    Copied, not moved: Serpentine3D may still be installed beside us."""
+    for old, new, only in (
+            ("~/.config/serpentine3d", "~/.config/blackbyrd3d", None),
+            ("~/.serpentine3d", "~/.blackbyrd3d", "plugins")):
+        src_dir = os.path.expanduser(old)
+        dst_dir = os.path.expanduser(new)
+        if not os.path.isdir(src_dir) or os.path.exists(dst_dir):
+            continue
+        try:
+            if only is None:
+                shutil.copytree(src_dir, dst_dir)
+            elif os.path.isdir(os.path.join(src_dir, only)):
+                shutil.copytree(os.path.join(src_dir, only),
+                                os.path.join(dst_dir, only))
+        except OSError:
+            pass
+
+
+_adopt_serpentine_dirs()
+
+CONFIG_DIR = os.path.expanduser("~/.config/blackbyrd3d")
+CONFIG_PATH = os.path.join(CONFIG_DIR, "settings.json")
+
+DEFAULT_SHORTCUTS = {
+    "Ctrl+N": "new",
+    "Ctrl+O": "open",
+    "Ctrl+S": "save",
+    "Ctrl+Shift+S": "saveas",
+    "Ctrl+Q": "quit",
+    "Ctrl+Z": "undo",
+    "Ctrl+Y": "redo",
+    # These are application actions, distinct from the model Copy command.
+    "Ctrl+C": "clipboardcopy",
+    "Ctrl+V": "clipboardpaste",
+    "Delete": "delete",
+    "Ctrl+A": "selall",
+    "F10": "pointson",
+    "F11": "pointsoff",
+    "F1": "top",
+    "F2": "front",
+    "F3": "right",
+    "F4": "perspective",
+    "F5": "isometric",
+    "Ctrl+E": "zoomextents",
+    "Ctrl+Shift+A": "assistant",
+    "Ctrl+M": "maximizeviewport",
+    "F7": "grid",
+    "Ctrl+P": "exportpdf",
+    "Ctrl+Shift+P": "commandpalette",
+    "Ctrl+`": "scripteditor",
+    "Ctrl+,": "settings",
+    "Ctrl+G": "group",
+    "Ctrl+Shift+G": "ungroup",
+    "Ctrl+H": "hide",
+    "Ctrl+Shift+H": "show",
+    "Ctrl+L": "lock",
+    "Ctrl+Shift+L": "unlockall",
+    "Ctrl+T": "trim",
+    "Ctrl+J": "join",
+    "F8": "ortho",
+    "F9": "gridsnap",
+    "Ctrl+W": "zoomwindow",
+    "Home": "undoview",
+    "End": "redoview",
+    "Ctrl+Shift+E": "zoomextents",
+}
+SHORTCUT_DEFAULTS_VERSION = 1
+
+DEFAULTS = {
+    "mouse": {
+        "orbit_button": "right",       # middle | right; right as in Rhino
+        "invert_scroll": False,
+        "orbit_speed": 1.0,
+        "zoom_speed": 1.0,
+        "chords": {},                  # 'ctrl+shift+mmb' -> command name
+    },
+    "osnaps": {
+        "enabled": True,
+        "end": True,
+        "point": True,
+        "mid": True,
+        "center": True,
+        "quad": True,
+        "int": True,
+        "appint": False,
+        "perp": False,
+        "near": False,
+    },
+    "media": {
+        "endcard": False,   # sign turntable/replay clips with the end card
+    },
+    "grid_snap": False,
+    "grid_snap_step": 1.0,
+    "default_units": "mm",
+    "recent_files": [],                # most-recent-first document paths
+    "show_welcome": True,              # start screen on launch
+    "check_updates": True,             # check GitHub for a newer release on launch
+    "aliases": {},                     # alias -> command name
+    "shortcuts": DEFAULT_SHORTCUTS,    # key sequence -> command name
+    "shortcut_defaults_version": SHORTCUT_DEFAULTS_VERSION,
+    "display": {
+        "grid_extent": 100,
+        "grid_major": 10,
+        # What a fresh viewport shows: shaded | wireframe | ghosted | zebra
+        # | curvature | technical | draft | rendered | plaster | plastercolor
+        "default_mode": "shaded",
+        # Soft shading in creases and corners, in the plaster modes
+        "ambient_occlusion": True,
+        # Point clouds: pixels per point, and how many points a frame
+        # draws before a scan's finer levels are left out
+        "point_size": 2.0,
+        "point_budget": 2000000,
+        # Whole-interface scale as a factor (1.0 = as shipped). Applied by
+        # the launcher through QT_SCALE_FACTOR, which Qt reads only as the
+        # QApplication is built — so it takes effect on the next launch.
+        # interface_font names the family for the app-wide font; "" leaves
+        # the platform default in charge.
+        "ui_scale": 1.0,
+        "interface_font": "",
+    },
+    # Window geometry, dock state and view layout from the last session,
+    # written on close — see MainWindow._remember_window.
+    "window": {
+        "geometry": "",
+        "state": "",
+        # Four viewports on a first launch. The layout was there all along
+        # and went unfound — GitHub #5 asked for a feature that had already
+        # shipped — which opening in a single view did nothing to help.
+        # A default only: anyone who leaves in a single view gets one back.
+        "layout": "quad",
+    },
+}
+
+
+class Config:
+    def __init__(self, path: str | None = None):
+        if path is None:
+            path = os.environ.get("BYRD3D_CONFIG", CONFIG_PATH)
+        self.path = path
+        self.data = copy.deepcopy(DEFAULTS)
+        self.load()
+
+    def load(self):
+        try:
+            with open(self.path, encoding="utf-8") as f:
+                stored = json.load(f)
+        except (OSError, ValueError):
+            return
+        _merge(self.data, stored)
+        shortcuts = stored.get("shortcuts", {}) or {}
+        if stored.get("shortcut_defaults_version", 0) < SHORTCUT_DEFAULTS_VERSION:
+            # Upgrade once, preserving Qt-equivalent custom bindings. The
+            # version makes subsequent saves authoritative, so deleting a
+            # factory shortcut does not bring it back on the next launch.
+            from PySide6.QtGui import QKeySequence
+            custom_keys = {QKeySequence(key).toString() for key in shortcuts}
+            self.data["shortcuts"] = {
+                key: command for key, command in DEFAULT_SHORTCUTS.items()
+                if QKeySequence(key).toString() not in custom_keys
+            }
+            self.data["shortcuts"].update(shortcuts)
+            self.data["shortcut_defaults_version"] = SHORTCUT_DEFAULTS_VERSION
+        else:
+            self.data["shortcuts"] = copy.deepcopy(shortcuts)
+
+    def save(self):
+        os.makedirs(os.path.dirname(self.path), exist_ok=True)
+        tmp = self.path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(self.data, f, indent=2, sort_keys=True)
+        if os.name != "nt":
+            os.chmod(tmp, 0o600)    # may hold an API key
+        os.replace(tmp, self.path)
+
+    def reset(self):
+        self.data = copy.deepcopy(DEFAULTS)
+        self.save()
+
+    # convenience accessors
+    def get(self, *keys, default=None):
+        node = self.data
+        for k in keys:
+            if not isinstance(node, dict) or k not in node:
+                return default
+            node = node[k]
+        return node
+
+    def set(self, *keys_and_value):
+        *keys, value = keys_and_value
+        node = self.data
+        for k in keys[:-1]:
+            node = node.setdefault(k, {})
+        node[keys[-1]] = value
+        self.save()
+
+
+def push_recent(paths: list, path: str, cap: int = 10) -> list:
+    """Return `paths` with `path` promoted to the front (absolute, deduped,
+    capped). Pure — the caller persists the result."""
+    ap = os.path.abspath(path)
+    out = [ap] + [p for p in paths if os.path.abspath(p) != ap]
+    return out[:cap]
+
+
+def _merge(base: dict, override: dict):
+    for k, v in override.items():
+        if isinstance(v, dict) and isinstance(base.get(k), dict):
+            _merge(base[k], v)
+        else:
+            base[k] = v
+
+
+# ---------------------------------------------------------------- importers
+
+# Rhino command -> blackbyrd3d command (used when importing Rhino alias files)
+RHINO_COMMAND_MAP = {
+    "line": "line", "polyline": "polyline", "interpcrv": "interpcrv",
+    "curve": "curve", "circle": "circle", "arc": "arc",
+    "ellipse": "ellipse", "rectangle": "rectangle",
+    "extrudecrv": "extrude", "extrudesrf": "extrude", "extrude": "extrude",
+    "revolve": "revolve", "loft": "loft", "sweep1": "sweep1",
+    "sweep2": "sweep2", "planarsrf": "planarsrf", "box": "box",
+    "plane": "plane", "srfpt": "srfpt",
+    "sphere": "sphere", "cylinder": "cylinder", "cone": "cone",
+    "torus": "torus", "move": "move", "copy": "copy", "rotate": "rotate",
+    "rotate3d": "rotate", "scale": "scale", "scalenu": "scalenu",
+    "mirror": "mirror", "arraypolar": "arraypolar", "array": "array",
+    "booleanunion": "booleanunion", "booleandifference": "booleandifference",
+    "booleanintersection": "booleanintersection", "trim": "trim",
+    "split": "split", "join": "join", "explode": "explode",
+    "offset": "offset", "fillet": "fillet", "rebuild": "rebuild",
+    "delete": "delete", "hide": "hide", "show": "show", "undo": "undo",
+    "redo": "redo", "zoomextents": "zoomextents", "zea": "zoomextents",
+    "pointson": "pointson", "pointsoff": "pointsoff", "distance": "distance",
+    "length": "length", "area": "area", "volume": "volume",
+    "selall": "selall", "selnone": "selnone", "selcrv": "selcrv",
+    "selsrf": "selsrf", "selsolid": "selsolid", "sellast": "sellast",
+    "invert": "invert", "isolate": "isolate", "unisolate": "unisolate",
+    "top": "top", "front": "front", "right": "right",
+    "isometric": "isometric", "iso": "isometric",
+    "perspective": "perspective", "shade": "shaded", "shaded": "shaded",
+    "wireframe": "wireframe", "ghosted": "ghosted", "grid": "grid",
+    "new": "new", "open": "open", "save": "save", "import": "import",
+    "export": "export", "layer": "layer",
+}
+
+
+# full-macro phrases (normalized: prefixes stripped, lowercased) whose
+# meaning needs more than the first command token. Values may be Serp3D
+# macros ('osnap mid toggle') — aliases and shortcuts both accept those.
+RHINO_MACRO_MAP = {
+    "zoom": "zoom",
+    "zoom extents": "zoomextents",
+    "zoom target": "zoom",
+    "zoom all extents": "zoomextents",
+    "zoom selected": "zoomselected",
+    "zoom all selected": "zoomselected",
+    "zoom window": "zoomwindow",
+    "setview world top": "top",
+    "setview world front": "front",
+    "setview world back": "back",
+    "setview world right": "right",
+    "setview world left": "left",
+    "setview world bottom": "bottom",
+    "setview world perspective": "perspective",
+    # our one isometric looks from the south-east, the same corner Rhino's
+    # SEIsometric does; the other three corners are not views we have, and
+    # pointing them here would put the model the wrong way round
+    "setview world seisometric": "isometric",
+    "setdisplaymode arctic": "plaster",
+    "setdisplaymode rendered": "rendered",
+    "setdisplaymode shaded": "shaded",
+    "setdisplaymode wireframe": "wireframe",
+    "setdisplaymode ghosted": "ghosted",
+    "gumballalignment cplane": "gumballalignment cplane",
+    "gumballalignment object": "gumballalignment object",
+    "gumballalignment world": "gumballalignment world",
+    "gumballalignment view": "gumballalignment view",
+    "osnap end toggle enter": "osnap end toggle",
+    "osnap mid toggle enter": "osnap mid toggle",
+    "osnap center toggle enter": "osnap center toggle",
+    "osnap near toggle enter": "osnap near toggle",
+    "osnap quad toggle enter": "osnap quad toggle",
+    "osnap int toggle enter": "osnap int toggle",
+    "osnap appint toggle enter": "osnap appint toggle",
+    "osnap perp toggle enter": "osnap perp toggle",
+    "disableosnap toggle": "osnap all toggle",
+    "maxviewport": "1view",
+    "optionspage plugins": "plugins",
+    "curvaturegraphoff": "curvaturegraph",
+    "deletesubcrv": "split",
+    "selprev": "sellast",
+    "selpolysrf": "selsolid",
+    "selpolysurface": "selsolid",
+    "lockalldetails": "detaillock",
+    "hatchborder": "hatch",
+    "scale1d": "scalenu",
+    "boundingbox": "boundingbox",
+    "viewcapturetofile": "viewcapturetofile",
+    "viewcapturetoclipboard": "viewcapturetoclipboard",
+    "snap": "snap",
+    "dim": "dim",
+    "orient": "orient",
+    "orient3pt": "orient3pt",
+    "closecrv": "closecrv",
+    "clippingplane": "clippingplane",
+    "disableclippingplane": "disableclippingplane all",
+    "enableclippingplane": "enableclippingplane all",
+    "selclippingplane disableclippingplane": "disableclippingplane all",
+    "selectionfiltertoggle": "selfiltertoggle",
+}
+
+
+def normalize_rhino_macro(macro: str) -> str:
+    """'noecho -Osnap _Mid _Toggle _Enter' -> 'osnap mid toggle enter'."""
+    tokens = []
+    for tok in macro.replace("!", " ").replace("'", " ").split():
+        tok = tok.lstrip("_-'").lower()
+        if tok and tok != "noecho":
+            tokens.append(tok)
+    return " ".join(tokens)
+
+
+def map_rhino_macro(macro: str) -> str | None:
+    """Best Serp3D command (or macro) for a Rhino macro, else None."""
+    phrase = normalize_rhino_macro(macro)
+    if not phrase:
+        return None
+    if phrase in RHINO_MACRO_MAP:
+        return RHINO_MACRO_MAP[phrase]
+    first = phrase.split()[0]
+    mapped = RHINO_COMMAND_MAP.get(first)
+    if mapped:
+        return mapped
+    # many Rhino names are also Serp3D names (or aliases) verbatim
+    try:
+        from ..commands.base import resolve
+        cd = resolve(first)
+        if cd is not None:
+            return cd.name
+    except Exception:                                  # noqa: BLE001
+        pass
+    return None
+
+
+def parse_rhino_aliases(text: str) -> tuple[dict, list[str]]:
+    """Parse a Rhino alias export (.txt): each line 'alias macro'.
+
+    Macros look like '! _Line' or '_Circle _Vertical'. We take the first
+    command token, strip Rhino prefixes, and map known commands to their
+    blackbyrd3d names. Returns (aliases, unmapped_names).
+    """
+    aliases: dict = {}
+    unmapped: list[str] = []
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith(";") or line.startswith("#"):
+            continue
+        parts = line.split(None, 1)
+        if len(parts) != 2:
+            continue
+        alias, macro = parts[0].lower(), parts[1]
+        mapped = map_rhino_macro(macro)
+        if mapped:
+            aliases[alias] = mapped
+        else:
+            phrase = normalize_rhino_macro(macro)
+            if not phrase:
+                continue
+            aliases[alias] = phrase.split()[0]
+            unmapped.append(phrase.split()[0])
+    return aliases, unmapped
+
+
+def parse_shortcuts(text: str) -> dict:
+    """Parse shortcut definitions: JSON, or lines 'F5 zoomextents' /
+    'ctrl+shift+b=box'."""
+    text = text.strip()
+    if text.startswith("{"):
+        data = json.loads(text)
+        return {str(k): str(v) for k, v in data.items()}
+    out = {}
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith(("#", ";")):
+            continue
+        if "=" in line:
+            key, cmd = line.split("=", 1)
+        else:
+            parts = line.split(None, 1)
+            if len(parts) != 2:
+                continue
+            key, cmd = parts
+        out[key.strip()] = cmd.strip().lower()
+    return out
+
+
+# --- mouse chords --------------------------------------------------------
+#
+# A button held with modifiers, bound to a command. Written the way people
+# actually say it — 'ctrl+shift+mmb', 'MMB+Ctrl+Shift', 'shift+ctrl+middle'
+# are one binding, so nobody has to guess an order or a spelling.
+
+_CHORD_BUTTONS = {"middle": "middle", "mmb": "middle", "wheel": "middle",
+                  "right": "right", "rmb": "right"}
+_CHORD_MODIFIERS = {"ctrl": "ctrl", "control": "ctrl", "cmd": "ctrl",
+                    "command": "ctrl", "meta": "ctrl", "super": "ctrl",
+                    "shift": "shift",
+                    "alt": "alt", "option": "alt", "opt": "alt"}
+_CHORD_ORDER = ("ctrl", "shift", "alt")
+
+
+def chord_key(button: str, *, ctrl: bool = False, shift: bool = False,
+              alt: bool = False) -> str:
+    """The canonical name of a chord, as an event would produce it."""
+    held = [m for m, on in zip(_CHORD_ORDER, (ctrl, shift, alt)) if on]
+    return "+".join([*held, button])
+
+
+def parse_chord(text: str) -> str | None:
+    """Read a written chord into its canonical name, or None if it is not
+    one — a stray key, two buttons, nothing but modifiers."""
+    parts = [p.strip().lower() for p in str(text).split("+")]
+    if not parts or any(not p for p in parts):
+        return None
+    buttons = [_CHORD_BUTTONS[p] for p in parts if p in _CHORD_BUTTONS]
+    mods = {_CHORD_MODIFIERS[p] for p in parts if p in _CHORD_MODIFIERS}
+    if len(buttons) != 1 or len(buttons) + len(mods) != len(parts):
+        return None                    # a stray word, or the same twice
+    return chord_key(buttons[0], ctrl="ctrl" in mods, shift="shift" in mods,
+                     alt="alt" in mods)
+
+
+def chord_command(chords: dict, key: str) -> str | None:
+    """The command bound to a chord, matching however it was written."""
+    for text, command in (chords or {}).items():
+        if parse_chord(text) == key:
+            return str(command)
+    return None

@@ -1,0 +1,69 @@
+"""Snapshot-based undo/redo.
+
+Snapshots are shallow: SceneObject clones share the underlying immutable
+TopoDS_Shape and cached mesh, so a checkpoint costs O(objects), not O(geometry).
+"""
+
+from __future__ import annotations
+
+MAX_UNDO = 100
+
+
+class History:
+    def __init__(self, scene):
+        self.scene = scene
+        self._undo: list[tuple[str, dict]] = []
+        self._redo: list[tuple[str, dict]] = []
+        # the session journal listens here: a checkpoint is what separates
+        # an edit somebody made from geometry that merely changed
+        self.on_checkpoint = None
+        self.on_discard = None
+
+    def checkpoint(self, label: str = ""):
+        """Record state before a mutating operation."""
+        if self.on_checkpoint is not None:
+            self.on_checkpoint(label)
+        self._undo.append((label, self.scene.snapshot()))
+        if len(self._undo) > MAX_UNDO:
+            self._undo.pop(0)
+        self._redo.clear()
+
+    def discard_checkpoint(self):
+        """Drop the most recent checkpoint (cancelled/no-op command)."""
+        if self._undo:
+            self._undo.pop()
+            if self.on_discard is not None:
+                self.on_discard()
+
+    def revert_checkpoint(self):
+        """Put the scene back as the most recent checkpoint had it and drop
+        that checkpoint: an operation that changed things, then gave up."""
+        if self._undo:
+            _label, snap = self._undo.pop()
+            self.scene.restore(snap)
+            if self.on_discard is not None:
+                self.on_discard()
+
+    @property
+    def can_undo(self) -> bool:
+        return bool(self._undo)
+
+    @property
+    def can_redo(self) -> bool:
+        return bool(self._redo)
+
+    def undo(self) -> str | None:
+        if not self._undo:
+            return None
+        label, snap = self._undo.pop()
+        self._redo.append((label, self.scene.snapshot()))
+        self.scene.restore(snap)
+        return label or "operation"
+
+    def redo(self) -> str | None:
+        if not self._redo:
+            return None
+        label, snap = self._redo.pop()
+        self._undo.append((label, self.scene.snapshot()))
+        self.scene.restore(snap)
+        return label or "operation"

@@ -1,0 +1,56 @@
+[project]
+name = "blackbyrd3d"
+version = "0.1.0"
+description = "Open-source NURBS surface modeller for Linux with MCP integration"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Jonas Pedrotti" }]
+requires-python = ">=3.10"
+dependencies = [
+    # OCP 8 removed compatibility names used throughout the modelling kernel.
+    "cadquery-ocp==7.9.3.1.1",
+    # Essentials holds every Qt module used here; the full PySide6 also pulls
+    # in WebEngine, Addons and Pdf, about 460 MB nothing imports.
+    "PySide6-Essentials>=6.6",
+    "shiboken6>=6.6",       # checks whether a destroyed GL share group is still valid
+    "numpy>=1.26",
+    "pye57>=0.4.19,<0.5",
+    "PyOpenGL>=3.1",
+    "mcp>=2",               # the server is written against mcp.server.mcpserver
+    "httpx>=0.27,<1",       # the AI client speaks it directly; mcp 2 moved to httpx2
+    "rhino3dm>=8.0",
+    "ezdxf>=1.1",
+    "svgelements>=1.9",
+    # SketchUp files (#42): read from the reverse-engineered format, no SDK.
+    # Held to 1.3 because the importer reads a table from its parse results.
+    "openskp>=1.3,<1.4",
+]
+
+[project.optional-dependencies]
+# xdist: the tests are independent, so they can run side by side
+# (CONTRIBUTING says how many at once).
+dev = ["pytest>=8.0", "pytest-xdist>=3.5"]
+docs = ["mkdocs>=1.6", "mkdocs-material>=9.5"]
+
+[project.urls]
+Homepage = "https://github.com/JonasPedrotti/Blackbyrd3D"
+
+[project.scripts]
+byrd3d = "blackbyrd3d.launcher:main"
+byrd = "blackbyrd3d.launcher:main"          # short alias, like `code` for VS Code
+byrd3d-mcp = "blackbyrd3d.mcp_server.server:main"
+byrd3d-batch = "blackbyrd3d.batch:main"
+
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["blackbyrd3d*"]
+
+[tool.setuptools.package-data]
+blackbyrd3d = ["examples/*.byrd", "examples/*.wyrm"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

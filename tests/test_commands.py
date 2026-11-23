@@ -1,0 +1,1172 @@
+import pytest
+
+import blackbyrd3d.commands  # registers all commands  # noqa: F401
+from blackbyrd3d.commands.base import (
+    CommandContext, CommandProcessor, PointReq, SelectReq, parse_point,
+    resolve,
+)
+from blackbyrd3d.core import geometry as g
+from blackbyrd3d.core.history import History
+from blackbyrd3d.core.scene import Scene
+from blackbyrd3d.core.selection import SelectionManager
+
+
+@pytest.fixture
+def env():
+    scene = Scene()
+    selection = SelectionManager(scene)
+    history = History(scene)
+    ctx = CommandContext(scene, selection, history)
+    proc = CommandProcessor(ctx)
+    return scene, selection, history, ctx, proc
+
+
+def test_parse_point():
+    assert parse_point("1,2,3") == (1, 2, 3)
+    assert parse_point("1,2") == (1, 2, 0)
+    assert parse_point(" 1.5 , -2 ") == (1.5, -2, 0)
+    assert parse_point("@1,0,0", (5, 5, 5)) == (6, 5, 5)
+    assert parse_point("nonsense") is None
+
+
+def test_registry_aliases():
+    assert resolve("line").name == "line"
+    assert resolve("L").name == "line"
+    assert resolve("ze").name == "zoomextents"
+    assert resolve("nope") is None
+
+
+def test_line_command(env):
+    scene, sel, hist, ctx, proc = env
+    proc.run("line")
+    assert isinstance(proc.request, PointReq)
+    proc.provide_text("0,0,0")
+    proc.provide_text("10,0,0")
+    assert not proc.busy
+    assert len(scene.all()) == 1
+    assert g.curve_length(scene.all()[0].shape) == pytest.approx(10)
+
+
+def test_relative_coordinates(env):
+    scene, sel, hist, ctx, proc = env
+    proc.run("line")
+    proc.provide_text("5,5,0")
+    proc.provide_text("@10,0,0")
+    obj = scene.all()[0]
+    mn, mx = g.bbox(obj.shape)
+    assert mx[0] == pytest.approx(15, abs=1e-6)
+
+
+def test_polyline_close(env):
+    scene, sel, hist, ctx, proc = env
+    proc.run("polyline")
+    for t in ("0,0", "10,0", "10,10", "0,10"):
+        proc.provide_text(t)
+    proc.provide_text("c")           # close
+    assert not proc.busy
+    assert g.is_closed_curve(scene.all()[0].shape)
+
+
+def test_polyline_closes_by_clicking_the_first_point(env):
+    scene, sel, hist, ctx, proc = env
+    proc.run("polyline")
+    for t in ("0,0", "10,0", "10,10"):
+        proc.provide_text(t)
+    proc.provide_text("0,0")         # back on the start = Close
+    assert not proc.busy
+    assert g.is_closed_curve(scene.all()[0].shape)
+
+
+def test_two_point_polyline_does_not_close_on_the_start(env):
+    """With two points down, the start is not yet a close gesture — a
+    zero-area loop is never what the click meant."""
+    scene, sel, hist, ctx, proc = env
+    proc.run("polyline")
+    proc.provide_text("0,0")
+    proc.provide_text("10,0")
+    proc.provide_text("0,0")         # doubles back, does not close
+    assert proc.busy                 # still drawing
+    proc.provide_text("5,5")
+    proc.provide_text("")            # Enter finishes open
+    assert not proc.busy
+    assert not g.is_closed_curve(scene.all()[0].shape)
+
+
+def test_curve_closes_by_clicking_the_first_point(env):
+    scene, sel, hist, ctx, proc = env
+    proc.run("curve")
+    for t in ("0,0", "10,0", "10,10"):
+        proc.provide_text(t)
+    proc.provide_text("0,0")
+    assert not proc.busy
+    assert g.is_closed_curve(scene.all()[0].shape)
+
+
+def test_circle_and_extrude_via_selection(env):
+    scene, sel, hist, ctx, proc = env
+    proc.run("circle")
+    proc.provide_text("0,0,0")
+    proc.provide_text("5")
+    assert len(scene.all()) == 1
+
+    proc.run("extrude")
+    assert isinstance(proc.request, SelectReq)
+    proc.click_object(scene.all()[0].id)
+    proc.finish_selection()
+    proc.provide_text("10")          # distance
+    proc.provide_text("")            # cap default Yes
+    assert not proc.busy
+    solids = [o for o in scene.all() if o.kind == "solid"]
+    assert len(solids) == 1
+    import math
+    assert g.volume(solids[0].shape) == pytest.approx(
+        math.pi * 25 * 10, rel=1e-3)
+
+
+def test_preselection_skips_select_request(env):
+    scene, sel, hist, ctx, proc = env
+    obj = scene.add(g.make_circle((0, 0, 0), 3))
+    sel.set([obj.id])
+    proc.run("extrude")
+    # selection consumed automatically; first prompt is the distance
+    # (a clickable axis-locked point since the reference-workflow wave)
+    from blackbyrd3d.commands.base import PointReq
+    assert isinstance(proc.request, PointReq)
+    assert proc.request.axis_lock is not None
+
+
+def test_cancel_restores_scene(env):
+    scene, sel, hist, ctx, proc = env
+    proc.run("line")
+    proc.provide_text("0,0,0")
+    proc.cancel()
+    assert not proc.busy
+    assert len(scene.all()) == 0
+    assert not hist.can_undo        # cancelled command leaves no undo entry
+
+
+def test_undo_after_command(env):
+    scene, sel, hist, ctx, proc = env
+    proc.run("line")
+    proc.provide_text("0,0,0")
+    proc.provide_text("10,0,0")
+    assert hist.can_undo
+    proc.run("undo")
+    assert len(scene.all()) == 0
+    proc.run("redo")
+    assert len(scene.all()) == 1
+
+
+def test_move_command(env):
+    scene, sel, hist, ctx, proc = env
+    obj = scene.add(g.make_box((0, 0, 0), 1, 1, 1))
+    proc.run("move")
+    proc.click_object(obj.id)
+    proc.finish_selection()
+    proc.provide_text("0,0,0")
+    proc.provide_text("5,5,0")
+    mn, mx = g.bbox(scene.all()[0].shape)
+    assert mn[0] == pytest.approx(5, abs=1e-6)
+
+
+def test_copy_command_multiple(env):
+    scene, sel, hist, ctx, proc = env
+    obj = scene.add(g.make_box((0, 0, 0), 1, 1, 1))
+    proc.run("copy")
+    proc.click_object(obj.id)
+    proc.finish_selection()
+    proc.provide_text("0,0,0")
+    proc.provide_text("5,0,0")
+    proc.provide_text("10,0,0")
+    proc.provide_text("")           # finish
+    assert len(scene.all()) == 3
+
+
+def test_rotate_scale_mirror(env):
+    scene, sel, hist, ctx, proc = env
+    obj = scene.add(g.make_box((1, 0, 0), 1, 1, 1))
+
+    proc.run("rotate")
+    proc.click_object(obj.id)
+    proc.finish_selection()
+    proc.provide_text("0,0,0")
+    proc.provide_text("90")
+    mn, mx = g.bbox(scene.all()[0].shape)
+    assert mx[1] == pytest.approx(2, abs=1e-6)
+
+    proc.run("scale")
+    proc.click_object(obj.id)
+    proc.finish_selection()
+    proc.provide_text("0,0,0")
+    proc.provide_text("2")
+    assert g.volume(scene.all()[0].shape) == pytest.approx(8, rel=1e-5)
+
+    before_lo, before_hi = g.bbox(scene.all()[0].shape)
+    proc.run("mirror")
+    proc.click_object(obj.id)
+    proc.finish_selection()
+    proc.provide_text("0,0,0")
+    proc.provide_text("0,10,0")     # mirror across YZ-ish plane (x -> -x)
+    assert len(scene.all()) == 1, "Copy is off, so the box itself is mirrored"
+    lo, hi = g.bbox(scene.all()[0].shape)
+    assert lo[0] == pytest.approx(-before_hi[0], abs=1e-6)
+    assert hi[0] == pytest.approx(-before_lo[0], abs=1e-6)
+
+
+def test_boolean_union_difference(env):
+    scene, sel, hist, ctx, proc = env
+    a = scene.add(g.make_box((0, 0, 0), 10, 10, 10))
+    b = scene.add(g.make_box((5, 5, 5), 10, 10, 10))
+
+    proc.run("booleanunion")
+    proc.click_object(a.id)
+    proc.click_object(b.id)
+    proc.finish_selection()
+    assert len(scene.all()) == 1
+    assert g.volume(scene.all()[0].shape) == pytest.approx(1875)
+
+    proc.run("undo")
+    assert len(scene.all()) == 2
+    # the union left its result selected, and undo does not put a selection
+    # back; picking the objects below means picking them, not adding to it
+    sel.clear()
+
+    proc.run("booleandifference DeleteInput=Yes")
+    proc.click_object(scene.all()[0].id)
+    proc.finish_selection()
+    proc.click_object(scene.all()[1].id)
+    proc.finish_selection()
+    assert len(scene.all()) == 1
+    assert g.volume(scene.all()[0].shape) == pytest.approx(875)
+
+
+def test_loft_command(env):
+    scene, sel, hist, ctx, proc = env
+    c1 = scene.add(g.make_circle((0, 0, 0), 5))
+    c2 = scene.add(g.make_circle((0, 0, 10), 3))
+    proc.run("loft")
+    proc.click_object(c1.id)
+    proc.click_object(c2.id)
+    proc.finish_selection()
+    proc.provide_text("")           # style default
+    kinds = [o.kind for o in scene.all()]
+    assert "surface" in kinds or "solid" in kinds
+
+
+def test_delete_and_join(env):
+    scene, sel, hist, ctx, proc = env
+    l1 = scene.add(g.make_line((0, 0, 0), (10, 0, 0)))
+    l2 = scene.add(g.make_line((10, 0, 0), (10, 10, 0)))
+    proc.run("join")
+    proc.click_object(l1.id)
+    proc.click_object(l2.id)
+    proc.finish_selection()
+    assert len(scene.all()) == 1
+    assert g.curve_length(scene.all()[0].shape) == pytest.approx(20)
+    assert sel.ids == [scene.all()[0].id], "the joined curve stays picked"
+
+    proc.run("delete")                   # takes the curve still picked
+    assert len(scene.all()) == 0
+
+
+def test_layer_command(env):
+    scene, sel, hist, ctx, proc = env
+    proc.run("layer")
+    proc.provide_text("New")
+    proc.provide_text("Walls")
+    layer = scene.layers.find_by_name("Walls")
+    assert layer is not None
+    assert scene.layers.current_id == layer.id
+
+
+def test_unknown_command_reports(env):
+    scene, sel, hist, ctx, proc = env
+    msgs = []
+    ctx.add_echo_listener(msgs.append)
+    assert proc.run("frobnicate") is False
+    assert any("Unknown command" in m for m in msgs)
+
+
+def test_select_by_name_and_all(env):
+    scene, sel, hist, ctx, proc = env
+    scene.add(g.make_line((0, 0, 0), (1, 0, 0)), name="Alpha")
+    scene.add(g.make_line((0, 0, 0), (2, 0, 0)), name="Beta")
+    proc.run("delete")
+    proc.provide_text("Alpha")
+    proc.finish_selection()
+    assert len(scene.all()) == 1
+    assert scene.all()[0].name == "Beta"
+
+
+def test_split_command(env):
+    scene, sel, hist, ctx, proc = env
+    line = scene.add(g.make_line((0, 0, 0), (10, 0, 0)))
+    cutter = scene.add(g.make_line((5, -5, 0), (5, 5, 0)))
+    proc.run("split")
+    proc.click_object(line.id)
+    proc.click_object(cutter.id)
+    proc.finish_selection()
+    curves = [o for o in scene.all() if o.id != cutter.id]
+    assert len(curves) == 2
+
+
+def test_trim_command(env):
+    scene, sel, hist, ctx, proc = env
+    line = scene.add(g.make_line((0, 0, 0), (10, 0, 0)), name="Target")
+    cutter = scene.add(g.make_line((5, -5, 0), (5, 5, 0)), name="Cutter")
+    proc.run("trim")
+    proc.click_object(cutter.id)
+    proc.finish_selection()
+    proc.click_object(line.id)
+    # pieces now exist; remove the shorter/left piece by name lookup
+    pieces = [o for o in scene.all() if o.id not in (cutter.id,)]
+    assert len(pieces) == 2
+    proc.click_object(pieces[0].id)
+    proc.finish_selection()
+    remaining = [o for o in scene.all() if o.id != cutter.id]
+    assert len(remaining) == 1
+    assert g.curve_length(remaining[0].shape) == pytest.approx(5)
+
+
+def test_sweep2_command(env):
+    scene, sel, hist, ctx, proc = env
+    r1 = scene.add(g.make_line((0, 0, 0), (20, 0, 0)))
+    r2 = scene.add(g.make_line((0, 5, 0), (20, 5, 0)))
+    prof = scene.add(g.make_line((0, 0, 0), (0, 0, 3)))
+    proc.run("sweep2")
+    proc.click_object(r1.id)
+    proc.click_object(r2.id)
+    proc.click_object(prof.id)
+    assert any(o.kind in ("surface", "solid") for o in scene.all())
+
+
+def test_selection_filter_commands(env):
+    scene, sel, hist, ctx, proc = env
+    scene.add(g.make_line((0, 0, 0), (5, 0, 0)))
+    scene.add(g.make_box((0, 0, 0), 1, 1, 1))
+    srf = scene.add(g.planar_face(g.make_circle((5, 5, 0), 2)))
+    proc.run("selcrv")
+    assert len(sel.ids) == 1
+    proc.run("selsolid")
+    assert len(sel.ids) == 1
+    proc.run("selsrf")
+    assert sel.ids == [srf.id]
+    proc.run("invert")
+    assert len(sel.ids) == 2
+    proc.run("sellast")
+    assert sel.ids == [srf.id]
+
+
+def test_isolate_unisolate(env):
+    scene, sel, hist, ctx, proc = env
+    a = scene.add(g.make_box((0, 0, 0), 1, 1, 1))
+    b = scene.add(g.make_box((5, 0, 0), 1, 1, 1))
+    c = scene.add(g.make_box((10, 0, 0), 1, 1, 1))
+    proc.run("isolate")
+    proc.click_object(a.id)
+    proc.finish_selection()
+    assert len(scene.visible_objects()) == 1
+    proc.run("unisolate")
+    assert len(scene.visible_objects()) == 3
+
+
+def test_sellayer_and_selname(env):
+    scene, sel, hist, ctx, proc = env
+    layer = scene.layers.create("Props")
+    scene.add(g.make_box((0, 0, 0), 1, 1, 1), name="Crate A",
+              layer_id=layer.id)
+    scene.add(g.make_box((3, 0, 0), 1, 1, 1), name="Crate B")
+    proc.run("sellayer")
+    proc.provide_text("Props")
+    assert len(sel.ids) == 1
+    proc.run("selname")
+    proc.provide_text("crate")
+    assert len(sel.ids) == 2
+
+
+def test_feet_inches_input(env):
+    scene, sel, hist, ctx, proc = env
+    scene.units = "ft"
+    proc.run("circle")
+    proc.provide_text("0,0,0")
+    proc.provide_text("3'6\"")           # radius = 3.5 ft
+    import math
+    assert g.curve_length(scene.all()[0].shape) == pytest.approx(
+        2 * math.pi * 3.5, rel=1e-6)
+    # coordinates with units + polar input
+    proc.run("line")
+    proc.provide_text("1',2',0")
+    proc.provide_text("10<0")            # 10 ft along +X
+    mn, mx = g.bbox(scene.all()[1].shape)
+    assert mn[0] == pytest.approx(1) and mx[0] == pytest.approx(11)
+    assert mn[1] == pytest.approx(2)
+
+
+def test_units_command_rescale(env):
+    scene, sel, hist, ctx, proc = env
+    scene.add(g.make_box((0, 0, 0), 1000, 1000, 1000))   # 1m box in mm
+    proc.run("units")
+    proc.provide_text("m")
+    proc.provide_text("Yes")             # rescale
+    assert scene.units == "m"
+    assert g.volume(scene.all()[0].shape) == pytest.approx(1.0, rel=1e-6)
+    proc.run("undo")
+    assert g.volume(scene.all()[0].shape) == pytest.approx(1e9, rel=1e-6)
+
+
+def test_filletedge_and_contour_commands(env):
+    scene, sel, hist, ctx, proc = env
+    box = scene.add(g.make_box((0, 0, 0), 10, 10, 30))
+    proc.run("filletedge")
+    proc.click_object(box.id)
+    proc.finish_selection()
+    proc.provide_text("1")
+    assert 2800 < g.volume(scene.all()[0].shape) < 3000
+
+    proc.run("contour")
+    proc.click_object(scene.all()[0].id)
+    proc.finish_selection()
+    proc.provide_text("Z")
+    proc.provide_text("10")
+    contours = [o for o in scene.all() if o.kind == "curve"]
+    assert len(contours) >= 2
+    assert scene.layers.find_by_name("Contours") is not None
+
+
+def test_intersect_command(env):
+    scene, sel, hist, ctx, proc = env
+    a = scene.add(g.make_box((0, 0, 0), 10, 10, 10))
+    b = scene.add(g.make_sphere((10, 5, 5), 3))
+    proc.run("intersect")
+    proc.click_object(a.id)
+    proc.click_object(b.id)
+    curves = [o for o in scene.all() if o.kind == "curve"]
+    assert len(curves) >= 1
+
+
+def test_booleansplit_command(env):
+    scene, sel, hist, ctx, proc = env
+    box = scene.add(g.make_box((0, 0, 0), 10, 10, 10))
+    line = g.make_line((5, -1, -1), (5, 11, -1))
+    cutter = scene.add(g.extrude(g.make_line((5, -5, -5), (5, 15, -5)),
+                                 (0, 0, 1), 25))
+    proc.run("booleansplit")
+    proc.click_object(box.id)
+    proc.finish_selection()
+    proc.click_object(cutter.id)
+    proc.finish_selection()
+    solids = [o for o in scene.all() if o.kind == "solid"]
+    assert len(solids) == 2
+    for s in solids:
+        assert g.volume(s.shape) == pytest.approx(500, rel=1e-6)
+
+
+def test_group_lock_block(env):
+    scene, sel, hist, ctx, proc = env
+    a = scene.add(g.make_box((0, 0, 0), 1, 1, 1), name="A")
+    b = scene.add(g.make_box((3, 0, 0), 1, 1, 1), name="B")
+    c = scene.add(g.make_box((6, 0, 0), 1, 1, 1), name="C")
+
+    # group A+B: expansion picks up both
+    proc.run("group")
+    proc.click_object(a.id)
+    proc.click_object(b.id)
+    proc.finish_selection()
+    expanded = scene.expand_group_ids([a.id])
+    assert set(expanded) == {a.id, b.id}
+
+    # lock C: unselectable, filters skip it
+    sel.clear()  # start a fresh selection instead of using the new group
+    proc.run("lock")
+    proc.click_object(c.id)
+    proc.finish_selection()
+    assert not scene.is_selectable(c.id)
+    sel.select_all()
+    assert c.id not in sel.ids
+    proc.run("unlockall")
+    assert scene.is_selectable(c.id)
+
+    # block from A+B, then insert a second instance
+    proc.run("block")
+    proc.click_object(a.id)
+    proc.click_object(b.id)
+    proc.finish_selection()
+    proc.provide_text("0,0,0")
+    proc.provide_text("Crate")
+    assert len(scene.block_defs) == 1
+    instances = [o for o in scene.all() if o.block_id]
+    assert len(instances) == 1
+
+    proc.run("insert")
+    proc.provide_text("Crate")
+    proc.provide_text("10,0,0")
+    instances = [o for o in scene.all() if o.block_id]
+    assert len(instances) == 2
+    mn, _ = g.bbox(instances[-1].shape)
+    assert mn[0] == pytest.approx(10, abs=1e-6)
+
+
+def test_block_persistence(env, tmp_path):
+    from blackbyrd3d import fileio
+    scene, sel, hist, ctx, proc = env
+    a = scene.add(g.make_box((0, 0, 0), 2, 2, 2))
+    proc.run("block")
+    proc.click_object(a.id)
+    proc.finish_selection()
+    proc.provide_text("0,0,0")
+    proc.provide_text("Unit")
+    proc.run("lock")
+    proc.click_object(scene.all()[0].id)
+    proc.finish_selection()
+
+    path = str(tmp_path / "blocks.byrd")
+    fileio.export_file(scene, path)
+    from blackbyrd3d.core.scene import Scene
+    loaded = Scene()
+    fileio.import_file(loaded, path)
+    assert len(loaded.block_defs) == 1
+    assert loaded.all()[0].block_id
+    assert loaded.all()[0].locked
+
+
+def test_subobject_filletedge_and_pushpull(env):
+    scene, sel, hist, ctx, proc = env
+    box = scene.add(g.make_box((0, 0, 0), 10, 10, 10))
+
+    # fillet only edge 0
+    sel.toggle_subobject(box.id, "edge", 0)
+    proc.run("filletedge")
+    proc.provide_text("No")          # no chain expansion
+    proc.provide_text("1")
+    v = g.volume(scene.all()[0].shape)
+    # one rounded edge: 10x10x10 minus one quarter-round strip
+    expected = 1000 - (1 - 3.14159 / 4) * 1 * 10
+    assert v == pytest.approx(expected, rel=1e-3)
+    assert sel.subobjects == []
+
+    # push a face outward by 5: find the +X face index
+    shape = scene.all()[0].shape
+    import numpy as np
+    faces = g.faces_of(shape)
+    xmax_idx = max(range(len(faces)),
+                   key=lambda i: g.centroid(faces[i])[0])
+    v0 = g.volume(shape)
+    sel.toggle_subobject(box.id, "face", xmax_idx)
+    proc.run("pushpull")
+    proc.provide_text("5")
+    v1 = g.volume(scene.all()[0].shape)
+    assert v1 > v0 + 400          # roughly +500 minus the filleted strip
+
+    # carve inward
+    shape = scene.all()[0].shape
+    faces = g.faces_of(shape)
+    xmax_idx = max(range(len(faces)),
+                   key=lambda i: g.centroid(faces[i])[0])
+    sel.toggle_subobject(box.id, "face", xmax_idx)
+    proc.run("pushpull")
+    proc.provide_text("-3")
+    v2 = g.volume(scene.all()[0].shape)
+    assert v2 < v1
+
+
+def test_command_option_chips(env):
+    """Options are settable any time during a request, Rhino-style."""
+    scene, sel, hist, ctx, proc = env
+    c = scene.add(g.make_circle((0, 0, 0), 5))
+    proc.run("extrude")
+    proc.click_object(c.id)
+    proc.finish_selection()
+    chips = dict(proc.option_chips())
+    assert chips == {"Cap": "Yes", "BothSides": "No", "KeepOriginal": "Yes"}
+    proc.provide_text("BothSides=Yes")        # option text does not advance
+    proc.provide_text("cap=n")                # prefix match, case-insensitive
+    assert dict(proc.option_chips()) == {"Cap": "No", "BothSides": "Yes",
+                                         "KeepOriginal": "Yes"}
+    assert proc.set_option("Cap")             # click = cycle
+    assert dict(proc.option_chips())["Cap"] == "Yes"
+    proc.provide_text("10")
+    assert not proc.busy
+    solid = scene.all()[-1]
+    (zmin, zmax) = (g.bbox(solid.shape)[0][2], g.bbox(solid.shape)[1][2])
+    assert zmin == pytest.approx(-10) and zmax == pytest.approx(10)
+    import math
+    assert g.volume(solid.shape) == pytest.approx(math.pi * 25 * 20,
+                                                  rel=1e-3)
+
+
+def test_command_live_preview(env):
+    scene, sel, hist, ctx, proc = env
+    c = scene.add(g.make_circle((0, 0, 0), 5))
+    proc.run("extrude")
+    proc.click_object(c.id)
+    proc.finish_selection()
+    ghost = proc.preview_shape("7")
+    assert ghost is not None
+    assert g.bbox(ghost)[1][2] == pytest.approx(7)
+    assert proc.preview_shape("not a number") is None
+    assert proc.busy                          # preview never advances
+    proc.cancel()
+
+
+def test_loft_style_option(env):
+    scene, sel, hist, ctx, proc = env
+    c1 = scene.add(g.make_circle((0, 0, 0), 5))
+    c2 = scene.add(g.make_circle((0, 0, 10), 3))
+    proc.run("loft")
+    proc.click_object(c1.id)
+    proc.click_object(c2.id)
+    proc.provide_text("Style=Ruled")
+    proc.finish_selection()
+    assert not proc.busy
+    assert scene.all()[-1].kind in ("surface", "solid")
+
+
+def test_help_command(env):
+    scene, sel, hist, ctx, proc = env
+    echoes = []
+    ctx.add_echo_listener(echoes.append)
+    proc.run("help")
+    proc.provide_text("extrude")
+    assert any("extrude" in e and "ext" in e for e in echoes)
+    proc.run("help")
+    proc.provide_text("")
+    assert any(e.startswith("Surfaces:") for e in echoes)
+
+
+def test_zoom_commands(env):
+    scene, sel, hist, ctx, proc = env
+    from tests.conftest import StubViewport
+
+    class ZoomStub(StubViewport):
+        def __init__(self):
+            super().__init__("model")
+            self.calls = []
+
+        def zoom_selected(self):
+            self.calls.append("selected")
+            return bool(sel.ids)
+
+        def zoom_extents(self):
+            self.calls.append("extents")
+
+        def zoom_to_points(self, p1, p2):
+            self.calls.append(("window", p1, p2))
+
+    vp = ZoomStub()
+    ctx.viewport = vp
+    obj = scene.add(g.make_box((0, 0, 0), 5, 5, 5))
+    sel.set([obj.id])
+    proc.run("zoomselected")
+    assert vp.calls[-1] == "selected"
+    proc.run("zoom")
+    proc.provide_text("")          # default Selected (something is selected)
+    assert vp.calls[-1] == "selected"
+    proc.run("zoomwindow")
+    proc.provide_text("0,0,0")
+    proc.provide_text("10,10,0")
+    assert vp.calls[-1] == ("window", (0, 0, 0), (10, 10, 0))
+    sel.clear()
+    proc.run("zoom")
+    proc.provide_text("Extents")
+    assert vp.calls[-1] == "extents"
+
+
+def test_zoom_selected_math():
+    import numpy as np
+    from blackbyrd3d.core.scene import Scene
+    from blackbyrd3d.core.selection import SelectionManager
+    from blackbyrd3d.ui.viewport import Viewport
+    scene = Scene()
+    sel = SelectionManager(scene)
+    vp = Viewport(scene, sel)
+    far = scene.add(g.make_box((100, 100, 100), 2, 2, 2))
+    sel.set([far.id])
+    assert vp.zoom_selected()
+    assert np.allclose(vp.camera.target, (101, 101, 101))
+    assert vp.camera.distance < 30            # framed tight, not extents
+    vp.zoom_to_points((0, 0, 0), (10, 10, 0))
+    assert np.allclose(vp.camera.target, (5, 5, 0), atol=0.01)
+
+
+def test_box_click_height_flow(env):
+    """box: rect preview after 2 corners, click/typed height, axis lock."""
+    scene, sel, hist, ctx, proc = env
+    proc.run("box")
+    proc.provide_text("0,0,0")
+    # rectangle preview follows the candidate second corner
+    ghost = proc.preview_for((10, 6, 0))
+    assert ghost is not None and g.shape_kind(ghost) == "curve"
+    proc.provide_text("10,6,0")
+    req = proc.request
+    assert req.axis_lock == ((10, 6, 0), (0.0, 0.0, 1.0))
+    # box preview materialises toward the candidate height point
+    ghost = proc.preview_for((10, 6, 8))
+    assert g.shape_kind(ghost) == "solid"
+    assert g.volume(ghost) == pytest.approx(10 * 6 * 8)
+    proc.preview_for((10, 6, 0)) is None            # degenerate -> no ghost
+    # typed bare number resolves along the axis (E2E compatibility)
+    proc.provide_text("8")
+    assert not proc.busy
+    assert g.volume(scene.all()[0].shape) == pytest.approx(480)
+
+
+def test_box_negative_height_and_zero(env):
+    scene, sel, hist, ctx, proc = env
+    proc.run("box")
+    proc.provide_text("0,0,0")
+    proc.provide_text("4,4,0")
+    proc.provide_text("-5")                  # downward box
+    box = scene.all()[0]
+    assert g.volume(box.shape) == pytest.approx(80)
+    assert g.bbox(box.shape)[0][2] == pytest.approx(-5)
+    proc.run("box")
+    proc.provide_text("0,0,20")
+    proc.provide_text("4,4,20")
+    proc.provide_text("0")                   # zero height refused
+    assert not proc.busy and len(scene.all()) == 1
+
+
+def test_cylinder_and_circle_click_radius(env):
+    scene, sel, hist, ctx, proc = env
+    import math
+    proc.run("cylinder")
+    proc.provide_text("0,0,0")
+    ghost = proc.preview_for((3, 4, 0))      # radius 5 by click
+    assert g.shape_kind(ghost) == "curve"
+    proc.provide_text("3,4,0")
+    proc.provide_text("7")
+    cyl = scene.all()[-1]
+    assert g.volume(cyl.shape) == pytest.approx(math.pi * 25 * 7, rel=1e-3)
+
+    proc.run("circle")
+    proc.provide_text("0,0,0")
+    proc.provide_text("5")                   # typed radius still works
+    circ = scene.all()[-1]
+    assert circ.kind == "curve"
+    assert g.curve_length(circ.shape) == pytest.approx(2 * math.pi * 5,
+                                                       rel=1e-3)
+
+
+def test_point_axis_lock_in_viewport():
+    import numpy as np
+    from blackbyrd3d.core.scene import Scene
+    from blackbyrd3d.core.selection import SelectionManager
+    from blackbyrd3d.ui.viewport import Viewport
+    scene = Scene()
+    vp = Viewport(scene, SelectionManager(scene))
+    vp.resize(800, 600)
+    vp.point_mode = True
+    vp.point_axis = ((5, 5, 0), (0, 0, 1))
+    # any pixel resolves to a point on the vertical axis through (5,5,0)
+    pt = vp.world_point_at(400, 200)
+    assert pt is not None
+    assert pt[0] == pytest.approx(5) and pt[1] == pytest.approx(5)
+    pt_lower = vp.world_point_at(400, 500)
+    assert pt_lower[2] < pt[2]              # lower pixel -> lower height
+
+
+def test_macro_aliases_and_args(env):
+    """Aliases can expand to full macros; run() accepts trailing args."""
+    scene, sel, hist, ctx, proc = env
+    from blackbyrd3d.commands import base as cmd_base
+    cmd_base.add_alias("zx", "zoom extents")
+    assert cmd_base.resolve("zx").name == "zoom"      # first token resolves
+
+    class VP:
+        space = "model"
+
+        def __init__(self):
+            self.calls = []
+
+        def zoom_extents(self):
+            self.calls.append("extents")
+
+        def zoom_selected(self):
+            return False
+    vp = VP()
+    ctx.viewport = vp
+    proc.run("zx")                       # alias -> zoom + Extents answer
+    assert vp.calls == ["extents"]
+    proc.run("zoom extents")             # macro form directly
+    assert vp.calls == ["extents", "extents"]
+    cmd_base.remove_alias("zx")
+
+
+def test_osnap_command_toggles_config(env):
+    scene, sel, hist, ctx, proc = env
+    from blackbyrd3d.utils.config import Config
+    import json, tempfile, os
+    fd, path = tempfile.mkstemp(suffix=".json")
+    os.write(fd, b"{}")
+    os.close(fd)
+    os.environ["BYRD3D_CONFIG"] = path
+    try:
+        cfg = Config()
+        class VP:
+            space = "model"
+            config = cfg
+
+            class snaps:
+                enabled = True
+                types = {"mid": True, "appint": False}
+        ctx.viewport = VP()
+        proc.run("osnap mid toggle")
+        assert cfg.get("osnaps", "mid") is False      # default True -> off
+        proc.run("osnap mid on")
+        assert cfg.get("osnaps", "mid") is True
+        proc.run("osnap all toggle")
+        assert VP.snaps.enabled is False
+    finally:
+        del os.environ["BYRD3D_CONFIG"]
+        os.unlink(path)
+
+
+def test_osnap_command_moves_the_running_snaps(env):
+    """The bar redraws itself from the snap index, so a command that only
+    wrote the setting to disk looked like it had done nothing."""
+    scene, sel, hist, ctx, proc = env
+
+    class VP:
+        space = "model"
+        config = None
+
+        class snaps:
+            enabled = True
+            types = {"mid": True, "appint": False}
+    ctx.viewport = VP()
+    proc.run("osnap appint on")
+    assert VP.snaps.types["appint"] is True
+    proc.run("osnap appint toggle")
+    assert VP.snaps.types["appint"] is False
+    proc.run("osnap mid toggle")
+    assert VP.snaps.types["mid"] is False
+
+
+def test_rhino_macro_mapping():
+    from blackbyrd3d.utils.config import map_rhino_macro
+    assert map_rhino_macro("'_Zoom _Extents") == "zoomextents"
+    assert map_rhino_macro("'_Zoom _Selected") == "zoomselected"
+    assert map_rhino_macro("!_SetView _World _Back") == "back"
+    assert map_rhino_macro(
+        "noecho -Osnap _Mid _Toggle _Enter") == "osnap mid toggle"
+    assert map_rhino_macro("!_FilletEDge") == "filletedge"   # registry fall
+    assert map_rhino_macro("!_BooleanSplit") == "booleansplit"
+    assert map_rhino_macro("!_Grasshopper") is None
+    # SetLinetype now maps — Blackbyrd has a `linetype` command (setlinetype alias)
+    assert map_rhino_macro("-SetLinetype Dashed") == "linetype"
+
+
+def test_boundingbox_command(env):
+    scene, sel, hist, ctx, proc = env
+    scene.add(g.make_sphere((0, 0, 0), 5))
+    proc.run("boundingbox")
+    proc.provide_text("all")
+    box = scene.all()[-1]
+    assert g.volume(box.shape) == pytest.approx(1000, rel=1e-2)
+
+
+def test_back_left_bottom_views(env):
+    scene, sel, hist, ctx, proc = env
+    import math
+    from blackbyrd3d.core.selection import SelectionManager
+    from blackbyrd3d.ui.viewport import Viewport
+    vp = Viewport(scene, SelectionManager(scene))
+    ctx.viewport = vp
+
+    def go(name):                    # the view is turned to, so let it arrive
+        proc.run(name)
+        vp.land_flight()
+
+    go("back")
+    assert vp.camera.azimuth == pytest.approx(math.radians(90))
+    go("left")
+    assert vp.camera.azimuth == pytest.approx(math.radians(180))
+    go("bottom")
+    assert vp.camera.elevation == pytest.approx(math.radians(-89.9))
+
+
+def test_orient_two_points(env):
+    scene, sel, hist, ctx, proc = env
+    import math
+    box = scene.add(g.make_box((0, 0, 0), 4, 2, 1))
+    proc.run("orient")
+    proc.click_object(box.id)
+    proc.finish_selection()
+    proc.provide_text("0,0,0")           # ref 1
+    proc.provide_text("4,0,0")           # ref 2 (along +X)
+    proc.provide_text("10,0,0")          # target 1
+    proc.provide_text("10,4,0")          # target 2 (along +Y): 90deg turn
+    assert not proc.busy
+    mn, mx = g.bbox(scene.all()[0].shape)
+    assert mn[0] == pytest.approx(8, abs=1e-5)
+    assert mx[0] == pytest.approx(10, abs=1e-5)
+    assert mn[1] == pytest.approx(0, abs=1e-5)
+    assert mx[1] == pytest.approx(4, abs=1e-5)
+    assert g.volume(scene.all()[0].shape) == pytest.approx(8)
+
+    # Scale=Yes stretches to the target spacing (uniform)
+    sel.clear()
+    box2 = scene.add(g.make_box((0, 0, 0), 4, 2, 1))
+    proc.run("orient")
+    proc.click_object(box2.id)
+    proc.finish_selection()
+    proc.provide_text("0,0,0")
+    proc.provide_text("4,0,0")
+    proc.provide_text("Scale=Yes")
+    proc.provide_text("20,0,0")
+    proc.provide_text("28,0,0")          # 8 units: scale factor 2
+    assert g.volume(scene.all()[-1].shape) == pytest.approx(8 * 8)
+
+
+def test_orient3pt_flips_onto_wall(env):
+    scene, sel, hist, ctx, proc = env
+    box = scene.add(g.make_box((0, 0, 0), 4, 2, 1))
+    proc.run("orient3pt")
+    proc.click_object(box.id)
+    proc.finish_selection()
+    # reference frame on the floor (XY), target frame on the XZ wall
+    for p in ("0,0,0", "1,0,0", "0,1,0",
+              "0,0,0", "1,0,0", "0,0,1"):
+        proc.provide_text(p)
+    assert not proc.busy
+    mn, mx = g.bbox(scene.all()[0].shape)
+    assert mx[2] == pytest.approx(2)     # old Y extent now points up Z
+    assert mx[1] - mn[1] == pytest.approx(1, abs=1e-6)
+    assert g.volume(scene.all()[0].shape) == pytest.approx(8)
+
+
+def test_closecrv(env):
+    scene, sel, hist, ctx, proc = env
+    arc = scene.add(g.make_arc_3pt((0, 0, 0), (5, 5, 0), (10, 0, 0)))
+    proc.run("closecrv")
+    proc.click_object(arc.id)
+    proc.finish_selection()
+    assert g.is_closed_curve(scene.all()[0].shape)
+    # a closed curve reports the problem instead of failing
+    proc.run("closecrv")
+    proc.click_object(arc.id)
+    proc.finish_selection()
+    assert not proc.busy
+
+
+@pytest.mark.parametrize("origin, normal, first_depth, second_depth", [
+    ((0, 0, 0), (0, 0, 1), 0, 0),
+    ((0, 0, 0), (0, 0, 1), 5, 5),
+    ((0, 0, 0), (0, 0, 1), -7, -7),
+    ((0, 0, 0), (0, 0, 1), 5, 12),
+    ((3, -5, 11), (0, 0, 1), 4, 9),
+    ((3, -5, 11), (0, 1, 1), 4, 9),
+])
+@pytest.mark.parametrize("flip", [False, True])
+def test_clipping_plane_keeps_the_first_corners_depth(
+        env, origin, normal, first_depth, second_depth, flip):
+    from blackbyrd3d.core.cplane import CPlane
+    from tests.conftest import StubViewport
+
+    scene, sel, hist, ctx, proc = env
+    cp = CPlane(origin=origin, normal=normal)
+    ctx.viewport = StubViewport("model")
+    ctx.viewport.cplane = cp
+    first = cp.to_world(-2, -3, first_depth)
+    second = cp.to_world(10, 11, second_depth)
+    second_text = ",".join(map(str, second))
+    expected_center = cp.to_world(4, 4, first_depth)
+
+    proc.run("clippingplane")
+    proc.provide_text(",".join(map(str, first)))
+    preview = proc.preview_shape(second_text)
+    assert preview is not None
+    assert g.centroid(preview) == pytest.approx(expected_center)
+    assert proc.busy and not scene.all()
+
+    proc.provide_text(f"Flip={'Yes' if flip else 'No'}")
+    proc.provide_text(second_text)
+    assert not proc.busy
+    plane, = scene.all()
+    assert plane.clip_plane == {"enabled": True}
+    assert g.centroid(plane.shape) == pytest.approx(expected_center)
+    face = next(iter(g.faces_of(plane.shape)))
+    expected_normal = tuple((-1 if flip else 1) * n for n in cp.normal)
+    assert g.face_normal(face) == pytest.approx(expected_normal)
+
+
+def test_clipping_plane_lifecycle(env, tmp_path):
+    scene, sel, hist, ctx, proc = env
+    from blackbyrd3d import fileio
+    from tests.conftest import StubViewport
+    ctx.viewport = StubViewport("model")
+    scene.add(g.make_box((0, 0, 0), 10, 10, 10))
+    proc.run("clippingplane")
+    proc.provide_text("-2,-2,5")
+    proc.provide_text("12,12,5")
+    plane = scene.all()[-1]
+    assert plane.clip_plane == {"enabled": True}
+    assert plane.name.startswith("Clipping Plane")
+    assert g.centroid(plane.shape)[2] == pytest.approx(5)
+
+    proc.run("disableclippingplane all")
+    assert scene.get(plane.id).clip_plane == {"enabled": False}
+    proc.run("enableclippingplane all")
+    assert scene.get(plane.id).clip_plane == {"enabled": True}
+    proc.run("selclippingplane")
+    assert sel.ids == [plane.id]
+
+    path = str(tmp_path / "clip.byrd")
+    fileio.export_file(scene, path)
+    from blackbyrd3d.core.scene import Scene
+    loaded = Scene()
+    fileio.import_file(loaded, path)
+    planes = [o for o in loaded.all() if o.clip_plane]
+    assert len(planes) == 1 and planes[0].clip_plane["enabled"]
+    assert g.centroid(planes[0].shape)[2] == pytest.approx(5)
+
+
+def test_selection_filter(env):
+    scene, sel, hist, ctx, proc = env
+    scene.add(g.make_circle((0, 0, 0), 5))
+    scene.add(g.make_box((0, 0, 0), 2, 2, 2))
+    proc.run("selfilter curves")
+    assert sel.filter_active and sel.filter_kinds == {"curve"}
+    assert sel.filter_allows("curve") and not sel.filter_allows("solid")
+    proc.run("selfiltertoggle")
+    assert not sel.filter_active and sel.filter_allows("solid")
+    proc.run("selfiltertoggle")          # resumes with the same kind
+    assert sel.filter_active
+    proc.run("selfilter off")
+    assert not sel.filter_active
+
+
+def test_clip_vectors_derived_from_plane_object(env):
+    import numpy as np
+    from blackbyrd3d.core.scene import Scene
+    from blackbyrd3d.core.selection import SelectionManager
+    from blackbyrd3d.ui.viewport import Viewport
+    scene = Scene()
+    vp = Viewport(scene, SelectionManager(scene))
+    face = g.planar_face(g.make_rectangle((0, 0, 5), (10, 10, 5)))
+    obj = scene.add(face)
+    scene.update(obj.id, clip_plane={"enabled": True})
+    vecs = vp._clip_vectors()
+    assert len(vecs) == 1
+    v = vecs[0]
+    # plane z=5, normal +Z: keeps below (distance >= 0 for z < 5)
+    assert np.dot(v, [0, 0, 0, 1]) > 0       # origin kept
+    assert np.dot(v, [0, 0, 10, 1]) < 0      # above the plane clipped
+    scene.update(obj.id, clip_plane={"enabled": False})
+    assert vp._clip_vectors() == []
+
+
+def test_scale_by_reference_points(env):
+    """Rhino workflow: base point, grab a reference, drag to resize."""
+    import math
+    scene, sel, hist, ctx, proc = env
+    box = scene.add(g.make_box((0, 0, 0), 2, 2, 2))
+    proc.run("scale")
+    proc.click_object(box.id)
+    proc.finish_selection()
+    proc.provide_text("0,0,0")           # base
+    proc.provide_text("4,0,0")           # reference where it is now
+    ghost = proc.preview_for((8.0, 0.0, 0.0))   # dragging: factor 2
+    assert g.volume(ghost) == pytest.approx(64)
+    ghost = proc.preview_for(3.0)               # typed factor previews too
+    assert g.volume(ghost) == pytest.approx(8 * 27)
+    proc.provide_text("8,0,0")           # commit at factor 2
+    assert not proc.busy
+    assert g.volume(scene.all()[0].shape) == pytest.approx(64)
+
+
+def test_rotate_by_reference_direction(env):
+    scene, sel, hist, ctx, proc = env
+    box = scene.add(g.make_box((1, 0, 0), 1, 1, 1))
+    proc.run("rotate")
+    proc.click_object(box.id)
+    proc.finish_selection()
+    proc.provide_text("0,0,0")           # center
+    proc.provide_text("1,0,0")           # reference direction +X
+    ghost = proc.preview_for((0.0, 1.0, 0.0))   # dragged to +Y
+    assert g.bbox(ghost)[1][1] == pytest.approx(2, abs=1e-6)
+    proc.provide_text("0,1,0")           # commit 90 degrees
+    assert not proc.busy
+    assert g.bbox(scene.all()[0].shape)[1][1] == pytest.approx(2, abs=1e-6)
+
+
+def test_move_and_mirror_previews(env):
+    scene, sel, hist, ctx, proc = env
+    box = scene.add(g.make_box((0, 0, 0), 2, 2, 2))
+    proc.run("move")
+    proc.click_object(box.id)
+    proc.finish_selection()
+    proc.provide_text("0,0,0")
+    ghost = proc.preview_for((10.0, 0.0, 0.0))
+    assert g.bbox(ghost)[0][0] == pytest.approx(10)
+    proc.provide_text("10,0,0")
+    assert not proc.busy
+
+    proc.run("mirror")
+    proc.click_object(box.id)
+    proc.finish_selection()
+    proc.provide_text("0,0,0")
+    ghost = proc.preview_for((0.0, 10.0, 0.0))   # mirror across Y axis
+    assert g.bbox(ghost)[0][0] == pytest.approx(-12)
+    proc.cancel()
+
+
+def test_extrude_click_distance(env):
+    scene, sel, hist, ctx, proc = env
+    import math
+    c = scene.add(g.make_circle((5, 5, 0), 3))
+    proc.run("extrude")
+    proc.click_object(c.id)
+    proc.finish_selection()
+    req = proc.request
+    assert req.axis_lock is not None            # height is clickable
+    ghost = proc.preview_for((5.0, 5.0, 7.0))   # dragged up 7
+    assert g.bbox(ghost)[1][2] == pytest.approx(7, abs=1e-6)
+    proc.provide_text("7")                      # typed still works
+    assert not proc.busy
+    solid = scene.all()[-1]
+    assert g.volume(solid.shape) == pytest.approx(math.pi * 9 * 7, rel=1e-3)
+
+
+def test_array_previews(env):
+    scene, sel, hist, ctx, proc = env
+    box = scene.add(g.make_box((0, 0, 0), 2, 2, 2))
+    proc.run("arraypolar")
+    proc.click_object(box.id)
+    proc.finish_selection()
+    proc.provide_text("20,0,0")
+    assert proc.preview_for(8) is not None      # count ghost
+    proc.provide_text("6")
+    assert proc.preview_for(180.0) is not None  # fill-angle ghost
+    proc.cancel()
+
+
+# -- aliases, which are first come first served nowhere --
+
+def test_no_two_commands_claim_the_same_alias():
+    """Registration is last one wins, silently. `isocurves` taking `iso`
+    is how `isometric` stopped setting an isometric view, and nothing said
+    so until someone typed it."""
+    from collections import defaultdict
+
+    from blackbyrd3d.commands.base import _REGISTRY
+
+    claimed = defaultdict(list)
+    for cd in _REGISTRY.values():
+        for alias in cd.aliases:
+            claimed[alias.lower()].append(cd.name)
+
+    clashes = {a: names for a, names in claimed.items() if len(names) > 1}
+    assert clashes == {}, f"aliases claimed twice: {clashes}"
+
+
+def test_an_alias_is_not_also_a_command_name():
+    from blackbyrd3d.commands.base import _ALIASES, _REGISTRY
+
+    shadowed = {a: t for a, t in _ALIASES.items()
+                if a in _REGISTRY and _REGISTRY[a].name != t}
+    assert shadowed == {}, f"aliases hiding real commands: {shadowed}"
+
+
+def test_iso_still_sets_an_isometric_view():
+    assert resolve("iso").name == "isometric"

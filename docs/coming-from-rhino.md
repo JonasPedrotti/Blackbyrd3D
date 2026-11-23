@@ -1,0 +1,120 @@
+# Coming from Rhino
+
+If you know Rhino, you'll feel at home — same command-line workflow, same
+aliases, same object snaps, and it imports your Rhino shortcuts. Not every
+command is here yet, but the ones that are work the way you'd expect. This
+page maps your habits over and is honest about the gaps.
+
+## What's the same
+
+- **The command line.** Type a command, answer its prompts, click points or
+  type coordinates (`10,5,0`, relative `@5,0,0`, polar `10<45`). ++tab++
+  completes, ++enter++ or ++space++ repeats the last command, and
+  ++space++ is Enter everywhere it is in Rhino.
+- **The mouse.** Right-drag orbits, ++shift++ pans, ++ctrl++ zooms, and a
+  right-click is Enter.
+- **Aliases.** `l`, `pl`, `c`, `m`, `co`, `mi`, `o`, `f`, … work as you'd
+  expect, and you can import your own (below).
+- **Command options.** The words in a prompt's parentheses are choices, as
+  in Rhino: `arc` offers _Center_ and _StartEnd_, `circle` offers _2Point_,
+  _3Point_ and _Diameter_, `rectangle` _Center_ and _3Point_, `line`
+  _BothSides_, `box` _Center_, `sphere` _2Point_. Type the word (a prefix
+  is enough) or click its chip beside the command line.
+- **Object snaps** — end, mid, cen, quad, int, perp, near — on a persistent
+  osnap bar, plus a construction plane (`cplane`). **Project** is there
+  too, with a height of its own beside it instead of always the CPlane.
+- **++tab++ direction lock.** Aim, press ++tab++ to freeze that direction,
+  type the distance. Object snaps keep working while it's held. The lock
+  releases on ++tab++ again or at the next point.
+- **++ctrl++-click elevator.** Click a point on the construction plane with
+  ++ctrl++ held to stand a vertical up from it, then set the height with the
+  mouse or by typing it — the way you place a point off the CPlane in Rhino.
+- **Maximised viewports.** ++ctrl+m++, or a double-click on a viewport's
+  title, gives the pane you're in the whole window and puts your layout back
+  on the second press. `max` does it from the command line.
+- **The gumball** for move / rotate / scale, with numeric entry and Alt-drag
+  copy; ++ctrl+shift++-click faces and edges for push/pull and fillets.
+  `GumballAlignment`, or the small tag beside the gumball, chooses CPlane,
+  Object, World or View. Object follows a line, a planar curve or surface,
+  text, a hatch or a picture; solids and selections of several objects use
+  the CPlane. View follows the current viewport's view plane.
+- **Layers**, display modes (`wireframe` / `shaded` / `ghosted` / `rendered`
+  / `technical`), and **linetypes** per layer or object.
+- **Surface isocurves and edges are yours to switch off**, as they are in
+  Rhino's display mode settings. Each mode starts where you'd expect
+  (rendered has isocurves off), and the **Display** panel, beside Properties
+  and Layers, overrides that for the pane you're in. `isocurves` and
+  `surfaceedges` do the same from the command line.
+- **Two-space drafting** — model space plus paper-space **layouts** with
+  detail views, associative dimensions and hidden-line output. See
+  [Make a drawing sheet](howto/drawings.md).
+- **Interchange** — reads and writes `.3dm` for Rhino 5–8 (curves stay exact
+  NURBS; surfaces write as meshes — use STEP for an exact surface round
+  trip), STEP, and more. See [File formats](reference/file-formats.md).
+- **Attribute User Text** comes in with a `.3dm` and goes back out with
+  it. Properties lists an object's keys and values under **User text**,
+  where you add, rename and remove them as in Rhino's panel, and
+  `setusertext` / `getusertext` work as Rhino's SetUserText and
+  GetUserText do.
+
+## Bring your Rhino settings over
+
+In Rhino, export your aliases (_Options → Aliases → Export_) to a text file,
+then in Blackbyrd3D:
+
+- **Settings → Aliases** → import that file. Known Rhino commands are mapped
+  to their Blackbyrd equivalents automatically; simple macros
+  (`'_Zoom _Extents`, `-Osnap _Mid _Toggle`) are translated too.
+- **Settings → Keyboard** → import a keybindings list (`F5 zoomextents` per
+  line, or JSON) and bind any key to any command.
+
+## Command map (a sample)
+
+Most Rhino command names and aliases resolve directly. A few worth knowing:
+
+| Rhino                                                     | Blackbyrd3D                                                             |
+| --------------------------------------------------------- | ----------------------------------------------------------------------- |
+| `Line` `Polyline` `Curve` `InterpCrv`                     | `line` `polyline` `curve` `interpcrv`                                   |
+| `Circle` `Arc` `Rectangle`                                | `circle` `arc` `rectangle`                                              |
+| `InsertKnot` `RemoveKnot` `InsertControlPoint`            | `insertknot` `removeknot` `insertcontrolpoint`                          |
+| `Dir` `Flip`                                              | `dir` `flip`                                                            |
+| `ExtrudeCrv` `Revolve` `Loft` `Sweep1/2`                  | `extrude` `revolve` `loft` `sweep1` `sweep2`                            |
+| `FilletEdge` `ChamferEdge` `Shell`                        | `filletedge` `chamferedge` `shell`                                      |
+| `BooleanUnion / Difference / Intersection` `CurveBoolean` | `booleanunion` `booleandifference` `booleanintersection` `curveboolean` |
+| `Move` `Copy` `Rotate` `Scale` `Mirror` `Array`           | `move` `copy` `rotate` `scale` `mirror` `array`                         |
+| `Trim` `Split` `Join` `Explode` `Offset`                  | `trim` `split` `join` `offset`                                          |
+| `Layout` `Detail` `Make2D` `Dim`                          | `layout` `detail` `make2d` `dim`                                        |
+| `Zebra` `CurvatureAnalysis` `DraftAngleAnalysis`          | `zebra` `curvature` `draftanalysis`                                     |
+| `UndoView` `RedoView` `LockOther`                         | `undoview` `redoview` `lockother`                                       |
+
+The in-app `help` (or ++f1++) opens a searchable
+[command reference](reference/commands.md) with every command and its aliases.
+
+## What's different
+
+- **Units** default to millimetres; set them with `units` (mm/cm/m/in/**feet
+  & inches**), with an optional model rescale.
+- A **right-click** in the viewport is Enter — it runs what you've typed or
+  repeats the last command.
+- **AI-native**: an [MCP server and in-app assistant](howto/ai-mcp.md) can see
+  the viewport and run every command — Rhino has nothing equivalent built in.
+- **Headless**: the whole engine [scripts and batches](howto/scripting.md)
+  without a GUI.
+
+## Not here yet
+
+Blackbyrd3D is a young, focused modeller — it does direct NURBS/BREP
+modelling and drafting well, but it is **not** a full Rhino replacement.
+Notably absent today:
+
+- The long tail of **specialist commands**: might come over time if requested
+- **SubD** modelling: Unlikely to be integrated any time soon.
+- A production **render engine**: also unlikely to be cooming any time soon.
+- The third-party plugin ecosystem: Unlikely to be happening
+
+If a command you rely on is missing, ask for it on
+[GitHub](https://github.com/JonasPedrotti/Blackbyrd3D).
+
+---
+
+**Next:** [Install](getstarted/install.md) → [your first model](getstarted/first-model.md).

@@ -1,0 +1,857 @@
+"""Scene graph: object storage, naming, visibility, change notification.
+
+Core is Qt-free; UI subscribes via plain callables.
+"""
+
+from __future__ import annotations
+
+import itertools
+import threading
+import uuid
+from contextlib import contextmanager
+from dataclasses import dataclass, field, replace
+
+import numpy as np
+
+from . import geometry
+from .deferred import DeferredShape
+from .layers import (DEFAULT_CUT_LINE_WIDTH,
+                     HATCH_BACKGROUND_NONE, HATCH_INK, LayerManager,
+                     hatch_token_rgb, screen_width_for)
+from .layout import SectionFill
+from .tessellate import DisplayMesh, tessellate
+
+
+def _rebuild_record(rec: dict, shapes: list):
+    op = rec["op"]
+    p = rec.get("params", {})
+    if op == "loft":
+        return geometry.loft(shapes, ruled=bool(p.get("ruled")))
+    if op == "extrude":
+        if "result_index" in p:
+            results = geometry.extrude_profiles(
+                shapes, tuple(p["direction"]), float(p["dist"]),
+                cap=bool(p.get("cap")))
+            return results[int(p["result_index"])]
+        return geometry.extrude(shapes[0], tuple(p["direction"]),
+                                float(p["dist"]), cap=bool(p.get("cap")))
+    if op == "revolve":
+        return geometry.revolve(shapes[0], tuple(p["origin"]),
+                                tuple(p["axis"]), float(p["angle"]))
+    raise ValueError(f"Unknown history op '{op}'")
+
+
+_TESS_GUARD = threading.Lock()
+_TESS_LOCKS: dict[int, tuple] = {}      # id(shape) -> (shape, Lock)
+
+
+def _tess_lock(shape) -> threading.Lock:
+    with _TESS_GUARD:
+        ent = _TESS_LOCKS.get(id(shape))
+        if ent is None or ent[0] is not shape:
+            ent = (shape, threading.Lock())
+            _TESS_LOCKS[id(shape)] = ent
+        if len(_TESS_LOCKS) > 1024:     # bound the registry
+            for k in list(_TESS_LOCKS)[:512]:
+                if not _TESS_LOCKS[k][1].locked():
+                    del _TESS_LOCKS[k]
+        return ent[1]
+
+
+# Between the groups an object sits in, in its group_id: a character no
+# name or id has, so a file that knows only flat groups reads the whole
+# path as one group, which is what a click on it selects anyway.
+GROUP_SEP = ""
+
+
+def group_chain(group_id: str | None) -> list[str]:
+    """The groups an object sits in, outermost first."""
+    return group_id.split(GROUP_SEP) if group_id else []
+
+
+def outer_group(group_id: str | None) -> str | None:
+    """The outermost group: the one a click selects all of."""
+    return group_id.split(GROUP_SEP, 1)[0] if group_id else None
+
+
+def grouped_in(outer: str, group_id: str | None) -> str:
+    """An object's groups with one more round them all."""
+    return outer + GROUP_SEP + group_id if group_id else outer
+
+
+def ungrouped_once(group_id: str | None) -> str | None:
+    """The groups left once the outermost is ended: the next one in, or
+    none."""
+    chain = group_chain(group_id)
+    return GROUP_SEP.join(chain[1:]) or None
+
+
+@dataclass
+class SceneObject:
+    id: str
+    name: str
+    # A TopoDS_Shape, or a DeferredShape standing in for one that has been
+    # read but not converted. Read it through `shape`, which converts what
+    # it finds; the underscore is here so that property can exist at all.
+    _shape: object
+    kind: str          # curve | surface | solid | point | compound | mesh | pointcloud
+    layer_id: str
+    visible: bool = True
+    locked: bool = False               # visible but unselectable
+    # objects sharing an id select together; a group inside another is the
+    # groups it sits in, outermost first, joined by GROUP_SEP
+    group_id: str | None = None
+    block_id: str | None = None        # instance of a block definition
+    color: tuple[float, float, float] | None = None   # None -> layer color
+    # {"metallic","roughness","opacity"} and optionally "color", which only
+    # rendered mode reads — see Scene.render_color_of
+    material: dict | None = None
+    clip_plane: dict | None = None     # {"enabled": bool}: sections the view
+    annotation: dict | None = None     # {"text": str}: model-space dot label
+    linetype: str = "ByLayer"          # dash style; ByLayer -> use the layer's
+    print_width: float | None = None   # plotted mm; None -> the layer's
+    # its own section hatch, {"pattern", "angle", "spacing", "color"} as
+    # layers.section_fill_dict makes it; None -> the layer's
+    section_fill: dict | None = None
+    # a hatch's own colour and background, {"color", "background"} as
+    # tokens; a key left out, or None, takes the layer's (#91)
+    hatch_style: dict | None = None
+    draw_order: int = 0                # higher draws on top (breaks depth ties)
+    # {key: value}, Rhino's Attribute User Text, kept by its rules: see
+    # core/user_text.py, and never edit it in place
+    user_text: dict | None = None
+    _mesh: DisplayMesh | None = field(default=None, repr=False, compare=False)
+    _bounds: tuple | None = field(default=None, repr=False, compare=False)
+    # The scene holding this object, so a bare `.shape` read on something
+    # deferred can go through `Scene.realise` and get the whole job — an
+    # object that converts to nothing removed, one that converts to two
+    # given its sibling — rather than only the shape.
+    _scene: object = field(default=None, repr=False, compare=False)
+
+    @property
+    def shape(self):
+        """This object's geometry, converting it first if it has not been.
+
+        Every reader goes through here, which is the point: there is no
+        call site left that can be handed a placeholder by mistake.
+        """
+        held = self._shape
+        if isinstance(held, DeferredShape):
+            scene = self._scene
+            if scene is not None:
+                scene.realise(self.id)
+            else:
+                shapes = held.shapes()
+                self._shape = shapes[0] if shapes else None
+            held = self._shape
+        return held
+
+    @shape.setter
+    def shape(self, value):
+        self._shape = value
+
+    @property
+    def shape_ready(self) -> bool:
+        """Whether the geometry exists, as opposed to a promise of it.
+
+        Asking does not convert anything, which is what makes it usable in
+        the places that must not: the sync key, the tests above it.
+        """
+        return not isinstance(self._shape, DeferredShape)
+
+    def bbox(self) -> tuple[tuple, tuple]:
+        """This object's world bounding box, worked out at most once.
+
+        Measuring a B-rep walks the whole shape and a mesh reads every
+        vertex — about 100us an object, which is nothing until something
+        asks for all of them every frame. The gumball does exactly that,
+        and on the cave file it cost 747 ms of every frame you orbited
+        with the drawing selected.
+
+        Keyed on the shape it measured rather than cleared by hand:
+        geometry is changed here by swapping the shape for a new one, so
+        the answer expires by itself and there is no invalidation to
+        forget at a call site.
+        """
+        shape = self.shape
+        if shape is None:
+            return ((0.0, 0.0, 0.0), (0.0, 0.0, 0.0))
+        cached = self._bounds
+        if cached is not None and cached[0] is shape:
+            return cached[1]
+        box = geometry.bbox(shape)
+        self._bounds = (shape, box)
+        return box
+
+    @property
+    def mesh(self) -> DisplayMesh:
+        # None is what a deferred object that converted to nothing is left
+        # holding. The scene drops it, but whoever was already iterating
+        # still has it and will ask; an empty mesh draws nothing, which is
+        # the right picture, where the kernel would raise on the way there.
+        shape = self.shape
+        if shape is None:
+            return DisplayMesh()
+        if self._mesh is None:
+            with _tess_lock(shape):
+                if self._mesh is None:
+                    self._mesh = tessellate(shape)
+        return self._mesh
+
+    @property
+    def mesh_ready(self) -> bool:
+        return self._mesh is not None
+
+    def clone(self) -> "SceneObject":
+        if self.kind == "picture":
+            return replace(self, _shape=self.shape.copy())
+        return replace(self)
+
+
+class Scene:
+    def __init__(self):
+        self.objects: dict[str, SceneObject] = {}
+        self._order: list[str] = []
+        self.layers = LayerManager()
+        self.layers.on_shown = self.realise_layer
+        self._counters = {}
+        self._listeners: list = []
+        self._batch_depth = 0           # see batched()
+        self._batched_kinds: set[str] = set()
+        self.revision = 0               # bumped on every change notification
+        self.named_views: dict = {}     # name -> camera params
+        from .view_settings import ViewSettings
+        # How each model pane looks and where it looks from, kept in the
+        # file but outside undo, as a view change is.
+        self.view_settings = ViewSettings()
+        # Called by a save before it writes, by a window keeping its panes'
+        # cameras and looks in `view_settings`.
+        self.before_save = None
+        # Objects showing their control points. Kept here rather than on a
+        # viewport because points on is something the drawing is doing: turn
+        # a curve's points on in the Top view and its corners are there to
+        # pick in the Right view too. See Viewport.cv_enabled.
+        self.cv_enabled: set[str] = set()
+        # The ones of those showing only because they are selected: they go
+        # again when the selection lets go of them. PointsOn keeps a curve.
+        self.cv_auto: set[str] = set()
+        # Objects showing direction arrows, for the same reason and for as
+        # long as `dir` runs. Which way a curve runs is a fact about the
+        # drawing, not about the pane you happened to ask in.
+        self.dir_enabled: set[str] = set()
+        self.layouts: list = []         # drafting sheets (core/layout.py)
+        self.sheet_groups: list = []    # SheetGroups the sheets sit in
+        self.units: str = "mm"          # document units (utils/units.py)
+        self.block_defs: dict = {}      # id -> {"name", "shapes": [TopoDS]}
+        self.annot_styles: dict = {}    # name -> text/dim style overrides
+        # the built-in styles the sheets are lettered in, "metric" or
+        # "inch"; None for the ones the units give (layout.style_set)
+        self.annot_style_set: str | None = None
+        # what a text height on a sheet measures: "capitals", as drafting
+        # measures it, or "em", the font's size, in a drawing saved before
+        # that (layout.letters_capitals)
+        self.text_height_measures: str = "capitals"
+        # name -> HatchPattern, the patterns loaded from .pat files (#92)
+        self.hatch_patterns: dict = {}
+        # the names the last load gave, a fresh list each time; not saved
+        self.loaded_patterns: list = []
+        # Objects temporarily offered by a hidden-object pick. This is not
+        # an edit: no object's visibility changes and nothing is saved.
+        self.showing_only: frozenset[str] | None = None
+        self.record_history = False     # new surfaces remember their inputs
+        self.history_records: list = []   # {"op", "inputs", "output", ...}
+        self._regen_active = False
+        # What a scan session's .byrd carries beside its point clouds
+        # (protocol/SERP-SESSION-RECORD.md): camera trajectories, one dict
+        # per stream, and the session record. Held as the plain dicts the
+        # file gave, so a save writes them back unchanged; nothing here
+        # draws or edits them yet.
+        self.trajectories: list = []
+        self.session: dict | None = None
+
+    # -- notification --
+    @property
+    def image_planes(self):
+        """Legacy file representation; pictures themselves are scene objects."""
+        return [obj.shape.plane for obj in self.all() if obj.kind == "picture"]
+
+    @image_planes.setter
+    def image_planes(self, planes):
+        from .picture import PictureShape
+        for obj in list(self.all()):
+            if obj.kind == "picture":
+                self.remove(obj.id)
+        for plane in planes:
+            self.add(PictureShape(plane), name=plane.get("name"))
+
+    def add_listener(self, fn, kinds: tuple | None = None):
+        """Subscribe; kinds limits calls to those change categories
+        ("objects", "layers", "layouts") — "all" changes always fire."""
+        self._listeners.append((fn, frozenset(kinds) if kinds else None))
+
+    @contextmanager
+    def batched(self):
+        """Hold the notifications until the whole change is made.
+
+        Listeners answer a change by reading the scene, and two of them read
+        all of it — the layers panel rebuilds its tree and counts objects per
+        layer, the status bar counts objects. One notification per object
+        added therefore makes bulk work cost objects squared: 0.08 ms an
+        object into an empty scene, 0.71 ms into one already holding 4000,
+        about 4.7 seconds of opening the 522 MB cave file.
+
+        Nobody wants the states in between. What comes out is the finished
+        scene, once, and still sorted by kind so a listener that only asked
+        about layouts is not woken by objects arriving.
+
+        Notifications go out even if the body raises: a half-read file still
+        changed the scene, and a panel showing what was there before is worse
+        than one showing the half. `revision` still moves inside the batch,
+        so a cache rebuilt part-way through can tell the scene shifted.
+        """
+        self._batch_depth += 1
+        try:
+            yield self
+        finally:
+            self._batch_depth -= 1
+            if not self._batch_depth and self._batched_kinds:
+                kinds, self._batched_kinds = self._batched_kinds, set()
+                if "all" in kinds:
+                    self._fire("all")       # already reaches everyone
+                else:
+                    for kind in sorted(kinds):
+                        self._fire(kind)
+
+    def notify(self, kind: str = "all"):
+        self.revision += 1
+        if self._batch_depth:
+            self._batched_kinds.add(kind)
+            return
+        self._fire(kind)
+
+    def _fire(self, kind: str):
+        for fn, kinds in self._listeners:
+            if kinds is None or kind == "all" or kind in kinds:
+                fn()
+
+    # -- object management --
+    def _auto_name(self, kind: str) -> str:
+        n = self._counters.get(kind, 0) + 1
+        self._counters[kind] = n
+        return f"{kind.capitalize()} {n:02d}"
+
+    def add(self, shape, name: str | None = None,
+            layer_id: str | None = None,
+            obj_id: str | None = None) -> SceneObject:
+        """`obj_id` keeps the id an object was saved under, for what refers
+        to it by id across a save and an open (a Wyrm graph does); taken
+        already, the object gets a new one."""
+        # A DeferredShape is geometry the file described and nothing has
+        # converted. It answers for its own kind, because working the kind
+        # out from the shape is exactly the conversion being put off.
+        kind = (shape.kind if isinstance(shape, DeferredShape)
+                else geometry.shape_kind(shape))
+        if not obj_id or obj_id in self.objects:
+            obj_id = uuid.uuid4().hex[:8]
+        obj = SceneObject(
+            id=obj_id,
+            name=name or self._auto_name(kind),
+            _shape=shape,
+            kind=kind,
+            layer_id=layer_id or self.layers.current_id,
+            _scene=self,
+        )
+        self.objects[obj.id] = obj
+        self._order.append(obj.id)
+        self.notify("objects")
+        return obj
+
+    def add_from(self, shape, like: SceneObject) -> SceneObject:
+        """Add a shape carrying over another object's display attributes
+        (layer, colour, material, annotation, group) and its user text."""
+        obj = self.add(shape, layer_id=like.layer_id)
+        fields = {}
+        if like.color is not None:
+            fields["color"] = like.color
+        if like.material:
+            fields["material"] = dict(like.material)
+        if like.annotation:
+            fields["annotation"] = dict(like.annotation)
+        if like.group_id:
+            fields["group_id"] = like.group_id
+        if like.print_width is not None:
+            fields["print_width"] = like.print_width
+        if like.section_fill:
+            fields["section_fill"] = dict(like.section_fill)
+        if like.hatch_style:
+            fields["hatch_style"] = dict(like.hatch_style)
+        if like.user_text:
+            fields["user_text"] = dict(like.user_text)
+        if fields:
+            obj = self.update(obj.id, **fields)
+        return obj
+
+    # -- converting what was only read (see core/deferred.py) --
+
+    def realise(self, obj_id: str) -> SceneObject | None:
+        """Convert an object's deferred geometry, now.
+
+        One Rhino object is usually one shape, but not always, and the two
+        exceptions are why this is the scene's job rather than the object's.
+        Roughly a sixth of the hidden objects in a real survey file convert
+        to nothing at all, and an eager import made no object for those, so
+        neither can this one. A few convert to two — a sewn brep and the
+        mesh fallback for the faces that would not sew — and eager import
+        made two objects, so this adds the sibling.
+
+        Returns the object, or None if the geometry turned out to be
+        nothing and it has been dropped.
+        """
+        obj = self.objects.get(obj_id)
+        if obj is None or obj.shape_ready:
+            return obj
+
+        held = obj._shape
+        shapes = held.shapes()
+        if not shapes:
+            # Emptied as well as dropped: something may still be holding
+            # this object, and a placeholder that has already been asked
+            # and answered nothing is worse to hand back than nothing.
+            obj._shape = None
+            self.remove(obj_id)
+            return None
+
+        obj._shape = shapes[0]
+        obj._mesh = None
+        # The file's word on the kind was a guess made without the geometry.
+        obj.kind = geometry.shape_kind(shapes[0])
+        for extra in shapes[1:]:
+            # with the original's colour and user text, as eager import
+            # gives both pieces the one object's attributes
+            self.add_from(extra, obj)
+        self.notify("objects")
+        return obj
+
+    def realise_layer(self, layer_id: str) -> int:
+        """Convert everything still deferred on a layer. Returns how many.
+
+        This is what a layer being switched back on calls: doing the whole
+        layer in one pass means the file behind it is opened once, and it
+        keeps the cost where the user can see they asked for it.
+        """
+        return self.realise_all(o.id for o in self.all()
+                                if o.layer_id == layer_id)
+
+    def realise_all(self, ids=None, progress=None) -> int:
+        """Convert everything still deferred among `ids` (all objects when
+        None), with one notification for the lot. Returns how many.
+        `progress(fraction)` hears how far it has got.
+
+        One at a time, each conversion tells every panel the scene changed,
+        and on a drawing with thousands of hidden objects that is the
+        layers panel recounting the whole scene thousands of times.
+        """
+        if ids is None:
+            ids = self._order
+        pending = [i for i in ids
+                   if i in self.objects and not self.objects[i].shape_ready]
+        if not pending:
+            return 0
+        with self.batched():
+            for n, obj_id in enumerate(pending):
+                if progress is not None:
+                    progress(n / len(pending))
+                self.realise(obj_id)
+        return len(pending)
+
+    def remove_layer(self, layer_id: str) -> list[str]:
+        """Delete a layer and the layers under it. Returns what went.
+
+        Whatever was drawn on any of them moves to the current layer first,
+        or the first one left when that is going too. The work is still the
+        user's, and an object pointing at a layer that is gone is a crash
+        on the next redraw.
+        """
+        going = {layer_id,
+                 *(la.id for la in self.layers.descendants(layer_id))}
+        if len(going) >= len(self.layers.all()):
+            raise ValueError("Cannot delete the only layer")
+        orphans = [o.id for o in self.all() if o.layer_id in going]
+        if orphans:
+            self.update_many(orphans, layer_id=self.layers.heir(going))
+        return self.layers.remove(layer_id)
+
+    def remove(self, obj_id: str):
+        if obj_id in self.objects:
+            del self.objects[obj_id]
+            self._order.remove(obj_id)
+            self.notify("objects")
+
+    def replace_shape(self, obj_id: str, shape) -> SceneObject:
+        """Swap an object's geometry (transform, boolean result, ...)."""
+        old = self.objects[obj_id]
+        new = replace(old, _shape=shape, kind=geometry.shape_kind(shape),
+                      _mesh=None)
+        self.objects[obj_id] = new
+        self._regenerate_dependents(obj_id)
+        self.notify("objects")
+        return new
+
+    def add_record(self, op: str, inputs: list, output: str, **params):
+        """Remember how an object was built (record history)."""
+        self.history_records.append({"op": op, "inputs": list(inputs),
+                                     "output": output, "params": params})
+
+    def _regenerate_dependents(self, changed_id: str):
+        """Rebuild recorded outputs whose inputs changed, transitively."""
+        if self._regen_active or not self.history_records:
+            return
+        self._regen_active = True
+        try:
+            queue = [changed_id]
+            seen = set()
+            while queue:
+                cid = queue.pop(0)
+                for rec in self.history_records:
+                    if cid not in rec["inputs"] or rec["output"] in seen:
+                        continue
+                    seen.add(rec["output"])
+                    old = self.objects.get(rec["output"])
+                    parents = [self.objects.get(i) for i in rec["inputs"]]
+                    if old is None or any(p is None for p in parents):
+                        continue
+                    try:
+                        shape = _rebuild_record(rec,
+                                                [p.shape for p in parents])
+                    except Exception:              # noqa: BLE001
+                        continue                   # keep the stale child
+                    self.objects[rec["output"]] = replace(
+                        old, _shape=shape, kind=geometry.shape_kind(shape),
+                        _mesh=None)
+                    queue.append(rec["output"])
+        finally:
+            self._regen_active = False
+
+    def update(self, obj_id: str, **fields) -> SceneObject:
+        was_visible = self.objects[obj_id].visible
+        new = replace(self.objects[obj_id], **fields)
+        self.objects[obj_id] = new
+        # Most of what a real drawing defers is hidden object by object on a
+        # layer that is switched on, so this is the trigger that does the
+        # work, not the layer one. Here rather than when the viewport gets
+        # round to it: converting can leave nothing and remove the object,
+        # and the middle of a draw is no place to discover that.
+        if new.visible and not was_visible and not new.shape_ready:
+            if self.realise(obj_id) is None:
+                return new
+        self.notify("objects")
+        return new
+
+    def update_many(self, ids, **fields) -> int:
+        """Change the same fields on every object in `ids`. Returns how many.
+
+        One notification for the lot, not one an object: hiding a thousand
+        objects is one change to the drawing and should cost the listeners
+        what hiding one does.
+        """
+        ids = list(ids)
+        with self.batched():
+            for obj_id in ids:
+                self.update(obj_id, **fields)
+        return len(ids)
+
+    def get_layout(self, layout_id: str):
+        """The sheet with this id, or None."""
+        return next((lay for lay in self.layouts if lay.id == layout_id),
+                    None)
+
+    def get(self, obj_id: str) -> SceneObject | None:
+        return self.objects.get(obj_id)
+
+    def find_by_name(self, name: str) -> SceneObject | None:
+        for obj in self.all():
+            if obj.name.lower() == name.lower():
+                return obj
+        return None
+
+    def all(self) -> list[SceneObject]:
+        return [self.objects[i] for i in self._order]
+
+    def visible_objects(self) -> list[SceneObject]:
+        """What is drawn, picked and snapped to, including a temporary pick.
+
+        Asked many times a frame, and a frame comes with every mouse move a
+        command makes. Walking each object's layer branch made that 70 ms on
+        a survey drawing of nine thousand objects, so a layer is asked once
+        and the answer is kept until the scene, a layer or a pick changes.
+        """
+        layers = self.layers
+        key = (self.revision, len(self._order), self.showing_only,
+               tuple((la.id, la.visible, la.parent) for la in layers.all()))
+        cached = getattr(self, "_visible_cache", None)
+        if cached is not None and cached[0] == key:
+            return list(cached[1])
+        # is_visible, not the layer's own switch: a layer under a parent
+        # that is off is off, whatever its own switch says.
+        shown = {}
+        out = []
+        for o in self.all():
+            if not self._in_sight(o):
+                continue
+            on = shown.get(o.layer_id)
+            if on is None:
+                on = shown[o.layer_id] = layers.is_visible(o.layer_id)
+            if on:
+                out.append(o)
+        self._visible_cache = (key, out)
+        return list(out)
+
+    def drawable_objects(self) -> list[SceneObject]:
+        """Keep buffers for visible objects while a pick offers hidden ones.
+
+        The visible objects step aside during the pick, but need no fresh
+        upload when it ends.
+        """
+        return [o for o in self.all()
+                if (o.visible or (self.showing_only is not None
+                                  and o.id in self.showing_only))
+                and self.layers.is_visible(o.layer_id)]
+
+    def _in_sight(self, obj: SceneObject) -> bool:
+        if self.showing_only is not None:
+            return obj.id in self.showing_only
+        return obj.visible
+
+    def selectable_objects(self) -> list[SceneObject]:
+        return [o for o in self.visible_objects()
+                if not o.locked and not self.layers.is_locked(o.layer_id)]
+
+    def is_selectable(self, obj_id: str) -> bool:
+        obj = self.get(obj_id)
+        return (obj is not None and self._in_sight(obj) and not obj.locked
+                and self.layers.is_visible(obj.layer_id)
+                and not self.layers.is_locked(obj.layer_id))
+
+    def expand_group_ids(self, ids: list[str]) -> list[str]:
+        """Grow a selection to whole groups, each the outermost one its
+        objects sit in, the groups inside it and all."""
+        groups = {outer_group(self.objects[i].group_id) for i in ids
+                  if i in self.objects and self.objects[i].group_id}
+        if not groups:
+            return list(ids)
+        out = list(ids)
+        for o in self.selectable_objects():
+            if outer_group(o.group_id) in groups and o.id not in out:
+                out.append(o.id)
+        return out
+
+    def color_of(self, obj: SceneObject) -> tuple[float, float, float]:
+        return obj.color or self.layers.get(obj.layer_id).color
+
+    def print_width_of(self, obj: SceneObject) -> float:
+        """The pen width, in mm, a plot draws this object with.
+
+        An object's own width if it has one, or else its layer's; 0 means
+        the device default, the same as Rhino's PlotWeight.
+        """
+        if obj.print_width is not None:
+            return obj.print_width
+        return self.layers.get(obj.layer_id).print_width
+
+    def screen_width_of(self, obj: SceneObject) -> float:
+        """The width an object's edges draw at on screen, in pixels.
+
+        An object with a print width of its own draws at that width the
+        way its layer would, unless the layer's screen width was set by
+        hand: then that holds for everything on the layer.
+        """
+        layer = self.layers.get(obj.layer_id)
+        if obj.print_width is None or layer.screen_pinned:
+            return layer.lineweight
+        return screen_width_for(obj.print_width)
+
+    def hatch_of(self, obj: SceneObject) -> str:
+        """The fill a cut through this object is drawn with ("none": none):
+        its own section hatch's, or else its layer's.
+
+        Taken off the layer, the way the print width is: what a thing is
+        made of belongs to the layer it is on, so a section through it
+        reads as concrete or as steel without anybody hatching it by hand.
+        One object can still be made of something else.
+        """
+        if obj.section_fill:
+            return obj.section_fill["pattern"]
+        return self.layers.get(obj.layer_id).hatch
+
+    def section_fill_of(self, obj: SceneObject):
+        """Everything a cut through this object is drawn with: the
+        pattern, its angle and spacing on the paper, and its colour, then
+        the width and colour of the line round it. A style of its own is
+        all of a piece, cut line and all, the way Rhino's is."""
+        layer = self.layers.get(obj.layer_id)
+        own = obj.section_fill
+        if own:
+            return SectionFill(
+                own["pattern"], own["angle"], own["spacing"],
+                hatch_token_rgb(own["color"], layer.color),
+                own.get("cut_line_width", DEFAULT_CUT_LINE_WIDTH),
+                hatch_token_rgb(own.get("cut_line_color", HATCH_INK),
+                                layer.color),
+                self.hatch_pattern(own["pattern"]),
+                hatch_token_rgb(own.get("background",
+                                        HATCH_BACKGROUND_NONE),
+                                layer.color))
+        return SectionFill(layer.hatch, layer.hatch_angle,
+                           layer.hatch_spacing,
+                           self.layers.hatch_rgb(layer.id),
+                           layer.cut_line_width,
+                           hatch_token_rgb(layer.cut_line_color, layer.color),
+                           self.hatch_pattern(layer.hatch),
+                           hatch_token_rgb(layer.hatch_background,
+                                           layer.color))
+
+    def hatch_look_of(self, obj: SceneObject) -> tuple:
+        """(colour, background) a hatch is drawn with, each (r, g, b) or
+        None: ink for the colour, nothing for the background. Its own, or
+        else its layer's, as a cut through its layer's material is."""
+        from .layers import hatch_background_token, hatch_color_token
+        layer = self.layers.get(obj.layer_id)
+        own = obj.hatch_style or {}
+        color = own.get("color") or layer.hatch_color
+        background = own.get("background") or layer.hatch_background
+        return (hatch_token_rgb(hatch_color_token(color), layer.color),
+                hatch_token_rgb(hatch_background_token(background),
+                                layer.color))
+
+    def hatch_pattern(self, name):
+        """The families a fill's name is drawn from in this drawing: one
+        of the app's patterns or one loaded from a file, or None for Lines,
+        Cross and Solid, which draw themselves, and for a name it has no
+        pattern by, which draws as lines."""
+        from .hatch_patterns import definition_for
+        return definition_for(self.hatch_patterns, name)
+
+    def hatch_pattern_users(self, name) -> dict:
+        """How many of each thing in the drawing name a pattern: layers,
+        objects with a section style of their own, hatches on sheets and
+        hatches in the model, by those four keys."""
+        key = str(name or "").lower()
+        hatches = objects = 0
+        for obj in self.objects.values():
+            if obj.kind == "hatch" and \
+                    str(getattr(obj.shape, "pattern", "")).lower() == key:
+                hatches += 1
+            own = obj.section_fill
+            if own and str(own.get("pattern", "")).lower() == key:
+                objects += 1
+        return {"layer": sum(1 for la in self.layers.all()
+                             if la.hatch.lower() == key),
+                "object": objects,
+                "sheet": sum(1 for lay in self.layouts for h in lay.hatches
+                             if str(h.pattern).lower() == key),
+                "hatch": hatches}
+
+    def render_color_of(self, obj: SceneObject) -> tuple[float, float, float]:
+        """The colour rendered mode draws the object's surfaces in.
+
+        An object carries two colours, the way it does in Rhino: the one it
+        displays, which is the layer's unless it says otherwise, and the one on
+        its material. A drawing set up for rendering usually leaves every
+        object on its layer colour and puts the real colours on materials, so
+        the two are meant to differ (#4). Materials made in the app have no
+        colour of their own, and those objects render the colour they display.
+        """
+        return (obj.material or {}).get("color") or self.color_of(obj)
+
+    def clear(self):
+        self.objects.clear()
+        self._order.clear()
+        self._counters.clear()
+        self.layers = LayerManager()
+        self.layers.on_shown = self.realise_layer
+        self.named_views = {}
+        from .view_settings import ViewSettings
+        self.view_settings = ViewSettings()
+        self.layouts = []
+        self.sheet_groups = []
+        self.block_defs = {}
+        self.annot_styles = {}
+        self.annot_style_set = None
+        self.text_height_measures = "capitals"
+        self.hatch_patterns = {}
+        self.showing_only = None
+        self.image_planes = []
+        self.history_records = []
+        self.trajectories = []
+        self.session = None
+        # units are a user preference as much as a document property: keep
+        self.notify()
+
+    def format_length(self, value: float) -> str:
+        from ..utils.units import format_length
+        return format_length(value, self.units)
+
+    def format_paper_length(self, mm: float) -> str:
+        """A length on a sheet, in the units the sheet is read in."""
+        from ..utils.units import format_paper_length
+        return format_paper_length(mm, self.units)
+
+    def bbox(self) -> tuple[tuple, tuple] | None:
+        objs = self.visible_objects()
+        if not objs:
+            return None
+        boxes = np.array([o.bbox() for o in objs], float)
+        return (tuple(boxes[:, 0].min(axis=0)),
+                tuple(boxes[:, 1].max(axis=0)))
+
+    # -- snapshot (undo/redo) --
+    def snapshot(self) -> dict:
+        import copy
+        return {
+            "units": self.units,
+            "objects": {k: v.clone() for k, v in self.objects.items()},
+            "order": list(self._order),
+            "counters": dict(self._counters),
+            "layers": self.layers.snapshot(),
+            "named_views": copy.deepcopy(self.named_views),
+            "layouts": [lay.clone() for lay in self.layouts],
+            "sheet_groups": copy.deepcopy(self.sheet_groups),
+            "block_defs": {k: dict(v) for k, v in self.block_defs.items()},
+            "annot_styles": {k: dict(v) for k, v in self.annot_styles.items()},
+            "annot_style_set": self.annot_style_set,
+            "text_height_measures": self.text_height_measures,
+            "hatch_patterns": dict(self.hatch_patterns),
+            "image_planes": copy.deepcopy(self.image_planes),
+            "history_records": copy.deepcopy(self.history_records),
+            # By reference, not deep-copied: a trajectory is tens of
+            # thousands of poses that nothing in the app edits, and undo
+            # takes a snapshot every command.
+            "trajectories": self.trajectories,
+            "session": self.session,
+        }
+
+    def restore(self, snap: dict):
+        import copy
+        self.units = snap.get("units", self.units)
+        self.objects = {k: v.clone() for k, v in snap["objects"].items()}
+        self._order = list(snap["order"])
+        self._counters = dict(snap["counters"])
+        self.layers.restore(snap["layers"])
+        self.named_views = copy.deepcopy(snap.get("named_views", {}))
+        self.layouts = [lay.clone() for lay in snap.get("layouts", [])]
+        self.sheet_groups = copy.deepcopy(snap.get("sheet_groups", []))
+        self.block_defs = {k: dict(v) for k, v in
+                           snap.get("block_defs", {}).items()}
+        self.annot_styles = {k: dict(v) for k, v in
+                             snap.get("annot_styles", {}).items()}
+        self.annot_style_set = snap.get("annot_style_set")
+        self.text_height_measures = snap.get("text_height_measures",
+                                             "capitals")
+        self.hatch_patterns = dict(snap.get("hatch_patterns", {}))
+        if not any(obj.kind == "picture" for obj in self.all()):
+            self.image_planes = copy.deepcopy(snap.get("image_planes", []))
+        self.history_records = copy.deepcopy(
+            snap.get("history_records", []))
+        self.trajectories = snap.get("trajectories", [])
+        self.session = snap.get("session")
+        self.notify()

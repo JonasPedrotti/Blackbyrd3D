@@ -1,0 +1,291 @@
+"""Dockable viewports: model + paper side by side, focused-pane routing."""
+
+import json
+
+import pytest
+
+
+@pytest.fixture
+def window(tmp_path, monkeypatch):
+    cfg = tmp_path / "cfg.json"
+    cfg.write_text(json.dumps({}))
+    monkeypatch.setenv("BYRD3D_CONFIG", str(cfg))
+    monkeypatch.setenv("BYRD3D_AUTOSAVE_DIR", str(tmp_path / "autosave"))
+    from blackbyrd3d.app import MainWindow
+    w = MainWindow()
+    yield w
+    w._saved_revision = w.scene.revision   # else closeEvent blocks on the
+    w.close()                              # save-changes dialog, headless
+
+
+def test_dock_viewport_model_and_paper_side_by_side(window):
+    from PySide6.QtWidgets import QDockWidget
+    from blackbyrd3d.core.layout import Layout
+    lay = Layout(name="Sheet 1")
+    window.scene.layouts.append(lay)
+
+    window.processor.run("newviewport")
+    window.processor.provide_text("Right")
+    window.processor.provide_text("Sheet 1")
+    assert len(window.dock_viewports) == 1
+    vp2 = window.dock_viewports[0]
+    dock = vp2.parentWidget()
+    assert isinstance(dock, QDockWidget)
+    # A pane on a sheet says which sheet, where a model pane says its view.
+    assert dock.windowTitle().startswith("Sheet 1")
+    assert "Sheet 1" in dock.titleBarWidget().button.text()
+    # the star feature: 3D model and the paper sheet coexist
+    assert window.viewport.space == "model"
+    assert vp2.space == lay.id
+    assert vp2 in window.all_viewports()
+
+
+def test_space_tabs_act_on_the_window_not_the_focused_pane(window):
+    """The strip speaks for the window. It used to write to whichever pane
+    was active, so a sheet opened on top of the pane you happened to be in
+    and clicking back onto a model pane snapped the strip to Model on its
+    own, with nothing said about it."""
+    from blackbyrd3d.core.layout import Layout
+    lay = Layout(name="Sheet 1")
+    window.scene.layouts.append(lay)
+    window._refresh_space_tabs()
+    vp2 = window.new_viewport_dock("Right")
+    assert window.active_viewport is vp2
+
+    window.switch_space(lay.id)
+    assert window.space == lay.id
+    idx = window.space_tabs.currentIndex()
+    assert window.space_tabs.tabData(idx) == lay.id
+    assert vp2.space == "model"        # put away, not turned into paper
+
+    # focus a model pane again: the tab stays where you put it
+    window.switch_space("model")
+    window._set_active_viewport(vp2)
+    assert window.ctx.viewport is vp2
+    idx = window.space_tabs.currentIndex()
+    assert window.space_tabs.tabData(idx) == "model"
+
+
+def test_closed_dock_leaves_fanout_and_focus(window):
+    vp2 = window.new_viewport_dock("Floating")
+    assert vp2 in window.all_viewports()
+    vp2.parentWidget().close()
+    assert vp2 not in window.all_viewports()
+    assert window.active_viewport is window.viewport   # falls back
+
+    # point-mode fanout only reaches live panes (no crash on the dead one)
+    window.processor.run("line")
+    assert window.viewport.point_mode
+    window.processor.cancel()
+
+
+def test_zoom_selected_targets_focused_pane(window):
+    from blackbyrd3d.core import geometry as g
+    obj = window.scene.add(g.make_box((50, 50, 50), 2, 2, 2))
+    window.selection.set([obj.id])
+    vp2 = window.new_viewport_dock("Right")
+    before_main = float(window.viewport.camera.distance)
+    window.processor.run("zoomselected")
+    assert vp2.camera.distance < 30                 # focused pane framed it
+    assert window.viewport.camera.distance == before_main
+
+
+def _rmb_click(vp, pos=None):
+    from PySide6.QtCore import QPoint
+    from PySide6.QtCore import Qt as QtC
+    from PySide6.QtTest import QTest
+    QTest.mouseClick(vp, QtC.MouseButton.RightButton,
+                     pos=pos or QPoint(200, 150))
+
+
+def test_right_click_finishes_selection(window):
+    from blackbyrd3d.core import geometry as g
+    c1 = window.scene.add(g.make_circle((0, 0, 0), 5))
+    c2 = window.scene.add(g.make_circle((0, 0, 10), 3))
+    window.processor.run("loft")
+    window.processor.click_object(c1.id)
+    window.processor.click_object(c2.id)
+    _rmb_click(window.viewport)          # "press enter when done"
+    assert not window.processor.busy
+    assert window.scene.all()[-1].kind in ("surface", "solid")
+
+
+def test_right_click_repeats_last_command(window):
+    """The first one, not the second. A right-click on an idle prompt is
+    Enter, and Enter on an idle prompt has always repeated — asking for it
+    twice made the gesture mean nothing the first time it was made."""
+    window.processor.run("circle")
+    window.processor.provide_text("0,0,0")
+    window.processor.provide_text("5")
+    assert not window.processor.busy
+    _rmb_click(window.viewport)          # repeat 'circle'
+    assert window.processor.busy
+    assert "circle" in window.processor.prompt_text().lower() \
+        or "center" in window.processor.prompt_text().lower()
+    window.processor.cancel()
+
+
+def test_right_drag_does_not_trigger_enter(window):
+    from PySide6.QtCore import QPoint
+    from PySide6.QtCore import Qt as QtC
+    from PySide6.QtTest import QTest
+    window.processor.run("circle")       # busy; a drag must not advance it
+    vp = window.viewport
+    QTest.mousePress(vp, QtC.MouseButton.RightButton, pos=QPoint(100, 100))
+    QTest.mouseRelease(vp, QtC.MouseButton.RightButton, pos=QPoint(160, 130))
+    assert window.processor.busy         # still waiting for the center
+    window.processor.cancel()
+
+
+def test_right_click_accepts_defaults(window):
+    from blackbyrd3d.core import geometry as g
+    c = window.scene.add(g.make_circle((0, 0, 0), 5))
+    window.selection.set([c.id])
+    window.processor.run("extrude")      # preselection consumed
+    _rmb_click(window.viewport)          # accept default distance 10
+    assert not window.processor.busy
+    solid = window.scene.all()[-1]
+    assert solid.kind == "solid"
+    assert g.bbox(solid.shape)[1][2] == pytest.approx(10)
+
+
+def test_command_terminates_cleanly_after_completion(window):
+    """The playtest bug: scale must end when done. What it scaled stays
+    selected, so a habitual right-click afterwards repeats it on the same
+    objects, asking straight for the base point."""
+    from blackbyrd3d.core import geometry as g
+    obj = window.scene.add(g.make_box((0, 0, 0), 2, 2, 2))
+    window.selection.set([obj.id])
+    window.processor.run("scale")        # preselection used
+    window.processor.provide_text("0,0,0")
+    window.processor.provide_text("2")
+    assert not window.processor.busy     # terminated
+    assert window.selection.ids == [obj.id]   # a transform keeps hold
+
+    _rmb_click(window.viewport)          # RMB after finishing repeats
+    assert window.processor.busy
+    from blackbyrd3d.commands.base import PointReq
+    assert isinstance(window.processor.request, PointReq)
+    window.processor.cancel()
+    assert not window.processor.busy
+    assert g.volume(window.scene.all()[0].shape) == pytest.approx(64)
+
+
+def test_select_then_right_click_repeats_immediately(window):
+    """Picking an object and right-clicking repeats on what was picked."""
+    from blackbyrd3d.core import geometry as g
+    a = window.scene.add(g.make_box((0, 0, 0), 2, 2, 2))
+    window.selection.set([a.id])
+    window.processor.run("scale")
+    window.processor.provide_text("0,0,0")
+    window.processor.provide_text("2")
+    assert not window.processor.busy
+    b = window.scene.add(g.make_box((10, 0, 0), 2, 2, 2))
+    from PySide6.QtCore import Qt as QtC
+    window._on_object_clicked(b.id, QtC.KeyboardModifier.NoModifier)
+    _rmb_click(window.viewport)               # repeats right away
+    assert window.processor.busy
+    window.processor.provide_text("10,0,0")
+    window.processor.provide_text("3")
+    assert g.volume(window.scene.get(b.id).shape) == pytest.approx(8 * 27)
+
+
+def test_right_click_runs_typed_command(window):
+    """Rhino muscle memory: type a command and right-click to run it.
+    Right-click is Enter, so a typed name executes instead of repeating the
+    last command, and the input box clears like Enter does."""
+    window.command_line.input.setText("circle")
+    _rmb_click(window.viewport)
+    assert window.processor.busy                       # circle started
+    assert window.command_line.input.text() == ""      # consumed, like Enter
+    assert "circle" in window.processor.prompt_text().lower() \
+        or "center" in window.processor.prompt_text().lower()
+    window.processor.cancel()
+
+
+def test_right_click_commits_typed_value_midcommand(window):
+    """Mid-command, right-click commits whatever is typed (Enter), rather
+    than submitting an empty default and ignoring the text."""
+    from blackbyrd3d.core import geometry as g
+    window.processor.run("circle")
+    window.command_line.input.setText("0,0,0")
+    _rmb_click(window.viewport)                         # commit center
+    assert window.command_line.input.text() == ""
+    assert window.processor.busy                        # now wants radius
+    window.command_line.input.setText("5")
+    _rmb_click(window.viewport)                         # commit radius
+    assert not window.processor.busy
+    lo, hi = g.bbox(window.scene.all()[-1].shape)
+    assert (hi[0] - lo[0]) == pytest.approx(10, abs=0.01)
+
+
+def test_type_in_viewport_then_right_click_runs(window):
+    """End-to-end Rhino gesture: with the viewport focused, typing routes
+    into the command line and a right-click runs it -- never touching a box."""
+    from PySide6.QtTest import QTest
+    window.show()
+    vp = window.viewport
+    vp.setFocus()
+    QTest.keyClicks(vp, "c")                        # routes into the command line
+    QTest.keyClicks(window.command_line.input, "ircle")
+    assert window.command_line.input.text() == "circle"
+    _rmb_click(vp)
+    assert window.processor.busy                    # right-click ran it
+    window.processor.cancel()
+
+
+def test_sellast_recovers_released_selection(window):
+    from blackbyrd3d.core import geometry as g
+    obj = window.scene.add(g.make_box((0, 0, 0), 2, 2, 2))
+    window.selection.set([obj.id])
+    window.processor.run("move")
+    window.processor.provide_text("0,0,0")
+    window.processor.provide_text("5,0,0")
+    assert window.selection.ids == [obj.id]   # a transform keeps hold
+    window.selection.clear()
+    window.processor.run("sellast")
+    assert window.selection.ids == [obj.id]
+
+
+def test_final_enter_does_not_rerun_command(window):
+    """The real playtest bug: QLineEdit leaves Return unaccepted, so the
+    keystroke that completed a command bubbled to the main window's
+    Enter-repeats fallback and instantly re-ran it."""
+    from PySide6.QtCore import Qt as QtC
+    from PySide6.QtTest import QTest
+    from blackbyrd3d.core import geometry as g
+    box = window.scene.add(g.make_box((0, 0, 0), 10, 10, 10))
+    window.selection.set([box.id])
+    window.show()
+    for text in ("scale", "0,0,0", "2"):
+        QTest.keyClicks(window.command_line.input, text)
+        QTest.keyClick(window.command_line.input, QtC.Key.Key_Return)
+    assert not window.processor.busy          # finished means finished
+    assert window.command_line.prompt_label.text() == "Command"
+    assert g.volume(window.scene.all()[0].shape) == pytest.approx(8000)
+
+    # Enter with the VIEWPORT focused still repeats (Rhino gesture kept)
+    window.viewport.setFocus()
+    window.keyPressEvent(_key_event(QtC.Key.Key_Return))
+    assert window.processor.busy
+    window.processor.cancel()
+
+
+def _key_event(key):
+    from PySide6.QtCore import QEvent, Qt as QtC
+    from PySide6.QtGui import QKeyEvent
+    return QKeyEvent(QEvent.Type.KeyPress, key,
+                     QtC.KeyboardModifier.NoModifier)
+
+
+def test_new_sheet_action_adds_layout_and_switches(window):
+    """The '+' next to the Model tab creates a paper-space sheet and jumps
+    to it, same as 'layout' > New but one click."""
+    n0 = len(window.scene.layouts)
+    lay = window._new_sheet("A3")
+    assert len(window.scene.layouts) == n0 + 1
+    assert lay.paper_w == 420.0 and lay.paper_h == 297.0     # A3 landscape
+    assert window.active_viewport.space == lay.id            # switched onto it
+    labels = [window.space_tabs.tabText(i)
+              for i in range(window.space_tabs.count())]
+    assert lay.name in labels                                # tab exists

@@ -1,0 +1,526 @@
+"""Layer system."""
+
+from __future__ import annotations
+
+import itertools
+from dataclasses import dataclass, replace
+
+from .layout import SECTION_FILLS
+
+DEFAULT_LAYER_ID = "default"
+
+# What a layer path is written with, the separator Rhino uses:
+# "Walls::Interior" is the layer Interior sitting under the layer Walls.
+PATH_SEPARATOR = "::"
+
+# A layer's width on screen comes from its width on paper unless somebody
+# sets it: 4 px a millimetre puts the 0.35 mm pen most drawings plot with
+# at the 1.4 px every layer has always drawn at, and a layer left on the
+# printer's default draws at that too.
+DEFAULT_SCREEN_WIDTH = 1.4
+SCREEN_PX_PER_MM = 4.0
+
+
+# The colour a layer's section hatch is drawn in: the ink the rest of a
+# sheet is drawn in, the layer's own colour, or one of its own as #rrggbb.
+HATCH_INK = "ink"
+HATCH_LAYER_COLOR = "layer"
+# What a hatch shows under its lines (#91): none, which leaves a cut a
+# darker shade of its object on screen and the bare paper on a sheet, as
+# it always did, or a colour, the layer's or a #rrggbb, on both.
+HATCH_BACKGROUND_NONE = "none"
+MIN_HATCH_SPACING = 0.2         # mm on paper: closer is a grey smear
+
+# The line round a cut face, in millimetres on the paper: the 0.5 mm every
+# cut was outlined with before a layer could say, and no more than a pen
+# wider than any made. 0 draws no line round it at all.
+DEFAULT_CUT_LINE_WIDTH = 0.5
+MAX_CUT_LINE_WIDTH = 5.0
+
+
+def hatch_color_token(value) -> str:
+    """A hatch colour as a layer keeps it: "ink", "layer" or "#rrggbb".
+
+    An (r, g, b) in 0..1 becomes its #rrggbb; anything else that is not
+    one of the three, a file's or a script's, is ink, which is what such
+    a cut was always drawn in.
+    """
+    if isinstance(value, (tuple, list)) and len(value) == 3:
+        try:
+            channels = [max(0.0, min(1.0, float(c))) for c in value]
+        except (TypeError, ValueError):
+            return HATCH_INK
+        return "#" + "".join(f"{round(c * 255):02x}" for c in channels)
+    text = (value or "").strip().lower() if isinstance(value, str) else ""
+    if text in (HATCH_INK, HATCH_LAYER_COLOR):
+        return text
+    if len(text) == 7 and text[0] == "#":
+        try:
+            int(text[1:], 16)
+            return text
+        except ValueError:
+            pass
+    return HATCH_INK
+
+
+def hatch_background_token(value) -> str:
+    """A hatch background as a layer keeps it: "none", "layer" or
+    "#rrggbb", an (r, g, b) in 0..1 becoming its #rrggbb. Anything else
+    is none, which is what every cut had before it could say."""
+    text = value.strip().lower() if isinstance(value, str) else None
+    if text in (HATCH_BACKGROUND_NONE, "object", HATCH_INK):
+        return HATCH_BACKGROUND_NONE
+    token = hatch_color_token(value)
+    return HATCH_BACKGROUND_NONE if token == HATCH_INK else token
+
+
+def hatch_token_rgb(token: str, layer_color):
+    """The (r, g, b) a hatch colour token draws in, or None for ink:
+    "layer" is the colour of the layer it is read against."""
+    if token == HATCH_LAYER_COLOR:
+        return tuple(layer_color)
+    if token.startswith("#"):
+        return tuple(int(token[i:i + 2], 16) / 255.0 for i in (1, 3, 5))
+    return None
+
+
+def _tidy_pattern(name) -> str:
+    """The app's own fills in lower case, a pattern from a .pat file by its
+    name (#92), and nothing at all the lines it always was. A name the
+    drawing has no pattern by is kept rather than lost: it draws as lines
+    until the pattern is loaded."""
+    name = (name or "").strip() if isinstance(name, str) else ""
+    if not name:
+        return "lines"
+    return name.lower() if name.lower() in SECTION_FILLS else name
+
+
+def _tidy_angle(degrees) -> float:
+    """Lines at 225 degrees are lines at 45, so it is kept that way."""
+    return float(degrees) % 180.0
+
+
+def _tidy_spacing(mm) -> float:
+    return max(MIN_HATCH_SPACING, float(mm))
+
+
+def _tidy_cut_width(mm) -> float:
+    """None (0) up to the widest pen; what is not a width at all is none."""
+    return max(0.0, min(float(mm), MAX_CUT_LINE_WIDTH))
+
+
+def section_fill_dict(pattern="lines", angle=45.0, spacing=2.5,
+                      color=HATCH_INK,
+                      cut_line_width=DEFAULT_CUT_LINE_WIDTH,
+                      cut_line_color=HATCH_INK,
+                      background=HATCH_BACKGROUND_NONE) -> dict:
+    """A section style of an object's own, as the object keeps it: the
+    same things a layer has, put right the way a layer's are. A style
+    kept before cut lines had a width and colour gets the ones every cut
+    was outlined with then, and one kept before a cut had a background
+    the object's shade."""
+    return {"pattern": _tidy_pattern(pattern), "angle": _tidy_angle(angle),
+            "spacing": _tidy_spacing(spacing),
+            "color": hatch_color_token(color),
+            "cut_line_width": _tidy_cut_width(cut_line_width),
+            "cut_line_color": hatch_color_token(cut_line_color),
+            "background": hatch_background_token(background)}
+
+
+def screen_width_for(print_mm: float) -> float:
+    """The width, in pixels, a layer following its print width draws at.
+    Never under a pixel: a thin pen still has to show."""
+    if print_mm <= 0:
+        return DEFAULT_SCREEN_WIDTH
+    return max(1.0, round(print_mm * SCREEN_PX_PER_MM, 2))
+
+# muted but distinguishable object colors, dark-theme friendly
+_PALETTE = [
+    (0.85, 0.85, 0.85),   # light grey
+    (0.95, 0.65, 0.30),   # amber
+    (0.40, 0.70, 0.95),   # sky blue
+    (0.55, 0.85, 0.50),   # green
+    (0.90, 0.50, 0.55),   # rose
+    (0.75, 0.60, 0.95),   # violet
+    (0.95, 0.85, 0.45),   # gold
+    (0.45, 0.85, 0.80),   # teal
+]
+
+
+@dataclass(frozen=True)
+class Layer:
+    id: str
+    name: str
+    color: tuple[float, float, float]
+    visible: bool = True
+    locked: bool = False
+    lineweight: float = DEFAULT_SCREEN_WIDTH   # on-screen edge width, px
+    linetype: str = "Continuous"   # dash-pattern name (core/linetype.py)
+    print_width: float = 0.0       # plotted pen width in mm; 0 = device default
+    screen_pinned: bool = False    # lineweight set by hand, not from print
+    hatch: str = "lines"           # fill where it is cut (SECTION_FILLS)
+    hatch_angle: float = 45.0      # degrees on the paper, within half a turn
+    hatch_spacing: float = 2.5     # mm on the paper between hatch lines
+    hatch_color: str = HATCH_INK   # "ink", "layer" or "#rrggbb"
+    hatch_background: str = HATCH_BACKGROUND_NONE  # "none", "layer", "#.."
+    cut_line_width: float = DEFAULT_CUT_LINE_WIDTH  # mm round a cut; 0 = none
+    cut_line_color: str = HATCH_INK  # "ink", "layer" or "#rrggbb"
+    parent: str | None = None      # the layer this one sits under, if any
+
+
+class LayerManager:
+    def __init__(self):
+        self._layers: dict[str, Layer] = {}
+        self._order: list[str] = []
+        self._counter = itertools.count(1)
+        self.current_id = DEFAULT_LAYER_ID
+        self._add(Layer(DEFAULT_LAYER_ID, "Default", _PALETTE[0]))
+        # Called with a layer id when that layer is switched on, whoever
+        # switched it. The scene sets it, to convert the geometry it read
+        # from the file and put off converting (see core/deferred.py). A
+        # table on its own has nothing to convert and leaves it None.
+        self.on_shown = None
+
+    def _add(self, layer: Layer):
+        self._layers[layer.id] = layer
+        self._order.append(layer.id)
+
+    # -- queries --
+    def get(self, layer_id: str) -> Layer:
+        return self._layers[layer_id]
+
+    def find_by_name(self, name: str) -> Layer | None:
+        for layer in self.all():
+            if layer.name.lower() == name.lower():
+                return layer
+        return None
+
+    def all(self) -> list[Layer]:
+        return [self._layers[i] for i in self._order]
+
+    def children(self, layer_id: str) -> list[Layer]:
+        """The layers directly under this one, in the order they were made."""
+        return [la for la in self.all() if la.parent == layer_id]
+
+    def descendants(self, layer_id: str) -> list[Layer]:
+        """Everything under this one, a branch at a time."""
+        out = []
+        for child in self.children(layer_id):
+            out.append(child)
+            out.extend(self.descendants(child.id))
+        return out
+
+    def with_descendants(self, layer_ids) -> set:
+        """These layers and everything under them: what hiding them hides.
+        Ids no longer in the table are let go."""
+        out = set()
+        for layer_id in layer_ids:
+            if layer_id in self._layers:
+                out.add(layer_id)
+                out.update(la.id for la in self.descendants(layer_id))
+        return out
+
+    def ancestors(self, layer_id: str) -> list[Layer]:
+        """Every layer above this one, nearest first.
+
+        Walks by id rather than trusting the chain to end: set_parent
+        refuses to make a loop, but a file written by something else can
+        still hand us one, and a hung app is a worse answer than a short
+        list. A parent that is not there any more ends the walk too.
+        """
+        out = []
+        seen = {layer_id}
+        parent = self._layers[layer_id].parent
+        while (parent is not None and parent in self._layers
+               and parent not in seen):
+            seen.add(parent)
+            out.append(self._layers[parent])
+            parent = self._layers[parent].parent
+        return out
+
+    def full_path(self, layer_id: str) -> str:
+        """What the file calls this layer: "Walls::Interior"."""
+        names = [la.name for la in reversed(self.ancestors(layer_id))]
+        names.append(self._layers[layer_id].name)
+        return PATH_SEPARATOR.join(names)
+
+    def find_by_path(self, path: str) -> Layer | None:
+        """The layer at a full path, which is what a name alone cannot say.
+
+        Walls::Interior and Roof::Interior are two layers sharing a leaf
+        name, so find_by_name can only ever answer with one of them.
+        """
+        wanted = path.strip().lower()
+        for layer in self.all():
+            if self.full_path(layer.id).lower() == wanted:
+                return layer
+        return None
+
+    def is_visible(self, layer_id: str) -> bool:
+        """Whether the layer is really on screen, its parents counted.
+
+        A layer keeps its own switch whatever a parent does, so switching a
+        parent back on leaves a child that was off still off.
+        """
+        return (self._layers[layer_id].visible
+                and all(la.visible for la in self.ancestors(layer_id)))
+
+    def is_locked(self, layer_id: str) -> bool:
+        """Whether the layer is really locked, its parents counted."""
+        return (self._layers[layer_id].locked
+                or any(la.locked for la in self.ancestors(layer_id)))
+
+    @property
+    def current(self) -> Layer:
+        return self._layers[self.current_id]
+
+    # -- mutations --
+    def create(self, name: str | None = None,
+               color: tuple[float, float, float] | None = None,
+               parent: str | None = None) -> Layer:
+        n = next(self._counter)
+        layer_id = f"layer{n}"
+        while layer_id in self._layers:
+            n = next(self._counter)
+            layer_id = f"layer{n}"
+        if not name:
+            name = f"Layer {n:02d}"
+        if color is None:
+            color = _PALETTE[len(self._order) % len(_PALETTE)]
+        layer = Layer(layer_id, name, color, parent=parent)
+        self._add(layer)
+        return layer
+
+    def rename(self, layer_id: str, name: str):
+        self._layers[layer_id] = replace(self._layers[layer_id], name=name)
+
+    def set_visible(self, layer_id: str, visible: bool):
+        branch = [layer_id] + [la.id for la in self.descendants(layer_id)]
+        was = {i for i in branch if self.is_visible(i)}
+        self._layers[layer_id] = replace(self._layers[layer_id], visible=visible)
+        if self.on_shown is None:
+            return
+        # Everything that came on, not only the layer that was clicked. A
+        # child under a parent that was off has geometry nobody has
+        # converted yet, and it is on screen now.
+        for i in branch:
+            if i not in was and self.is_visible(i):
+                self.on_shown(i)
+
+    def set_color(self, layer_id: str, color: tuple[float, float, float]):
+        self._layers[layer_id] = replace(self._layers[layer_id], color=color)
+
+    def set_lineweight(self, layer_id: str, weight: float):
+        """Set the screen width by hand, which pins it: the print width
+        no longer moves it until follow_print lets go."""
+        self._layers[layer_id] = replace(self._layers[layer_id],
+                                         lineweight=max(0.2, float(weight)),
+                                         screen_pinned=True)
+
+    def follow_print(self, layer_id: str):
+        """Let the screen width come from the print width again."""
+        layer = self._layers[layer_id]
+        self._layers[layer_id] = replace(
+            layer, lineweight=screen_width_for(layer.print_width),
+            screen_pinned=False)
+
+    def set_linetype(self, layer_id: str, name: str):
+        self._layers[layer_id] = replace(self._layers[layer_id],
+                                         linetype=name or "Continuous")
+
+    def set_print_width(self, layer_id: str, width: float):
+        """Set the plotted pen width, and with it the screen width unless
+        that was set by hand."""
+        layer = self._layers[layer_id]
+        width = max(0.0, float(width))
+        self._layers[layer_id] = replace(
+            layer, print_width=width,
+            lineweight=(layer.lineweight if layer.screen_pinned
+                        else screen_width_for(width)))
+
+    def set_hatch(self, layer_id: str, pattern: str):
+        """Say what this layer's material is filled with where it is cut.
+
+        "none" is a fill of its own: the cut is outlined and left empty.
+        A pattern loaded from a .pat file is named as it is spelled
+        there. Nothing at all is lines, which is what such a layer was
+        always drawn with: a file written before layers had a hatch, or
+        by a build that wrote "" for one nobody had set.
+        """
+        self._layers[layer_id] = replace(self._layers[layer_id],
+                                         hatch=_tidy_pattern(pattern))
+
+    def set_hatch_angle(self, layer_id: str, degrees: float):
+        self._layers[layer_id] = replace(self._layers[layer_id],
+                                         hatch_angle=_tidy_angle(degrees))
+
+    def set_hatch_spacing(self, layer_id: str, mm: float):
+        self._layers[layer_id] = replace(self._layers[layer_id],
+                                         hatch_spacing=_tidy_spacing(mm))
+
+    def set_hatch_color(self, layer_id: str, color):
+        self._layers[layer_id] = replace(
+            self._layers[layer_id], hatch_color=hatch_color_token(color))
+
+    def set_hatch_background(self, layer_id: str, color):
+        """What a cut through this layer's material shows under its hatch:
+        "none", or a colour."""
+        self._layers[layer_id] = replace(
+            self._layers[layer_id],
+            hatch_background=hatch_background_token(color))
+
+    def set_cut_line_width(self, layer_id: str, mm: float):
+        """How wide, in millimetres on the paper, the line round a cut
+        through this layer's material is drawn; 0 draws none."""
+        self._layers[layer_id] = replace(self._layers[layer_id],
+                                         cut_line_width=_tidy_cut_width(mm))
+
+    def set_cut_line_color(self, layer_id: str, color):
+        self._layers[layer_id] = replace(
+            self._layers[layer_id], cut_line_color=hatch_color_token(color))
+
+    def hatch_rgb(self, layer_id: str):
+        """The (r, g, b) a layer's hatch is drawn in, or None for ink."""
+        layer = self._layers[layer_id]
+        return hatch_token_rgb(layer.hatch_color, layer.color)
+
+    def move_up(self, layer_id: str) -> bool:
+        """Move a layer above the sibling in front of it, branch and all.
+
+        Says whether anything moved: the first of its siblings has nowhere
+        to go, and a press that moves nothing must not cost an undo. Up is
+        never out of a branch, which is what ``set_parent`` is for.
+        """
+        return self._move(layer_id, -1)
+
+    def move_down(self, layer_id: str) -> bool:
+        """Move a layer below the sibling after it, branch and all."""
+        return self._move(layer_id, 1)
+
+    def place(self, layer_id: str, parent_id: str | None,
+              before_id: str | None = None) -> bool:
+        """Put a layer, branch and all, under a parent and in front of one
+        of that parent's layers, which is what a drop in the list means.
+
+        ``before_id`` of None means after everything already under that
+        parent: a drop onto a layer, or on the space below the list, has
+        no layer to land in front of. Says whether anything changed, so a
+        drop that puts a layer back where it was costs no undo.
+        """
+        if before_id == layer_id:
+            return False
+        if before_id is not None and \
+                self._layers[before_id].parent != parent_id:
+            raise ValueError(f"{before_id} is not one of {parent_id}'s layers")
+        was = (list(self._order), self._layers[layer_id].parent)
+        self.set_parent(layer_id, parent_id)
+        block = self._block(layer_id)
+        rest = [i for i in self._order if i not in set(block)]
+        if before_id is not None:
+            at = rest.index(self._block(before_id)[0])
+        else:
+            # last of the layers already there, or, with none, the parent
+            # itself, so a first sublayer lands under the layer it joined
+            kin = [la.id for la in self.children(parent_id)
+                   if la.id != layer_id]
+            if kin:
+                at = rest.index(self._block(kin[-1])[-1]) + 1
+            elif parent_id is not None:
+                at = rest.index(parent_id) + 1
+            else:
+                at = len(rest)
+        self._order = rest[:at] + block + rest[at:]
+        return (self._order, self._layers[layer_id].parent) != was
+
+    def _move(self, layer_id: str, step: int) -> bool:
+        siblings = [la.id for la in
+                    self.children(self._layers[layer_id].parent)]
+        i = siblings.index(layer_id) + step
+        if not 0 <= i < len(siblings):
+            return False
+        # A branch is not one run of the list - a layer made later can sit
+        # between a parent and its child - so the block is gathered by id
+        # and put down again in one piece, past the whole of the sibling
+        # it is passing.
+        block = self._block(layer_id)
+        rest = [i for i in self._order if i not in set(block)]
+        passed = self._block(siblings[i])
+        at = (rest.index(passed[0]) if step < 0
+              else rest.index(passed[-1]) + 1)
+        self._order = rest[:at] + block + rest[at:]
+        return True
+
+    def _block(self, layer_id: str) -> list[str]:
+        """A layer and everything under it, in the order the list has."""
+        branch = {layer_id} | {la.id for la in self.descendants(layer_id)}
+        return [i for i in self._order if i in branch]
+
+    def set_order(self, layer_ids):
+        """Put the layers in the order given, for a file that says so.
+
+        Anything the caller leaves out keeps its place after the rest, so
+        a file that names only some of them cannot lose the others.
+        """
+        wanted = []
+        for layer_id in layer_ids:
+            if layer_id in self._layers and layer_id not in wanted:
+                wanted.append(layer_id)
+        self._order = wanted + [i for i in self._order if i not in set(wanted)]
+
+    def set_parent(self, layer_id: str, parent_id: str | None):
+        """Move a layer, and everything under it, to sit under another one.
+
+        A layer cannot go under itself or under one of its own children: a
+        branch that contains itself has no top, so nothing could say what
+        it inherits or what its path is.
+        """
+        if parent_id is not None:
+            if parent_id not in self._layers:
+                raise ValueError(f"No such layer: {parent_id}")
+            if parent_id == layer_id or parent_id in {
+                    la.id for la in self.descendants(layer_id)}:
+                raise ValueError("A layer cannot sit under itself")
+        self._layers[layer_id] = replace(self._layers[layer_id],
+                                         parent=parent_id)
+
+    def set_locked(self, layer_id: str, locked: bool):
+        self._layers[layer_id] = replace(self._layers[layer_id], locked=locked)
+
+    def remove(self, layer_id: str) -> list[str]:
+        """Remove a layer and everything under it. Returns what went.
+
+        The branch goes together because a layer whose parent is gone has
+        no path and nothing to inherit from, which is not a layer any more.
+        Whatever was drawn on one of them is the caller's to see to first,
+        and Scene.remove_layer is the caller that does. Default goes like
+        any other; only the last layer stays, a drawing needing one.
+        """
+        going = [layer_id] + [la.id for la in self.descendants(layer_id)]
+        if len(going) >= len(self._order):
+            raise ValueError("Cannot delete the only layer")
+        for i in going:
+            del self._layers[i]
+            self._order.remove(i)
+        if self.current_id in going:
+            self.current_id = self._order[0]
+        return going
+
+    def heir(self, going) -> str:
+        """Where what was on the layers `going` goes: the current layer, or
+        the first left when the current one is among them."""
+        if self.current_id not in going:
+            return self.current_id
+        return next(i for i in self._order if i not in going)
+
+    # -- snapshot support --
+    def snapshot(self) -> dict:
+        return {
+            "layers": dict(self._layers),
+            "order": list(self._order),
+            "current": self.current_id,
+        }
+
+    def restore(self, snap: dict):
+        self._layers = dict(snap["layers"])
+        self._order = list(snap["order"])
+        self.current_id = snap["current"]

@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Blackbyrd3D
+Comment=NURBS surface modeller
+Exec=byrd3d %F
+Icon=blackbyrd3d
+Terminal=false
+Categories=Graphics;3DGraphics;Engineering;
+MimeType=application/x-blackbyrd3d;application/x-blackbyrd3d-wyrm;
+Keywords=CAD;NURBS;3D;modelling;

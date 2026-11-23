@@ -1,0 +1,555 @@
+"""Second surface/curve wave: patch, blends, projection, helix, text,
+unroll."""
+
+from ..core import geometry as g
+from .base import (
+    NumberReq, OptionReq, PointReq, SelectReq, TextReq, TextEditorReq,
+    command, has_text_editor,
+)
+
+
+@command("patch", aliases=("networksrf",))
+def cmd_patch(ctx):
+    curves = yield SelectReq("Select boundary curves", kinds=("curve",),
+                             min_count=2)
+    srf = g.patch_surface([c.shape for c in curves])
+    obj = ctx.scene.add(srf)
+    ctx.echo(f"Created {obj.name} through {len(curves)} boundary curves.")
+
+
+@command("blendcrv", aliases=("blend",))
+def cmd_blendcrv(ctx):
+    a = yield SelectReq("Select first curve", kinds=("curve",), max_count=1)
+    b = yield SelectReq("Select second curve", kinds=("curve",),
+                        max_count=1, allow_preselected=False)
+    cont = yield OptionReq("Continuity", options=["Tangent", "Position"],
+                           default="Tangent")
+    blend = g.blend_curves(a[0].shape, b[0].shape,
+                           continuity=cont.lower())
+    obj = ctx.scene.add(blend)
+    ctx.echo(f"Created blend {obj.name} ({cont.lower()}).")
+
+
+@command("project")
+def cmd_project(ctx):
+    curves = yield SelectReq("Select curves to project", kinds=("curve",))
+    targets = yield SelectReq("Select target surface",
+                              kinds=("surface", "solid"), max_count=1,
+                              allow_preselected=False)
+    direction = tuple(-c for c in ctx.cplane.normal)
+    n = 0
+    for c in curves:
+        try:
+            for piece in g.project_curve(c.shape, targets[0].shape,
+                                         direction):
+                ctx.scene.add(piece, layer_id=c.layer_id)
+                n += 1
+        except g.GeometryError as exc:
+            ctx.echo(f"{c.name}: {exc}")
+    ctx.echo(f"Projected {n} curve(s) onto {targets[0].name}.")
+
+
+@command("pull")
+def cmd_pull(ctx):
+    curves = yield SelectReq("Select curves to pull", kinds=("curve",))
+    targets = yield SelectReq("Select target surface",
+                              kinds=("surface", "solid"), max_count=1,
+                              allow_preselected=False)
+    n = 0
+    for c in curves:
+        try:
+            for piece in g.pull_curve(c.shape, targets[0].shape):
+                ctx.scene.add(piece, layer_id=c.layer_id)
+                n += 1
+        except g.GeometryError as exc:
+            ctx.echo(f"{c.name}: {exc}")
+    ctx.echo(f"Pulled {n} curve(s) onto {targets[0].name}.")
+
+
+@command("helix")
+def cmd_helix(ctx):
+    import math
+    DEFAULT_TURNS = 5.0
+    center = yield PointReq("Center of helix base")
+    cp = ctx.cplane
+    # it winds up out of the plane you drew the base circle on
+    up = tuple(float(a) for a in cp.normal)
+    w0 = cp.from_world(center)[2]
+
+    def _base_to(p):
+        # a helix needs a pitch as well, so the first drag shows the circle
+        # it will wind around
+        r = math.dist(center, p)
+        return g.make_circle(center, r, up) if r > 1e-9 else None
+
+    rp = yield PointReq("Radius (click, or type a number)",
+                        number_from=(center, tuple(cp.xdir)),
+                        rubber_from=center, preview_fn=_base_to,
+                        pick_plane=(tuple(center), up))
+    radius = math.dist(center, rp)
+    if radius < 1e-9:
+        ctx.echo("Zero radius — no helix created.")
+        return
+
+    def _helix(pitch, turns):
+        if pitch < 1e-9 or turns < 0.01:
+            return None
+        try:
+            return g.make_helix(center, radius, pitch, turns, axis=up)
+        except g.GeometryError:
+            return None
+
+    pp = yield PointReq("Pitch, the rise per turn (click, or type a number)",
+                        number_from=(center, up), axis_lock=(center, up),
+                        rubber_from=center,
+                        preview_fn=lambda p: _helix(
+                            abs(cp.from_world(p)[2] - w0), DEFAULT_TURNS))
+    pitch = abs(cp.from_world(pp)[2] - w0)
+    if pitch < 1e-9:
+        ctx.echo("Zero pitch — no helix created.")
+        return
+
+    turns = yield NumberReq("Number of turns", default=DEFAULT_TURNS,
+                            minimum=0.01,
+                            preview_fn=lambda n: _helix(pitch, float(n)))
+    shape = _helix(pitch, turns)
+    if shape is None:
+        ctx.echo("No helix created.")
+        return
+    obj = ctx.scene.add(shape)
+    ctx.echo(f"Created {obj.name} ({turns:g} turns).")
+
+
+def place_model_text(ctx):
+    """The `text` command in the model: editable lettering, or its letter
+    outlines as curves, surfaces or solids."""
+    from ..core.text import TextShape, text_curves
+    from ..core.text_object import output_shapes
+    from . import dragging
+    if has_text_editor(ctx) or getattr(ctx, "replay_text_inline", False):
+        import numpy as np
+        import uuid
+        position = yield PointReq("Text position (baseline anchor)")
+        if ctx.window is not None and hasattr(ctx.window, "model_text_frame"):
+            frame = ctx.window.model_text_frame(position)
+        else:
+            plane = ctx.cplane
+            frame = np.eye(4)
+            frame[:3, 0] = plane.xdir
+            frame[:3, 1] = plane.ydir
+            frame[:3, 2] = plane.normal
+            frame[:3, 3] = position
+
+        def lettering(values):
+            return g.apply_matrix(TextShape(**values), frame)
+
+        req = TextEditorReq("Text", curve_output=True,
+                            units=ctx.scene.units, shape_fn=lettering,
+                            anchor=position)
+        content = yield req
+        values = dict(content)
+        output = values.pop("output", "editable")
+        grouped = values.pop("group_output", True)
+        solid_depth = values.pop("solid_depth", 1.)
+        obj = ctx.scene.get(req.target_id) if req.target_id else None
+        if obj is None:
+            obj = ctx.scene.add(lettering(values), name="Text")
+        if output != "editable":
+            ctx.scene.remove(obj.id)
+            group_id = (uuid.uuid4().hex if grouped
+                        and output in ("curves", "surface") else None)
+            made = []
+            for shape in output_shapes(obj.shape, output, solid_depth):
+                curve_obj = ctx.scene.add_from(shape, obj)
+                if group_id:
+                    curve_obj = ctx.scene.update(
+                        curve_obj.id, group_id=group_id)
+                made.append(curve_obj)
+            ctx.select_result(made)
+            ctx.echo(f"Text {output} created.")
+        else:
+            ctx.select_result([obj])
+            ctx.echo("Text placed. Double-click it or edit Content in Properties to change it.")
+        return
+    content = yield TextReq("Text")
+    # Resolved editor answers also arrive during headless session recovery.
+    if isinstance(content, dict):
+        import numpy as np
+        import uuid
+        values = dict(content)
+        output = values.pop("output", "editable")
+        grouped = values.pop("group_output", True)
+        solid_depth = values.pop("solid_depth", 1.)
+        lettering = TextShape(**values)
+        plane = ctx.cplane
+        frame = np.eye(4)
+        frame[:3, 0] = plane.xdir
+        frame[:3, 1] = plane.ydir
+        frame[:3, 2] = plane.normal
+
+        def placed(position):
+            frame[:3, 3] = position
+            return g.apply_matrix(lettering, frame)
+
+        position = yield PointReq("Text position (baseline anchor)",
+                                  preview_fn=placed)
+        shape = placed(position)
+        if output != "editable":
+            group_id = (uuid.uuid4().hex if grouped
+                        and output in ("curves", "surface") else None)
+            for result in output_shapes(shape, output, solid_depth):
+                obj = ctx.scene.add(result)
+                if group_id:
+                    ctx.scene.update(obj.id, group_id=group_id)
+            ctx.echo(f"Text {output} created.")
+        else:
+            ctx.scene.add(shape, name="Text")
+            ctx.echo("Text placed. Double-click it or edit Content in Properties to change it.")
+        return
+    # where before how big: the height is a size in the model, and there is
+    # nothing to measure it against until the text has somewhere to sit
+    position = yield PointReq("Position (baseline start)")
+    up = tuple(ctx.cplane.ydir)
+    read = dragging.distance_from(position)
+
+    def _text_to(p):
+        h = read(p)
+        if h < 1e-6:
+            return None
+        try:
+            return g.make_compound(
+                [g.translate(c, position) for c in text_curves(content, h)])
+        except (g.GeometryError, ValueError):
+            return None
+
+    hp = yield PointReq("Text height (click, or type a number)",
+                        number_from=(position, up), rubber_from=position,
+                        preview_fn=_text_to)
+    height = read(hp)
+    if height < 1e-6:
+        ctx.echo("Zero height — no text created.")
+        return
+    curves = text_curves(content, height)
+    made = []
+    for c in curves:
+        made.append(ctx.scene.add(g.translate(c, position)))
+    ctx.echo(f"Created {len(made)} text outline curve(s) — extrude or "
+             "planarsrf them for solid lettering.")
+
+
+@command("unrollsrf", aliases=("unroll",))
+def cmd_unrollsrf(ctx):
+    objs = yield SelectReq("Select surfaces to unroll (planar, cylindrical "
+                           "or conical faces)", kinds=("surface", "solid"))
+    layer = ctx.scene.layers.find_by_name("Unrolled")
+    layer_id = layer.id if layer else ctx.scene.layers.create(
+        "Unrolled", (0.55, 0.85, 0.65)).id
+    offset_x = 0.0
+    total = 0
+    for o in objs:
+        for face in g.faces_of(o.shape):
+            try:
+                curves = g.unroll_face(face)
+            except g.GeometryError as exc:
+                ctx.echo(f"{o.name}: {exc}")
+                continue
+            import numpy as np
+            mins = np.full(3, np.inf)
+            maxs = np.full(3, -np.inf)
+            for c in curves:
+                mn, mx = g.bbox(c)
+                mins = np.minimum(mins, mn)
+                maxs = np.maximum(maxs, mx)
+            shift = (offset_x - mins[0], -mins[1], 0)
+            for c in curves:
+                ctx.scene.add(g.translate(c, shift), layer_id=layer_id)
+                total += 1
+            offset_x += (maxs[0] - mins[0]) + max(
+                (maxs[0] - mins[0]) * 0.1, 1.0)
+    ctx.scene.notify()
+    if total:
+        ctx.echo(f"Unrolled {total} boundary curve(s) onto layer "
+                 "'Unrolled' (laid out along +X from the origin).")
+
+
+@command("pipe")
+def cmd_pipe(ctx):
+    rails = yield SelectReq("Select rail curves", kinds=("curve",))
+
+    from . import dragging
+    # a pipe radius is measured out from the rail it wraps, not from anywhere
+    # else in the scene
+    base = dragging.curve_middle(rails[0].shape)
+    side = tuple(ctx.cplane.xdir)
+    read = dragging.distance_from(base)
+
+    def _preview(p):
+        r = read(p)
+        if r < 1e-9:
+            return None
+        try:
+            return g.make_compound(
+                [g.pipe(o.shape, r, cap=False) for o in rails])
+        except g.GeometryError:
+            return None
+
+    rp = yield PointReq("Pipe radius (click, or type a number)",
+                        number_from=(base, side), rubber_from=base,
+                        choices={"Cap": ["Yes", "No"]}, preview_fn=_preview)
+    radius = read(rp)
+    if radius < 1e-9:
+        ctx.echo("Zero radius — no pipe created.")
+        return
+    cap = ctx.opt("Cap", "Yes") == "Yes"
+    made = []
+    for o in rails:
+        try:
+            made.append(ctx.scene.add(g.pipe(o.shape, radius, cap=cap),
+                                      layer_id=o.layer_id))
+        except g.GeometryError as exc:
+            ctx.echo(f"{o.name}: {exc}")
+    ctx.echo(f"Piped {len(made)} curve(s).")
+
+
+@command("edgesrf", aliases=("srfedges",))
+def cmd_edgesrf(ctx):
+    curves = yield SelectReq("Select 2, 3 or 4 connected curves",
+                             kinds=("curve",), min_count=2, max_count=4)
+    srf = g.edge_surface([c.shape for c in curves])
+    obj = ctx.scene.add(srf)
+    ctx.echo(f"Created {obj.name} from {len(curves)} edge curves.")
+
+
+@command("dupborder")
+def cmd_dupborder(ctx):
+    objs = yield SelectReq("Select surfaces, polysurfaces or hatches",
+                           kinds=("surface", "solid", "hatch"))
+    made = []
+    for o in objs:
+        # A hatch is bounded by the region it fills, and knows that
+        # boundary already; its compound also holds the pattern's lines,
+        # which are not a border and must not come back as one (#45).
+        borders = (o.shape.to_curves() if o.kind == "hatch"
+                   else g.free_boundaries(o.shape))
+        for w in borders:
+            made.append(ctx.scene.add(w, layer_id=o.layer_id))
+    if made:
+        ctx.echo(f"Duplicated {len(made)} border curve(s).")
+    else:
+        ctx.echo("No naked borders found (solids have none).")
+
+
+@command("dupedge")
+def cmd_dupedge(ctx):
+    """Duplicate Ctrl+Shift-picked edges as curves."""
+    from .solids_edit import _subobject_edge_map
+    picked = _subobject_edge_map(ctx)
+    if not picked:
+        ctx.echo("Ctrl+Shift-click edges first, then run DupEdge.")
+        yield from ()
+        return
+    made = []
+    for obj_id, edges in picked.items():
+        obj = ctx.scene.get(obj_id)
+        for e in edges:
+            made.append(ctx.scene.add(g.copy_shape(e),
+                                      layer_id=obj.layer_id))
+    ctx.echo(f"Duplicated {len(made)} edge(s) as curves.")
+    yield from ()
+
+
+@command("untrim")
+def cmd_untrim(ctx):
+    objs = yield SelectReq(
+        "Select trimmed surfaces",
+        kinds=("surface",),
+        choices={"Mode": ["Holes", "All"]})
+    holes_only = ctx.opt("Mode", "Holes") == "Holes"
+    n = 0
+    for o in objs:
+        try:
+            ctx.scene.replace_shape(o.id,
+                                    g.untrim(o.shape, holes_only=holes_only))
+            n += 1
+        except g.GeometryError as exc:
+            ctx.echo(f"{o.name}: {exc}")
+    ctx.echo(f"Untrimmed {n} surface(s)"
+             + (" (holes removed)." if holes_only else " (all trims)."))
+
+
+@command("extractisocurve", aliases=("isocurve",))
+def cmd_extractisocurve(ctx):
+    srfs = yield SelectReq("Select surface", kinds=("surface",), max_count=1)
+    o = srfs[0]
+    made = 0
+    while True:
+        p = yield PointReq("Point on surface (Enter to finish)",
+                           allow_empty=True,
+                           choices={"Direction": ["U", "V", "Both"]})
+        if p is None:
+            break
+        d = ctx.opt("Direction", "U").lower()
+        for along in (("u", "v") if d == "both" else (d,)):
+            try:
+                ctx.scene.add(g.iso_curve(o.shape, p, along),
+                              layer_id=o.layer_id)
+                made += 1
+            except g.GeometryError as exc:
+                ctx.echo(str(exc))
+    ctx.echo(f"Extracted {made} isocurve(s).")
+
+
+@command("dupfaceborder")
+def cmd_dupfaceborder(ctx):
+    """Duplicate the border wires of Ctrl+Shift-picked faces as curves."""
+    from ..core import occ
+    from OCP.TopExp import TopExp_Explorer
+    picked = []
+    for (obj_id, kind, idx) in ctx.selection.subobjects:
+        if kind != "face":
+            continue
+        obj = ctx.scene.get(obj_id)
+        if obj is None:
+            continue
+        faces = g.faces_of(obj.shape)
+        if 0 <= idx < len(faces):
+            picked.append((obj, faces[idx]))
+    if not picked:
+        ctx.echo("Ctrl+Shift-click faces first, then run DupFaceBorder.")
+        yield from ()
+        return
+    made = 0
+    for obj, face in picked:
+        exp = TopExp_Explorer(face, occ.WIRE)
+        while exp.More():
+            ctx.scene.add(g.copy_shape(exp.Current()),
+                          layer_id=obj.layer_id)
+            made += 1
+            exp.Next()
+    ctx.echo(f"Duplicated {made} border wire(s) as curves.")
+    yield from ()
+
+
+@command("extractsrf", aliases=("extractsurface", "extractface"))
+def cmd_extractsrf(ctx):
+    """Pull Ctrl+Shift-picked faces out of the polysurfaces holding them.
+
+    Copy=No is Rhino's default and ours: the usual reason to reach for
+    this is to rebuild a face, and leaving the original in place would
+    put a duplicate surface exactly where the new one has to go.
+    """
+    picked: dict = {}
+    for (obj_id, kind, idx) in ctx.selection.subobjects:
+        if kind != "face":
+            continue
+        obj = ctx.scene.get(obj_id)
+        if obj is None or not (0 <= idx < len(g.faces_of(obj.shape))):
+            continue
+        picked.setdefault(obj_id, []).append(idx)
+    if not picked:
+        ctx.echo("Ctrl+Shift-click one or more faces first, "
+                 "then run ExtractSrf.")
+        yield from ()
+        return
+    copy = yield OptionReq("Copy the faces", options=["No", "Yes"],
+                           default="No")
+    made = []
+    for obj_id, indices in picked.items():
+        obj = ctx.scene.get(obj_id)
+        faces = g.faces_of(obj.shape)
+        for i in sorted(set(indices)):
+            made.append(ctx.scene.add(g.copy_shape(faces[i]),
+                                      layer_id=obj.layer_id))
+        if copy == "Yes":
+            continue
+        rest = g.remove_faces(obj.shape, indices)
+        if rest is None:
+            ctx.scene.remove(obj_id)     # every face taken, nothing behind
+        else:
+            ctx.scene.replace_shape(obj_id, rest)
+    # what you extracted is what you want to work on next
+    ctx.select_result(made)
+    ctx.echo(f"Extracted {len(made)} surface(s)"
+             + (" as copies." if copy == "Yes" else "."))
+
+
+def _picked_face_edges(ctx):
+    """[(obj, face_shape, edge_shape, edge_index)] from Ctrl+Shift picks."""
+    out = []
+    for (obj_id, kind, idx) in ctx.selection.subobjects:
+        if kind != "edge":
+            continue
+        obj = ctx.scene.get(obj_id)
+        if obj is None:
+            continue
+        edges = g.edges_of(obj.shape)
+        faces = g.faces_of(obj.shape)
+        if not (0 <= idx < len(edges)) or not faces:
+            continue
+        edge = edges[idx]
+        support = next(
+            (f for f in faces
+             if any(e.IsSame(edge) for e in g.edges_of(f))), faces[0])
+        out.append((obj, support, edge, idx))
+    return out
+
+
+@command("extendsrf")
+def cmd_extendsrf(ctx):
+    """Extend a surface past a Ctrl+Shift-picked boundary edge."""
+    picked = _picked_face_edges(ctx)
+    if not picked:
+        ctx.echo("Ctrl+Shift-click a surface boundary edge first, "
+                 "then run ExtendSrf.")
+        yield from ()
+        return
+    obj, _, _, idx = picked[0]
+
+    from . import dragging
+
+    def _extend(d):
+        return g.extend_surface(obj.shape, idx, d)
+
+    # only the picked edge knows which way the surface grows, and it cannot
+    # say — so extend it a hair and watch which way it went
+    side = tuple(ctx.cplane.xdir)
+    direction = dragging.grow_direction(obj.shape, _extend, fallback=side)
+    base = dragging.edge_point([obj], direction)
+    read = dragging.distance_from(base)
+
+    def _preview(p):
+        d = read(p)
+        if d < 1e-9:
+            return None
+        try:
+            return _extend(d)
+        except g.GeometryError:
+            return None
+
+    lp = yield PointReq("Extension length (click, or type a number)",
+                        axis_lock=(base, direction),
+                        number_from=(base, direction),
+                        rubber_from=base, preview_fn=_preview)
+    length = read(lp)
+    if length < 1e-9:
+        ctx.echo("Zero length — nothing extended.")
+        return
+    ctx.scene.replace_shape(obj.id, g.extend_surface(obj.shape, idx, length))
+    ctx.echo(f"Extended {obj.name} by {length:g}.")
+
+
+@command("blendsrf")
+def cmd_blendsrf(ctx):
+    """G1 blend surface between two Ctrl+Shift-picked surface edges."""
+    picked = _picked_face_edges(ctx)
+    if len(picked) != 2:
+        ctx.echo("Ctrl+Shift-click one edge on each of two surfaces, "
+                 "then run BlendSrf.")
+        yield from ()
+        return
+    (oa, fa, ea, _), (ob, fb, eb, _) = picked
+    blend = g.blend_surfaces(fa, ea, fb, eb)
+    obj = ctx.scene.add(blend, layer_id=oa.layer_id)
+    ctx.echo(f"Created blend {obj.name} between "
+             f"{oa.name} and {ob.name}.")
+    yield from ()

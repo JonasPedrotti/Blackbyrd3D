@@ -1,0 +1,1776 @@
+"""Paper-space layouts: sheets, detail views, and annotations.
+
+Dimensions are millimetres of paper. A detail keeps its scale as
+`scale_denom`, the model units one millimetre of paper shows. The scale it
+is written as is a ratio of real lengths, so the two differ by the
+document's units: 1:4 in an inch document is 4/25.4 inches to the paper
+millimetre (`format_scale`, `parse_scale`).
+"""
+
+from __future__ import annotations
+
+import copy
+import math
+import re
+import uuid
+from dataclasses import dataclass, field, fields, replace
+
+from ..utils.units import TO_MM, paper_units, parse_length
+
+# landscape (width, height) in mm
+PAPER_SIZES = {
+    "A4": (297.0, 210.0),
+    "A3": (420.0, 297.0),
+    "A2": (594.0, 420.0),
+    "A1": (841.0, 594.0),
+    "A0": (1189.0, 841.0),
+    "Letter": (279.4, 215.9),
+    "Tabloid": (431.8, 279.4),
+}
+
+STANDARD_SCALES = [1, 2, 5, 10, 20, 50, 100, 200, 500]
+
+# The scales a detail is offered at, in the order they are offered. Metric
+# drawings and workshop drawings in inches give theirs as ratios; architects
+# and engineers in feet and inches name theirs by a length of paper and the
+# length of model it stands for, and a scale on the list is labelled by the
+# name it has there. No ratio is on a list twice: 3" = 1'-0" is the 1:4
+# already on it.
+METRIC_SCALES = ("1:1", "1:2", "1:5", "1:10", "1:20", "1:50", "1:100",
+                 "1:200")
+IMPERIAL_SCALES = (
+    "1:1", "1:2", "1:4", "1:8",
+    '1" = 1\'-0"', '3/4" = 1\'-0"', '1/2" = 1\'-0"', '3/8" = 1\'-0"',
+    '1/4" = 1\'-0"', '3/16" = 1\'-0"', '1/8" = 1\'-0"', '1/16" = 1\'-0"',
+    '1" = 10\'', '1" = 20\'', '1" = 50\'', '1" = 100\'',
+)
+
+
+def scale_presets(units: str) -> tuple:
+    """The scales a detail is offered at in a document of `units`."""
+    return IMPERIAL_SCALES if units in ("in", "ft") else METRIC_SCALES
+
+
+def _uid() -> str:
+    return uuid.uuid4().hex[:8]
+
+
+@dataclass
+class DetailView:
+    id: str = field(default_factory=_uid)
+    # rectangle on paper, mm, origin bottom-left of sheet
+    x: float = 10.0
+    y: float = 10.0
+    w: float = 100.0
+    h: float = 80.0
+    # camera
+    azimuth: float = math.radians(-90)      # top view default
+    elevation: float = math.radians(89.9)
+    target: list = field(default_factory=lambda: [0.0, 0.0, 0.0])
+    perspective: bool = False
+    scale_denom: float = 10.0               # model units to the paper mm
+    perspective_distance: float = 60.0      # camera distance when perspective
+    display_mode: str = "wireframe"         # wireframe|shaded|hidden|technical
+    locked: bool = False                    # its view and scale (#130)
+    # Locked as an item by `lock`: drawn and snapped to, but never picked.
+    # Every sheet item has one, and it has nothing to do with `locked`.
+    item_locked: bool = False
+    show_border: bool = True
+    show_label: bool = True
+    section_offset: float | None = None   # cut plane distance from target
+    # layers this detail leaves out, as Rhino's per-detail visibility does
+    # (a sublayer goes with its parent); the model itself is untouched
+    hidden_layers: list = field(default_factory=list)
+
+    # and single objects, by id, as Rhino's HideInDetail leaves them out;
+    # assigned anew, never edited in place, as undo keeps a copy
+    hidden_objects: list = field(default_factory=list)
+
+    def left_out(self, scene) -> set:
+        """The ids of the objects this detail does not draw or let you
+        pick, on top of what is hidden anyway: its own hidden ones and
+        everything on a layer it leaves out. While a command picks from
+        objects on show (`Scene.showing_only`), it leaves out only the
+        layers, so what it hid can be drawn to be picked."""
+        layers = scene.layers.with_descendants(self.hidden_layers) \
+            if self.hidden_layers else set()
+        out = {o.id for o in scene.all() if o.layer_id in layers}
+        if scene.showing_only is None:
+            out.update(self.hidden_objects)
+        return out
+
+    def contains(self, px: float, py: float) -> bool:
+        return (self.x <= px <= self.x + self.w
+                and self.y <= py <= self.y + self.h)
+
+    def scale_text(self, units: str) -> str:
+        """The scale as it is written in a document of `units`."""
+        if self.perspective:
+            return "perspective"
+        return format_scale(self.scale_denom, units)
+
+
+@dataclass
+class TextNote:
+    id: str = field(default_factory=_uid)
+    x: float = 0.0
+    y: float = 0.0
+    text: str = ""             # may contain newlines
+    height: float = 4.0        # mm
+    style: str = ""            # named style overrides height when set
+    # Empty family identifies old notes, whose em sizing and line spacing
+    # must remain unchanged until the user edits their typography.
+    font_family: str = ""
+    font_style: str = ""
+    alignment: str = "left"
+    # A patch of paper under the lettering, hiding what lies behind it,
+    # reaching `margin` cap heights past it on every side.
+    background: bool = False
+    margin: float = 0.25
+    item_locked: bool = False  # by `lock` (see DetailView)
+
+
+@dataclass
+class LinearDim:
+    id: str = field(default_factory=_uid)
+    x1: float = 0.0
+    y1: float = 0.0
+    x2: float = 0.0
+    y2: float = 0.0
+    offset: float = 8.0        # mm from the measured points
+    text: str = ""             # empty -> auto (measured length)
+    scale_denom: float = 1.0   # to express model-space length
+    style: str = ""
+    # associative anchors: model-space points seen through a detail.
+    # When set, x/y are recomputed from the detail camera each draw.
+    detail_id: str = ""
+    m1: list | None = None     # [x, y, z]
+    m2: list | None = None
+    # drawn on bare paper, so it measures the paper and not the model
+    measures_paper: bool = False
+    item_locked: bool = False  # by `lock` (see DetailView)
+
+
+@dataclass
+class Leader:
+    id: str = field(default_factory=_uid)
+    points: list = field(default_factory=list)   # [[x,y], ...] arrow at [0]
+    text: str = ""
+    height: float = 3.5
+    style: str = ""
+    item_locked: bool = False  # by `lock` (see DetailView)
+
+
+# Every fill the app has of its own, in the order they are offered. A
+# layer names one of these as the material it is hatched with, so the
+# list a layer can be set to and the list the `hatch` command offers are
+# one list and cannot drift apart. The same list as
+# hatch_patterns.BUILTIN_NAMES, kept here so this module needs no numpy.
+HATCH_PATTERNS = ("lines", "cross", "solid", "dash", "dots", "plus",
+                  "squares", "triangles", "brick")
+
+# What a layer's material can be filled with where a section cuts it: any
+# of the patterns, or none at all. None is a material's choice not to be
+# hatched, which a hatch drawn by hand cannot make, so layers offer it and
+# the hatch command does not.
+SECTION_FILLS = ("none", *HATCH_PATTERNS)
+
+
+def hatch_patterns_of(scene) -> tuple:
+    """Every pattern a hatch in this drawing can be drawn with: the app's
+    own, then in one list by name those installed from .pat files and
+    those the drawing brought with it (#92)."""
+    from .hatch_patterns import installed
+    names: dict = {}
+    for name in (*(getattr(scene, "hatch_patterns", None) or {}),
+                 *installed()):
+        names.setdefault(name.lower(), name)
+    return (*HATCH_PATTERNS,
+            *sorted(names.values(), key=lambda n: n.lower()))
+
+
+def section_fills_of(scene) -> tuple:
+    """Every fill a layer in this drawing can name for its material."""
+    return ("none", *hatch_patterns_of(scene))
+
+
+def pattern_label(name: str) -> str:
+    """A pattern's name as a list shows it: the app's own capitalised,
+    as they always were, a loaded one as its file spells it."""
+    return name.capitalize() if name.lower() in SECTION_FILLS else name
+
+
+def pattern_named(scene, text) -> str | None:
+    """The pattern a typed or picked name means in this drawing, spelled
+    the way it is kept, or None for one it has no pattern by."""
+    key = str(text or "").strip().lower()
+    for name in section_fills_of(scene):
+        if name.lower() == key:
+            return name
+    return None
+
+
+@dataclass
+class Hatch:
+    id: str = field(default_factory=_uid)
+    points: list = field(default_factory=list)   # closed polygon [[x,y],...]
+    holes: list = field(default_factory=list)    # rings left empty, same form
+    pattern: str = "lines"                       # see hatch_patterns_of
+    angle: float = 45.0
+    spacing: float = 3.0                         # mm
+    color: list | None = None                    # [r, g, b] 0..1; None: ink
+    item_locked: bool = False  # by `lock` (see DetailView)
+
+
+@dataclass
+class RadialDim:
+    id: str = field(default_factory=_uid)
+    cx: float = 0.0
+    cy: float = 0.0
+    px: float = 0.0        # point on the circle (paper mm)
+    py: float = 0.0
+    diameter: bool = False
+    scale_denom: float = 1.0
+    text: str = ""
+    style: str = ""
+    measures_paper: bool = False
+    item_locked: bool = False  # by `lock` (see DetailView)
+
+
+def measured_text(dim, paper_length: float, scene=None) -> str:
+    """What a dimension says it measures, `paper_length` millimetres of
+    paper apart: the paper itself in the units its sheet is read in, if it
+    was drawn on bare paper, or else the model through a detail, at
+    `scale_denom` model units to the millimetre, in the document's units.
+    Its own text, when it has one, is the caller's to put first."""
+    if dim.measures_paper:
+        return (scene.format_paper_length(paper_length) if scene is not None
+                else f"{paper_length:g}")
+    measured = paper_length * dim.scale_denom
+    return (scene.format_length(measured) if scene is not None
+            else f"{measured:g}")
+
+
+@dataclass
+class AngularDim:
+    id: str = field(default_factory=_uid)
+    vx: float = 0.0        # vertex
+    vy: float = 0.0
+    x1: float = 0.0
+    y1: float = 0.0
+    x2: float = 0.0
+    y2: float = 0.0
+    radius: float = 15.0   # arc placement radius, mm
+    item_locked: bool = False  # by `lock` (see DetailView)
+
+
+@dataclass
+class PaperObject:
+    """Geometry drawn on the paper itself, in millimetres.
+
+    A real shape rather than a list of points, so that offset, trim, fillet
+    and the rest work on a border or a detail bubble the same way they work on
+    the model. Nothing here is seen through a detail: 100 means 100mm across
+    the sheet.
+
+    Keep every field but the shape immutable — the copy below is shallow, and
+    a list or dict here would be shared between undo checkpoints.
+    """
+    id: str = field(default_factory=_uid)
+    shape: object = None                 # a TopoDS shape in paper millimetres
+    name: str = ""
+    color: tuple | None = None           # None -> the sheet's default ink
+    linetype: str = "Continuous"
+    lineweight: float = 0.25             # millimetres, as on a drawing
+    item_locked: bool = False            # by `lock` (see DetailView)
+    _plines: tuple | None = field(default=None, repr=False, compare=False)
+    _pts: tuple | None = field(default=None, repr=False, compare=False)
+
+    @property
+    def polylines(self) -> list:
+        """The shape as (N, 3) polylines, in paper millimetres.
+
+        Polylines rather than loose segments, so that a dash pattern runs
+        along a whole curve instead of restarting at every tessellation step.
+
+        Keyed on the shape it measured rather than cleared by hand: a shape is
+        changed here by swapping in a new one, so the answer expires by itself
+        and there is no invalidation to forget at a call site — the same trick
+        `SceneObject.bbox` uses.
+        """
+        cached = self._plines
+        if cached is not None and cached[0] is self.shape:
+            return cached[1]
+        from . import geometry, hlr
+        from .picture import PictureShape
+        if isinstance(self.shape, PictureShape):
+            if self.shape.plane.get("region_brep"):
+                lines = hlr.edges_to_polylines(
+                    geometry.edges_of(self.shape.face()))
+            else:
+                import numpy as np
+                vertices = self.shape.vertices
+                lines = [np.vstack((vertices, vertices[0]))]
+        else:
+            lines = hlr.edges_to_polylines(geometry.edges_of(self.shape))
+        self._plines = (self.shape, lines)
+        return lines
+
+    @property
+    def points(self) -> list:
+        """The shape's free-standing points, in paper millimetres.
+
+        A point object is the one thing on a sheet with no line work in it, so
+        walking edges walks past it. Kept apart from `polylines` rather than
+        folded in as a polyline of one, because everything reading polylines
+        reads them as something to walk along: dashing them, measuring them,
+        asking what a click landed near.
+
+        Keyed on the shape the same way `polylines` is, and for the same reason.
+        """
+        cached = self._pts
+        if cached is not None and cached[0] is self.shape:
+            return cached[1]
+        from . import geometry
+        from .picture import PictureShape
+        # Pictures use a lightweight textured mesh rather than an OpenCascade
+        # shape.  Their four corners already live in ``polylines`` for picking
+        # and outlining; they have no free-standing point marks to draw.
+        pts = [] if isinstance(self.shape, PictureShape) \
+            else geometry.free_points(self.shape)
+        self._pts = (self.shape, pts)
+        return pts
+
+    def __deepcopy__(self, memo):
+        """Copy for the undo stack, sharing the shape.
+
+        `copy.deepcopy` of a TopoDS shape raises outright — it will not
+        pickle — and there is nothing to gain by copying one: a shape is never
+        edited in place, an edit replaces it, so two checkpoints can hold the
+        same shape safely. The same bargain `SceneObject.clone` makes.
+
+        It lives here rather than in `Layout.clone` because anything that
+        copies a scene reaches a layout eventually, and the object that owns
+        the shape is the one place that knows this.
+        """
+        twin = replace(self)
+        memo[id(self)] = twin
+        return twin
+
+
+def merge_line_groups(entries: list) -> list:
+    """A detail's visible line work bucketed by the pen it plots with.
+
+    `entries` is one (print width in mm, linetype name, polylines) for each
+    object the hidden-line pass drew. Objects that plot at the same width with
+    the same dash pattern come out as one group, so a plot puts down as few
+    pens as the drawing has distinct ones rather than one per object. First-
+    seen order is kept, so the same drawing groups the same way every run.
+    """
+    groups: dict = {}
+    order: list = []
+    for width, name, polys in entries:
+        key = (round(float(width), 6), name or "Continuous")
+        if key not in groups:
+            groups[key] = []
+            order.append(key)
+        groups[key].extend(polys)
+    return [(key[0], key[1], groups[key]) for key in order]
+
+
+def hatch_region(loops: list, angle_deg: float, spacing: float) -> list:
+    """Hatch segments filling a region, as [((x0,y0),(x1,y1)), ...].
+
+    `loops` is the ring around the outside followed by the rings punched
+    out of it, in the coordinates the segments come back in. Every ring
+    crosses the scanline, and the crossings are paired off in order, so a
+    line that enters the material at the outer ring leaves it again at
+    the hole and picks up on the far side. That is the whole reason a
+    hatch is asked about a region and not about one closed polygon: a
+    section through a pipe is a ring of wall, and filling the bore in
+    turns it into a bar.
+    """
+    import numpy as np
+    rings = [np.asarray(ring, float) for ring in loops if len(ring) >= 3]
+    if not rings or spacing <= 0:
+        return []
+    a = math.radians(angle_deg)
+    rot = np.array([[math.cos(-a), -math.sin(-a)],
+                    [math.sin(-a), math.cos(-a)]])
+    local = [ring @ rot.T for ring in rings]
+    y0 = min(ring[:, 1].min() for ring in local)
+    y1 = max(ring[:, 1].max() for ring in local)
+    inv = np.array([[math.cos(a), -math.sin(a)],
+                    [math.sin(a), math.cos(a)]])
+    out = []
+    y = y0 + spacing / 2
+    while y < y1:
+        xs = []
+        for ring in local:
+            n = len(ring)
+            for i in range(n):
+                p, q = ring[i], ring[(i + 1) % n]
+                if (p[1] > y) != (q[1] > y):
+                    t = (y - p[1]) / (q[1] - p[1])
+                    xs.append(p[0] + t * (q[0] - p[0]))
+        xs.sort()
+        for i in range(0, len(xs) - 1, 2):
+            a2 = inv @ np.array([xs[i], y])
+            b2 = inv @ np.array([xs[i + 1], y])
+            out.append(((float(a2[0]), float(a2[1])),
+                        (float(b2[0]), float(b2[1]))))
+        y += spacing
+    return out
+
+
+def hatch_lines(points: list, angle_deg: float,
+                spacing: float) -> list:
+    """Hatch segments filling a closed polygon (even-odd), as
+    [((x0,y0),(x1,y1)), ...] in the same coordinates as `points`."""
+    return hatch_region([points], angle_deg, spacing)
+
+
+def cut_patterns(data: dict) -> list:
+    """What a detail's cut faces are made of, in the order they come in.
+
+    The hidden-line pass carries the object every cut face was cut from
+    along beside the face; this is the half of that a fill needs. A
+    detail with no such record, an old cache or a caller that never had
+    one, gets an empty list and is hatched the way it always was.
+    """
+    return [pattern
+            for _oid, pattern, _region in (data.get("cut_by_obj") or [])]
+
+
+@dataclass(frozen=True)
+class SectionFill:
+    """How a cut face is drawn: the pattern it is filled with, the angle
+    and spacing of its lines on the paper (degrees, millimetres), and the
+    colour they are drawn in, as an (r, g, b) in 0..1, or None for the ink
+    the rest of the sheet is drawn in. Then the line round the face: its
+    width on the paper in millimetres, 0 for none, and its colour, the
+    same way (#82). `definition` is the pattern a name from the drawing's
+    library stands for (#92), and `background` the colour the face is
+    flooded with under its lines, or None to leave it as it was (#91)."""
+    pattern: str = "lines"
+    angle: float = 45.0
+    spacing: float = 2.5
+    color: tuple | None = None
+    cut_line_width: float = 0.5
+    cut_line_color: tuple | None = None
+    definition: object = None
+    background: tuple | None = None
+
+
+# Past this many segments a face's pattern is too fine for its size, and
+# the sheet draws what it has rather than locking up drawing the rest.
+MAX_PAPER_SEGMENTS = 50000
+
+
+def section_drawing(regions: list, cx: float, cy: float, s: float,
+                    fills: list | None = None,
+                    min_dot: float = 0.0, snap=None) -> tuple:
+    """A detail's section cuts on the paper, ready to draw.
+
+    `regions` arrive in the detail's projector frame, in model units;
+    `cx`, `cy` and `s` place them on the sheet. `fills` is aligned with
+    `regions` and says how each cut face is filled, off whatever it was
+    cut from (`SectionFill`); a region with none gets plain lines.
+
+    Returns three things, all in paper millimetres:
+    - the hatch lines, as (colour, segments) with one entry per colour
+      in the order the colours first come up, so a painter changes pen
+      once a colour rather than once a face;
+    - the outlines, as (colour, width, rings) with one entry per pen in
+      the order the pens first come up, every ring of every face that
+      has a cut line; a face whose cut line is 0 wide is left out;
+    - the faces to flood, as (colour, rings) with the bore among the
+      rings: solid is not a set of segments, it is the face itself, and
+      a face with a background is flooded in it under its lines.
+
+    "cross" goes over a face a second time square to the first, "none"
+    leaves it outlined and empty, a pattern from the drawing's library is
+    drawn family by family, and anything else (no pattern, or one out of
+    a file this drawing has no pattern for) gets the plain lines it always
+    got. The screen and the plot both draw this, and they used to work
+    it out separately: one of them was always going to be a version
+    behind.
+    """
+    from .hatch_patterns import dot_polygon, fill_segments
+    fills = fills or []
+    lines: dict = {}
+    outlines: dict = {}
+    floods = []
+    for i, region in enumerate(regions):
+        paper = [[(cx + px * s, cy + py * s) for px, py in ring]
+                 for ring in region if len(ring) >= 3]
+        if not paper:
+            continue
+        fill = fills[i] if i < len(fills) else SectionFill()
+        solid = fill.pattern == "solid" or getattr(fill.definition, "solid",
+                                                   False)
+        if solid:
+            floods.append((fill.color, paper))
+        elif fill.pattern != "none":
+            if fill.background is not None:
+                floods.append((fill.background, paper))
+            segs, dots = fill_segments(
+                paper, fill.definition, fill.pattern, fill.angle,
+                fill.spacing, limit=MAX_PAPER_SEGMENTS, dots=True)
+            lines.setdefault(fill.color, []).extend(segs)
+            # a dot is filled, the way a solid face is, in the hatch's ink
+            floods.extend((fill.color, [dot_polygon(
+                c if snap is None else snap(*c), max(r, min_dot))])
+                for c, r in dots)
+        if fill.cut_line_width > 0:
+            outlines.setdefault((fill.cut_line_color, fill.cut_line_width),
+                                []).extend(paper)
+    return [(color, segs) for color, segs in lines.items() if segs], \
+        [(color, width, rings)
+         for (color, width), rings in outlines.items()], floods
+
+
+def detail_hatches(hatches: list, looks: list, cx: float, cy: float,
+                   s: float, min_dot: float = 0.0, snap=None) -> tuple:
+    """A detail's hatch objects on the paper, ready to draw (#91, #92).
+
+    `hatches` are what the detail's pass carried out, (object id, fill
+    triangles, pattern lines, dots as (centre, radius)) in its projector
+    frame and model units,
+    and `looks` is aligned with them: each one's (colour, background), an
+    (r, g, b) or None, whether it is solid, and its print width in mm, 0
+    for the device's. Returns, in paper mm, the triangles to fill, as
+    (colour, triangles), and the lines to draw, as (colour, width,
+    segments): a background or a solid fill under its lines, and nothing
+    at all of its edge. A colour of None is ink: a solid's poché, a line's
+    pen. `min_dot` is the smallest radius a dot is drawn at, in paper mm,
+    so a screen shows one however far out it is zoomed, and `snap` moves a
+    dot's centre, in paper mm, onto the screen's pixels, so every dot a few
+    pixels across comes out the same shape.
+    """
+    import numpy as np
+    from .hatch_patterns import dot_polygon
+    floods, lines = [], {}
+    for (_oid, tris, segs, dots), (color, ground, solid, width) in zip(
+            hatches, looks):
+        if solid:
+            if len(tris):
+                floods.append((color, np.asarray(tris, float) * s
+                               + (cx, cy)))
+            continue
+        if ground is not None and len(tris):
+            floods.append((ground, np.asarray(tris, float) * s + (cx, cy)))
+        if len(segs):
+            lines.setdefault((color, float(width)), []).append(
+                np.asarray(segs, float) * s + (cx, cy))
+        if dots:
+            # each dot filled, as a fan of the small circle it is
+            fans = []
+            for centre, radius in dots:
+                at = (cx + centre[0] * s, cy + centre[1] * s)
+                if snap is not None:
+                    at = snap(*at)
+                ring = np.asarray(dot_polygon(at, max(radius * s, min_dot)),
+                                  float)
+                fans.extend((ring[0], ring[k], ring[k + 1])
+                            for k in range(1, len(ring) - 1))
+            floods.append((color, np.asarray(fans)))
+    return floods, [(color, width, np.concatenate(parts))
+                    for (color, width), parts in lines.items()]
+
+
+def cut_hatching(regions: list, cx: float, cy: float, s: float,
+                 angle: float = 45.0, spacing: float = 2.5,
+                 patterns: list | None = None) -> tuple:
+    """A detail's section cuts on the paper, all in the one ink: the hatch
+    segments, the loops to outline and the faces to flood.
+
+    `patterns` is aligned with `regions` and names each face's pattern;
+    `angle` and `spacing` go for every face. `section_drawing` is the
+    same answer with each face's own angle, spacing and colour.
+    """
+    fills = [SectionFill(patterns[i] if patterns and i < len(patterns)
+                         else "", angle, spacing)
+             for i in range(len(regions))]
+    lines, outlines, floods = section_drawing(regions, cx, cy, s, fills)
+    return ([seg for _color, segs in lines for seg in segs],
+            [ring for _color, _width, rings in outlines for ring in rings],
+            [rings for _color, rings in floods])
+
+
+DEFAULT_STYLES = {
+    "Standard": {"text_height": 3.2, "arrow_size": 2.2, "dim_offset": 8.0},
+    "Small":    {"text_height": 2.2, "arrow_size": 1.6, "dim_offset": 5.0},
+    "Heading":  {"text_height": 6.0, "arrow_size": 2.2, "dim_offset": 8.0},
+}
+
+# A sheet read in inches is lettered from round inches near the metric
+# sizes, 1/8" text for Standard, though they are kept in millimetres too.
+INCH_STYLES = {
+    name: {key: inches * TO_MM["in"] for key, inches in sizes.items()}
+    for name, sizes in {
+        "Standard": {"text_height": 0.125, "arrow_size": 0.09,
+                     "dim_offset": 0.3},
+        "Small":    {"text_height": 0.09, "arrow_size": 0.06,
+                     "dim_offset": 0.2},
+        "Heading":  {"text_height": 0.25, "arrow_size": 0.09,
+                     "dim_offset": 0.3},
+    }.items()
+}
+
+# What a new note is lettered at when nothing else says, in either set.
+NOTE_HEIGHTS = {"metric": 4.0, "inch": 0.15 * TO_MM["in"]}
+
+
+def style_set(scene) -> str:
+    """The built-in styles `scene` is lettered in, "metric" or "inch".
+
+    They are the ones for the units its sheets are read in, unless what is
+    lettered already was lettered in the others (`Scene.annot_style_set`):
+    lettering keeps its sizes when the units change, and a drawing written
+    before inch documents had inch styles stays metric."""
+    chosen = getattr(scene, "annot_style_set", None)
+    if chosen in ("metric", "inch"):
+        return chosen
+    units = paper_units(getattr(scene, "units", "mm"))
+    return "inch" if units == "in" else "metric"
+
+
+def builtin_styles(scene) -> dict:
+    """Standard, Small and Heading as `scene` letters them."""
+    return INCH_STYLES if style_set(scene) == "inch" else DEFAULT_STYLES
+
+
+def default_note_height(scene) -> float:
+    """A new note's cap height, in millimetres."""
+    return NOTE_HEIGHTS[style_set(scene)]
+
+
+def lettered_in_builtin_styles(scene) -> bool:
+    """Whether anything on a sheet takes its size from a built-in style:
+    every linear dimension, an unstyled one from Standard, and any styled
+    note. Radial and angular dimensions are lettered at their own size."""
+    return any(lay.dims or any(note.style for note in lay.notes)
+               for lay in getattr(scene, "layouts", ()))
+
+
+def annotation_style(scene, name: str) -> dict:
+    """Named annotation style merged over the Standard defaults."""
+    builtin = builtin_styles(scene)
+    props = dict(builtin["Standard"])
+    if name:
+        props.update(builtin.get(name, {}))
+        if scene is not None:
+            props.update(getattr(scene, "annot_styles", {}).get(name, {}))
+    return props
+
+
+def note_text_height(note, scene=None) -> float:
+    """Paper height used to render a note's text."""
+    if getattr(note, "style", ""):
+        return float(annotation_style(scene, note.style)["text_height"])
+    return float(note.height)
+
+
+def letters_capitals(scene) -> bool:
+    """Whether a text height on `scene`'s sheets is the height of its
+    capitals, as drafting measures it. In a drawing saved before it was,
+    dimensions, leaders and notes not made in the on-screen editor gave
+    their height to the font as its size, which printed their capitals
+    about 0.71 of it, and they go on printing as they did
+    (`Scene.text_height_measures`). Without a drawing, as in a new one."""
+    return getattr(scene, "text_height_measures", "capitals") == "capitals"
+
+
+def font_size(height: float, scene=None) -> float:
+    """The font size, in paper millimetres, that sheet text `height` high
+    is lettered in."""
+    if not letters_capitals(scene):
+        return height
+    from .text import cap_height_ratio
+    return height / cap_height_ratio()
+
+
+def lettered_by_font_size(scene) -> bool:
+    """Whether anything on a sheet would print otherwise if its height were
+    the capitals' (`letters_capitals`): any dimension or leader, and a note
+    not made in the on-screen editor, which letters its own by them."""
+    return any(lay.dims or lay.rdims or lay.adims or lay.leaders
+               or any(not note.font_family for note in lay.notes)
+               for lay in getattr(scene, "layouts", ()))
+
+
+def _on_axis(v, tol: float = 5e-3):
+    """`v` with components a whisker from 0 or ±1 rounded to them."""
+    import numpy as np
+    out = np.asarray(v, float).copy()
+    near = np.abs(np.abs(out) - 1.0) < tol
+    out[np.abs(out) < tol] = 0.0
+    out[near] = np.sign(out[near])
+    n = np.linalg.norm(out)
+    return out / n if n > 1e-12 else np.asarray(v, float)
+
+
+# The views a detail is offered, in the order Properties lists them. Named as
+# the commands name them, and read off the same table the model's camera is.
+DETAIL_VIEWS = ("Top", "Front", "Right", "Left", "Back", "Bottom",
+                "Isometric", "Perspective")
+
+
+def detail_view_name(detail) -> str | None:
+    """The named view a detail looks along, or None when it was aimed by
+    hand."""
+    from ..ui.camera import STANDARD_VIEWS
+    for name in DETAIL_VIEWS:
+        azimuth, elevation = STANDARD_VIEWS[name.lower()]
+        delta = (detail.azimuth - azimuth + math.pi) % (2 * math.pi) - math.pi
+        if (detail.perspective == (name == "Perspective")
+                and math.isclose(delta, 0, abs_tol=1e-7)
+                and math.isclose(detail.elevation, elevation, abs_tol=1e-7)):
+            return name
+    return None
+
+
+def detail_aimed_at(detail, name: str, bounds) -> dict:
+    """The camera fields that turn `detail` to a named view; empty when it
+    already looks that way.
+
+    Frame, scale and target stay: a detail turned is the same window onto
+    the same place, from another side. `bounds` is the model's box, which a
+    turn to perspective has to stand back far enough to see all of.
+    """
+    from ..ui.camera import STANDARD_VIEWS
+    azimuth, elevation = STANDARD_VIEWS[name.lower()]
+    perspective = name.lower() == "perspective"
+    fields = {"azimuth": azimuth, "elevation": elevation,
+              "perspective": perspective}
+    if all(getattr(detail, key) == value for key, value in fields.items()):
+        return {}
+    if perspective and not detail.perspective and bounds is not None:
+        from itertools import product
+        # Enclose the model about the existing target in a sphere, then stand
+        # back beyond both the horizontal and the vertical field of view.
+        radius = max(math.dist(point, detail.target)
+                     for point in product(*zip(*bounds)))
+        aspect = max(detail.w, 1e-6) / max(detail.h, 1e-6)
+        half_angle = math.atan(math.tan(math.pi / 8) * min(aspect, 1.0))
+        fields["perspective_distance"] = max(
+            detail.perspective_distance,
+            radius * 1.1 / math.sin(half_angle))
+    return fields
+
+
+def detail_basis(detail):
+    """The basis a detail's geometry is measured in: view dir, right, up.
+
+    The named views are aimed 0.1 degrees off vertical so the camera basis
+    never degenerates. Geometry must not inherit that lean — a line drawn in a
+    top view has to come out level — so an axis the basis is within a whisker
+    of is the axis it gets.
+    """
+    import numpy as np
+    from ..ui.layout_view import detail_direction
+    d, right, _up = detail_direction(detail)
+    d, right = _on_axis(d), _on_axis(right)
+    right = right - np.dot(right, d) * d
+    n = np.linalg.norm(right)
+    if n > 1e-12:
+        right = right / n
+    return d, right, np.cross(right, -d)
+
+
+def detail_project(detail, model_pt) -> tuple[float, float]:
+    """Model-space point -> paper mm through a detail's camera."""
+    import numpy as np
+    d, right, up = detail_basis(detail)
+    rel = np.asarray(model_pt, float) - np.asarray(detail.target, float)
+    u = float(np.dot(rel, right)) / detail.scale_denom
+    v = float(np.dot(rel, up)) / detail.scale_denom
+    return detail.x + detail.w / 2 + u, detail.y + detail.h / 2 + v
+
+
+def detail_unproject(detail, px: float, py: float) -> list:
+    """Paper mm -> model-space point on the detail's view plane."""
+    import numpy as np
+    d, right, up = detail_basis(detail)
+    u = (px - detail.x - detail.w / 2) * detail.scale_denom
+    v = (py - detail.y - detail.h / 2) * detail.scale_denom
+    return [float(c) for c in
+            np.asarray(detail.target, float) + right * u + up * v]
+
+
+def detail_model_point(detail, px: float, py: float,
+                       grid_step: float = 0.0) -> tuple:
+    """The model point a detail shows at paper (px, py).
+
+    Inside a detail you are drawing in the model, and the plane you draw on
+    is the one the detail looks at — the same relationship the CPlane has to
+    model space. Any grid snap therefore rounds in model units on that
+    plane, because a round number here belongs to the geometry that gets
+    built, not to the paper it is being viewed on.
+    """
+    if grid_step > 0:
+        cx, cy = detail.x + detail.w / 2, detail.y + detail.h / 2
+        u = round((px - cx) * detail.scale_denom / grid_step) * grid_step
+        v = round((py - cy) * detail.scale_denom / grid_step) * grid_step
+        px = cx + u / detail.scale_denom
+        py = cy + v / detail.scale_denom
+    return tuple(round(c, 9) for c in detail_unproject(detail, px, py))
+
+
+def resolve_associative(layout):
+    """Refresh paper coordinates of detail-anchored dimensions."""
+    details = {d.id: d for d in layout.details}
+    for dim in layout.dims:
+        det = details.get(getattr(dim, "detail_id", ""))
+        if det is None or dim.m1 is None or dim.m2 is None:
+            continue
+        dim.x1, dim.y1 = detail_project(det, dim.m1)
+        dim.x2, dim.y2 = detail_project(det, dim.m2)
+        dim.scale_denom = det.scale_denom
+
+
+def _dist_seg(px, py, a, b) -> float:
+    import numpy as np
+    p = np.array([px, py], float)
+    a = np.asarray(a, float)[:2]
+    b = np.asarray(b, float)[:2]
+    ab = b - a
+    denom = float(ab @ ab)
+    t = 0.0 if denom < 1e-12 else float(np.clip((p - a) @ ab / denom, 0, 1))
+    return float(np.linalg.norm(p - (a + t * ab)))
+
+
+def annotation_at(layout, px: float, py: float, tol: float = 2.0,
+                  scene=None, locked: bool = True):
+    """Topmost annotation near a paper point -> (kind, obj) or None.
+
+    Kinds: note, leader, dim, rdim, adim, hatch (dims before hatches so
+    outlines don't shadow them). `locked=False` passes over what `lock`
+    has locked, as a pick must: what is under it is found instead."""
+    def topmost(pool):
+        return [o for o in reversed(pool) if locked or not o.item_locked]
+
+    for note in topmost(layout.notes):
+        x0, y0, x1, y1 = annotation_bounds("note", note, scene)
+        if x0 - tol <= px <= x1 + tol and y0 - tol <= py <= y1 + tol:
+            return ("note", note)
+    for dim in topmost(layout.dims):
+        import numpy as np
+        a = np.array([dim.x1, dim.y1])
+        b = np.array([dim.x2, dim.y2])
+        d = b - a
+        n = np.linalg.norm(d)
+        if n < 1e-9:
+            continue
+        nvec = np.array([-d[1], d[0]]) / n
+        if _dist_seg(px, py, a + nvec * dim.offset,
+                     b + nvec * dim.offset) <= tol:
+            return ("dim", dim)
+    for rd in topmost(layout.rdims):
+        if _dist_seg(px, py, (rd.cx, rd.cy), (rd.px, rd.py)) <= tol:
+            return ("rdim", rd)
+    for ad in topmost(layout.adims):
+        import math as _m
+        r = _m.hypot(px - ad.vx, py - ad.vy)
+        if abs(r - ad.radius) <= tol * 1.5:
+            return ("adim", ad)
+    for leader in topmost(layout.leaders):
+        pts = leader.points
+        for a, b in zip(pts[:-1], pts[1:]):
+            if _dist_seg(px, py, a, b) <= tol:
+                return ("leader", leader)
+    for hatch in topmost(layout.hatches):
+        if _point_in_poly(px, py, hatch.points):
+            return ("hatch", hatch)
+    return None
+
+
+def paper_object_at(layout, px: float, py: float, tol: float = 2.0,
+                    locked: bool = True):
+    """Topmost paper geometry near a paper point -> PaperObject or None.
+
+    Picked by its ink, the way a curve is picked in the model: what a border
+    encloses is the rest of the sheet, and a click in the middle of the page
+    means the page. `locked=False` passes over what `lock` has locked.
+    """
+    from .picture import PictureShape
+    for obj in reversed(layout.objects):        # drawn last, so on top
+        if obj.item_locked and not locked:
+            continue
+        # A picture has visible ink throughout its textured triangles.  Its
+        # rectangular outline remains useful for snaps and trimmed edges, but
+        # making that thin outline the only pick target is unlike clicking any
+        # other filled object on screen.
+        if isinstance(obj.shape, PictureShape):
+            for triangle in obj.shape.triangles:
+                if _point_in_poly(px, py, obj.shape.vertices[triangle]):
+                    return obj
+        for poly in obj.polylines:
+            for a, b in zip(poly[:-1], poly[1:]):
+                if _dist_seg(px, py, a, b) <= tol:
+                    return obj
+        # a point has no ink to be near, so being near the point is the test
+        for p in obj.points:
+            if math.hypot(px - float(p[0]), py - float(p[1])) <= tol:
+                return obj
+    return None
+
+
+def paper_object_bounds(obj) -> tuple:
+    """Paper-space bbox (x0, y0, x1, y1) of paper geometry.
+
+    From the polylines rather than the shape's own bbox, so a curve is only as
+    big as it draws and the answer follows the same cache a repaint uses.
+    """
+    xs, ys = [], []
+    for poly in obj.polylines:
+        for p in poly:
+            xs.append(float(p[0]))
+            ys.append(float(p[1]))
+    for p in obj.points:
+        xs.append(float(p[0]))
+        ys.append(float(p[1]))
+    if not xs:
+        return (0.0, 0.0, 0.0, 0.0)
+    return (min(xs), min(ys), max(xs), max(ys))
+
+
+def _seg_hits_rect(a, b, lo: tuple, hi: tuple) -> bool:
+    """Does the segment a-b touch the axis-aligned rect? (Liang-Barsky.)"""
+    x0, y0 = float(a[0]), float(a[1])
+    dx, dy = float(b[0]) - x0, float(b[1]) - y0
+    t0, t1 = 0.0, 1.0
+    for p, q in ((-dx, x0 - lo[0]), (dx, hi[0] - x0),
+                 (-dy, y0 - lo[1]), (dy, hi[1] - y0)):
+        if p == 0.0:
+            if q < 0.0:
+                return False            # parallel to this edge and outside it
+        else:
+            r = q / p
+            if p < 0.0:
+                if r > t1:
+                    return False
+                t0 = max(t0, r)
+            else:
+                if r < t0:
+                    return False
+                t1 = min(t1, r)
+    return True
+
+
+def paper_object_crosses(obj, x0: float, y0: float,
+                         x1: float, y1: float) -> bool:
+    """Does any of the geometry's ink fall inside the paper rect?
+
+    A crossing band asks what it touches, and a bounding box is the wrong
+    answer for paper geometry: a border's box is the whole page, so a box test
+    hands over the border for any band drawn anywhere inside it.
+    """
+    lo = (min(x0, x1), min(y0, y1))
+    hi = (max(x0, x1), max(y0, y1))
+    for poly in obj.polylines:
+        for a, b in zip(poly[:-1], poly[1:]):
+            if _seg_hits_rect(a, b, lo, hi):
+                return True
+    for p in obj.points:
+        if (lo[0] <= float(p[0]) <= hi[0]
+                and lo[1] <= float(p[1]) <= hi[1]):
+            return True
+    return False
+
+
+def move_paper_object(obj, dx: float, dy: float):
+    """Slide paper geometry across the sheet by millimetres.
+
+    There is no x/y to add to — the shape *is* the position — so this replaces
+    the shape, which is also the only edit a shared undo checkpoint allows.
+    """
+    from . import geometry
+    obj.shape = geometry.translate(obj.shape, (dx, dy, 0.0))
+
+
+def _point_in_poly(px: float, py: float, pts: list) -> bool:
+    inside = False
+    n = len(pts)
+    for i in range(n):
+        x1, y1 = pts[i][0], pts[i][1]
+        x2, y2 = pts[(i + 1) % n][0], pts[(i + 1) % n][1]
+        if (y1 > py) != (y2 > py):
+            if px < x1 + (py - y1) / (y2 - y1) * (x2 - x1):
+                inside = not inside
+    return inside
+
+
+def move_annotation(kind: str, obj, dx: float, dy: float):
+    """Translate any annotation by paper millimetres."""
+    if kind == "note":
+        obj.x += dx
+        obj.y += dy
+    elif kind == "dim":
+        obj.x1 += dx
+        obj.y1 += dy
+        obj.x2 += dx
+        obj.y2 += dy
+        if getattr(obj, "m1", None) is not None:
+            obj.detail_id = ""          # moving by hand breaks the anchor
+            obj.m1 = obj.m2 = None
+    elif kind == "rdim":
+        obj.cx += dx
+        obj.cy += dy
+        obj.px += dx
+        obj.py += dy
+    elif kind == "adim":
+        obj.vx += dx
+        obj.vy += dy
+        obj.x1 += dx
+        obj.y1 += dy
+        obj.x2 += dx
+        obj.y2 += dy
+    elif kind in ("leader", "hatch"):
+        obj.points = [[p[0] + dx, p[1] + dy] for p in obj.points]
+        # A hole that stayed behind is a hole in the wrong place, and once
+        # the hatch has moved far enough it is a hole in nothing at all.
+        if getattr(obj, "holes", None):
+            obj.holes = [[[p[0] + dx, p[1] + dy] for p in ring]
+                         for ring in obj.holes]
+
+
+def move_sheet_item(kind: str, obj, dx: float, dy: float):
+    """Translate anything a sheet holds by paper millimetres.
+
+    Three kinds each knew how to move themselves; what was missing was one
+    question that could be asked of a mixed handful, which is what a selection
+    on a sheet is. A locked detail moves too: its lock keeps its view, and
+    the view travels with the frame (#130).
+    """
+    if kind == "detail":
+        obj.x += dx
+        obj.y += dy
+    elif kind == "object":
+        move_paper_object(obj, dx, dy)
+    else:
+        move_annotation(kind, obj, dx, dy)
+
+
+def transform_sheet_item(kind: str, obj, matrix, size: float = 1.0,
+                         scene=None) -> bool:
+    """Put anything a sheet holds through an affine map of the paper.
+
+    `matrix` is a 3x3 map of paper millimetres, (x, y, 1) in and out; it
+    moves every point an item is placed by. `size` is what the item's own
+    lengths become worth: text height, a dimension's offset, a hatch's
+    spacing. A uniform scale passes its factor, and a one-way stretch
+    passes 1, which moves text and dimensions without distorting them.
+
+    A detail's frame is mapped and its drawing scale kept, so a 1:50 detail
+    stays 1:50 and shows more or less of the model. A locked one too: the
+    lock keeps the view, not the frame (#130). The return says whether the
+    item was changed.
+
+    A turn or a reflection is drawn the way a drawing wants it rather than
+    literally. A note is always drawn level and reading forwards, so its
+    middle is what is turned or mirrored and the text is set level there; a
+    detail frame, which cannot turn either, moves its middle likewise and
+    keeps its shape. A mirrored dimension stays on the mirrored side of
+    what it measures, and a hatch's lines turn with any turn or reflection.
+    """
+    import numpy as np
+    m = np.asarray(matrix, float)
+    linear = m[:2, :2]
+    flips = float(np.linalg.det(linear)) < 0
+    square = linear @ linear.T
+    similar = np.allclose(square, np.eye(2) * square[0, 0], atol=1e-9)
+    scale = math.sqrt(max(float(square[0, 0]), 0.0))
+    # does it turn or flip anything, rather than only grow it
+    turns = similar and not np.allclose(linear, np.eye(2) * scale, atol=1e-9)
+
+    def at(x, y):
+        p = m @ np.array([float(x), float(y), 1.0])
+        return float(p[0]), float(p[1])
+
+    def pts(seq):
+        return [list(at(p[0], p[1])) for p in seq]
+
+    grow = abs(float(size) - 1.0) > 1e-12
+    if kind == "detail":
+        if turns:
+            cx, cy = at(obj.x + obj.w / 2, obj.y + obj.h / 2)
+            obj.w = max(obj.w * scale, MIN_DETAIL_MM)
+            obj.h = max(obj.h * scale, MIN_DETAIL_MM)
+            obj.x, obj.y = cx - obj.w / 2, cy - obj.h / 2
+            return True
+        xs, ys = zip(*(at(x, y) for x, y in detail_corners(obj)))
+        obj.x, obj.y = min(xs), min(ys)
+        obj.w = max(max(xs) - obj.x, MIN_DETAIL_MM)
+        obj.h = max(max(ys) - obj.y, MIN_DETAIL_MM)
+    elif kind == "object":
+        from . import geometry
+        m4 = np.eye(4)
+        m4[:2, :2] = m[:2, :2]
+        m4[:2, 3] = m[:2, 2]
+        obj.shape = geometry.apply_matrix(obj.shape, m4)
+    elif kind in ("note", "leader"):
+        middle = None
+        if kind == "note" and turns:
+            # set level and reading forwards where the turned or mirrored
+            # text would be: the middle of the text is what is moved
+            x0, y0, x1, y1 = annotation_bounds("note", obj, scene)
+            middle = at((x0 + x1) / 2, (y0 + y1) / 2)
+        elif kind == "note":
+            obj.x, obj.y = at(obj.x, obj.y)
+        else:
+            obj.points = pts(obj.points)
+        if grow:
+            # A named style owns the rendered height; scaling is an edit to
+            # this one, so it leaves the style at the size it was drawn.
+            height = note_text_height(obj, scene)
+            obj.style = ""
+            obj.height = height * abs(float(size))
+        if middle is not None:
+            # after the height, so the text is centred at the size it ends
+            x0, y0, x1, y1 = annotation_bounds("note", obj, scene)
+            obj.x += middle[0] - (x0 + x1) / 2
+            obj.y += middle[1] - (y0 + y1) / 2
+    elif kind == "dim":
+        obj.x1, obj.y1 = at(obj.x1, obj.y1)
+        obj.x2, obj.y2 = at(obj.x2, obj.y2)
+        if flips:
+            # its line is drawn to the left of first-to-second; mirrored,
+            # left is the other side, so the ends change places
+            obj.x1, obj.y1, obj.x2, obj.y2 = obj.x2, obj.y2, obj.x1, obj.y1
+        obj.offset *= abs(float(size))
+        if getattr(obj, "m1", None) is not None:
+            obj.detail_id = ""          # its points no longer project from
+            obj.m1 = obj.m2 = None      # the model points it was anchored to
+    elif kind == "rdim":
+        obj.cx, obj.cy = at(obj.cx, obj.cy)
+        obj.px, obj.py = at(obj.px, obj.py)
+    elif kind == "adim":
+        obj.vx, obj.vy = at(obj.vx, obj.vy)
+        obj.x1, obj.y1 = at(obj.x1, obj.y1)
+        obj.x2, obj.y2 = at(obj.x2, obj.y2)
+        obj.radius *= abs(float(size))
+    elif kind == "hatch":
+        obj.points = pts(obj.points)
+        if getattr(obj, "holes", None):
+            obj.holes = [pts(ring) for ring in obj.holes]
+        obj.spacing *= abs(float(size))
+        if similar:
+            a = math.radians(obj.angle)
+            d = linear @ np.array([math.cos(a), math.sin(a)])
+            obj.angle = math.degrees(math.atan2(d[1], d[0])) % 180.0
+    else:
+        return False
+    return True
+
+
+MIN_DETAIL_MM = 5.0
+
+
+def detail_corners(det) -> tuple:
+    """The frame's four corners, anticlockwise from the bottom-left.
+
+    A picked corner is named by its index here, so the order is part of the
+    contract rather than a detail of how the grips get drawn.
+    """
+    return ((det.x, det.y), (det.x + det.w, det.y),
+            (det.x + det.w, det.y + det.h), (det.x, det.y + det.h))
+
+
+def nudge_detail_corners(det, indices, dx: float, dy: float):
+    """Shift the named corners of a detail frame by paper millimetres.
+
+    A corner is where two edges meet, so moving one on its own stretches the
+    frame in both directions. Take the two corners of an edge and that edge
+    travels; take all four and the whole detail does.
+
+    A locked detail keeps its picture where it is on the page while its
+    frame is cropped, so the notes drawn beside it still point at what they
+    did (#130). Its view is drawn about the frame's middle, which a crop
+    moves, so the target moves to make up for it. Only a parallel view can
+    be held still that way; a perspective one is aimed at its middle.
+    """
+    idx = set(indices)
+    x0, y0 = det.x, det.y
+    x1, y1 = det.x + det.w, det.y + det.h
+    if idx & {0, 3}:
+        x0 += dx
+    if idx & {1, 2}:
+        x1 += dx
+    if idx & {0, 1}:
+        y0 += dy
+    if idx & {2, 3}:
+        y1 += dy
+    middle = (det.x + det.w / 2, det.y + det.h / 2)
+    det.x, det.w = min(x0, x1), max(abs(x1 - x0), MIN_DETAIL_MM)
+    det.y, det.h = min(y0, y1), max(abs(y1 - y0), MIN_DETAIL_MM)
+    if det.locked and not det.perspective:
+        # The picture goes with the frame along an axis only when both of
+        # that axis's edges went, which is a move rather than a crop.
+        across = bool(idx & {0, 3}) and bool(idx & {1, 2})
+        along = bool(idx & {0, 1}) and bool(idx & {2, 3})
+        _draw_target_at(det, (middle[0] + (dx if across else 0.0),
+                              middle[1] + (dy if along else 0.0)))
+
+
+def _draw_target_at(det, at):
+    """Move a detail's target so that the point it was aimed at is drawn at
+    `at` on the paper, not at the frame's middle, without turning or scaling
+    the view."""
+    import numpy as np
+    _d, right, up = detail_basis(det)
+    du = det.x + det.w / 2 - at[0]
+    dv = det.y + det.h / 2 - at[1]
+    det.target = [float(c) for c in np.asarray(det.target, float)
+                  + (du * right + dv * up) * det.scale_denom]
+
+
+def sheet_pools(layout) -> dict:
+    """Where each kind of pickable thing on a sheet lives."""
+    return {"note": layout.notes, "dim": layout.dims, "rdim": layout.rdims,
+            "adim": layout.adims, "leader": layout.leaders,
+            "hatch": layout.hatches, "object": layout.objects,
+            "detail": layout.details}
+
+
+def copy_sheet_item(layout, kind: str, obj):
+    """Duplicate a sheet item onto a layout, and return the copy.
+
+    Deep, and then given a fresh id. Deep because what the sheet holds is
+    mostly plain data — a detail's target, a leader's points — and a copy
+    sharing those would swing or drag both when either was touched. The id
+    because it is the one field that must not be copied: a hidden-line cache,
+    a saved file and a selection all tell two frames apart by it.
+
+    The layout is where the copy goes, not where the original came from: a
+    border copied on one sheet and a border pasted onto the next are the same
+    act, and nothing about the original is needed to carry it out.
+
+    The copy lands exactly on the original, since where it goes is the
+    caller's question and not every kind moves the same way.
+    """
+    pool = sheet_pools(layout).get(kind)
+    if pool is None:
+        return None
+    dup = copy.deepcopy(obj)
+    dup.id = _uid()
+    pool.append(dup)
+    return dup
+
+
+def delete_annotation(layout, kind: str, obj) -> bool:
+    pool = {"note": layout.notes, "dim": layout.dims,
+            "rdim": layout.rdims, "adim": layout.adims,
+            "leader": layout.leaders, "hatch": layout.hatches}.get(kind)
+    if pool and obj in pool:
+        pool.remove(obj)
+        return True
+    return False
+
+
+def annotation_bounds(kind: str, obj, scene=None) -> tuple:
+    """Rough paper-space bbox (x0, y0, x1, y1) of an annotation."""
+    if kind == "note":
+        height = note_text_height(obj, scene)
+        if obj.font_family:
+            from .text import text_path
+            rect = text_path(obj.text, height, obj.font_family,
+                             font_style=obj.font_style,
+                             alignment=obj.alignment).boundingRect()
+            box = (obj.x + rect.left(), obj.y - rect.bottom(),
+                   obj.x + rect.right(), obj.y - rect.top())
+        else:
+            from .text import text_advance
+            lines = (obj.text or " ").split("\n")
+            w = max(text_advance(line) for line in lines) \
+                * font_size(height, scene)
+            box = (obj.x, obj.y - (len(lines) - 1) * height * 1.6,
+                   obj.x + w, obj.y + height)
+        grow = obj.margin * height if obj.background else 0.0
+        return (box[0] - grow, box[1] - grow, box[2] + grow, box[3] + grow)
+    if kind == "dim":
+        import numpy as np
+        a = np.array([obj.x1, obj.y1])
+        b = np.array([obj.x2, obj.y2])
+        d = b - a
+        n = np.linalg.norm(d)
+        nvec = np.array([-d[1], d[0]]) / n if n > 1e-9 else np.zeros(2)
+        pts = [a, b, a + nvec * obj.offset, b + nvec * obj.offset]
+        xs = [p[0] for p in pts]
+        ys = [p[1] for p in pts]
+        return (min(xs), min(ys), max(xs), max(ys))
+    if kind == "rdim":
+        return (min(obj.cx, obj.px), min(obj.cy, obj.py),
+                max(obj.cx, obj.px), max(obj.cy, obj.py))
+    if kind == "adim":
+        r = obj.radius + 3
+        return (obj.vx - r, obj.vy - r, obj.vx + r, obj.vy + r)
+    pts = obj.points or [[0, 0]]
+    xs = [p[0] for p in pts]
+    ys = [p[1] for p in pts]
+    return (min(xs), min(ys), max(xs), max(ys))
+
+
+def sheet_item_bounds(kind: str, obj, scene=None) -> tuple:
+    """Paper-space bbox (x0, y0, x1, y1) of anything a sheet holds.
+
+    The three kinds each already knew their own bounds; what was missing was
+    one question that could be asked of a mixed handful of them, which is
+    what a selection on a sheet is.
+    """
+    if kind == "detail":
+        return (obj.x, obj.y, obj.x + obj.w, obj.y + obj.h)
+    if kind == "object":
+        return paper_object_bounds(obj)
+    return annotation_bounds(kind, obj, scene)
+
+
+def sheet_item_linework(kind: str, obj, scene=None) -> list:
+    """The lines a sheet item stands on, as [(points, closed)] in paper
+    millimetres: what a paper snap lands on and what a pending transform
+    ghosts. A frame's edges, the box a note's text fills, a dimension's
+    extension and dimension lines, a hatch's loops. Paper geometry is a
+    shape already and gives none.
+    """
+    import numpy as np
+    if kind == "detail":
+        return [(list(detail_corners(obj)), True)]
+    if kind == "note":
+        x0, y0, x1, y1 = annotation_bounds("note", obj, scene)
+        return [([(x0, y0), (x1, y0), (x1, y1), (x0, y1)], True)]
+    if kind == "leader":
+        return [(list(obj.points), False)]
+    if kind == "hatch":
+        return [(list(loop), True) for loop in [obj.points, *obj.holes]]
+    if kind == "dim":
+        a, b = np.array([obj.x1, obj.y1]), np.array([obj.x2, obj.y2])
+        delta = b - a
+        length = np.linalg.norm(delta)
+        normal = (np.array([-delta[1], delta[0]]) / length if length > 1e-9
+                  else np.zeros(2))
+        return [([a, a + normal * obj.offset, b + normal * obj.offset, b],
+                 False)]
+    if kind == "rdim":
+        return [([(obj.cx, obj.cy), (obj.px, obj.py)], False)]
+    if kind == "adim":
+        # the actual vertex and ray anchors, not the annotation's bbox
+        return [([(obj.x1, obj.y1), (obj.vx, obj.vy), (obj.x2, obj.y2)],
+                 False)]
+    return []
+
+
+def enclosing_polygon(polylines: list, px: float, py: float):
+    """Smallest closed polyline (paper coords) containing the point."""
+    best = None
+    best_area = None
+    for poly in polylines:
+        pts = [(p[0], p[1]) for p in poly]
+        if len(pts) < 4:
+            continue
+        if abs(pts[0][0] - pts[-1][0]) > 0.5 \
+                or abs(pts[0][1] - pts[-1][1]) > 0.5:
+            continue
+        if not _point_in_poly(px, py, pts[:-1]):
+            continue
+        area = 0.0
+        for (x1, y1), (x2, y2) in zip(pts[:-1], pts[1:]):
+            area += x1 * y2 - x2 * y1
+        area = abs(area) / 2
+        if best_area is None or area < best_area:
+            best, best_area = pts[:-1], area
+    return best
+
+
+@dataclass
+class Layout:
+    id: str = field(default_factory=_uid)
+    name: str = "Layout"
+    number: str = ""                     # the sheet number, A-101; may be ""
+    group: str | None = None             # the SheetGroup it sits in, if any
+    paper_w: float = 420.0
+    paper_h: float = 297.0
+    margin: float = 10.0
+    details: list = field(default_factory=list)
+    objects: list = field(default_factory=list)      # PaperObject, paper mm
+    notes: list = field(default_factory=list)
+    dims: list = field(default_factory=list)
+    leaders: list = field(default_factory=list)
+    hatches: list = field(default_factory=list)
+    rdims: list = field(default_factory=list)
+    adims: list = field(default_factory=list)
+    scale_bars: list = field(default_factory=list)   # [x, y, scale_denom]
+    title_block: dict = field(default_factory=dict)
+    revisions: list = field(default_factory=list)    # [[rev, date, note]]
+    # per-kind name counters for `add`; not saved, because the names are, and
+    # `add` skips past a name already on the sheet
+    _counters: dict = field(default_factory=dict, repr=False, compare=False)
+
+    # the sheet itself, as against anything put on it
+    _PAPER = ("id", "name", "number", "group", "paper_w", "paper_h",
+              "margin", "_counters")
+
+    def is_empty(self) -> bool:
+        """True if nothing has been drawn or placed on the paper.
+
+        Read off the fields rather than a written-out list of them, so a
+        new kind of sheet content counts from the day it is added rather
+        than the day someone remembers this method. Deleting a sheet asks
+        first when this is False, and goes quietly when it is True.
+        """
+        return not any(getattr(self, f.name) for f in fields(self)
+                       if f.name not in self._PAPER)
+
+    def duplicate(self, name: str) -> Layout:
+        """A copy of the sheet under a new name, with fresh ids throughout.
+
+        Every kind of thing on paper carries an id, not only the details,
+        and two sheets holding the same one is the sort of fault that
+        surfaces late — in whichever feature is the first to look an item
+        up rather than walk to it. Fields are read the way `is_empty`
+        reads them, so a new kind of content is covered when it lands.
+        """
+        dup = self.clone()
+        dup.id = _uid()
+        dup.name = name
+        for f in fields(dup):
+            if f.name in self._PAPER:
+                continue
+            for item in getattr(dup, f.name) or ():
+                if hasattr(item, "id"):     # revisions and scale bars are
+                    item.id = _uid()        # bare lists, with no id to move
+        return dup
+
+    def copied_details(self, dup: Layout) -> list:
+        """(this sheet's detail id, the copy's) for each detail of a sheet
+        `duplicate` made from this one: the copy keeps the order, and
+        only the ids moved."""
+        return [(old.id, new.id) for old, new in zip(self.details,
+                                                     dup.details)]
+
+    def detail_at(self, px: float, py: float) -> DetailView | None:
+        for d in reversed(self.details):        # topmost first
+            if d.contains(px, py):
+                return d
+        return None
+
+    def convert_units(self, factor: float, rescaled: bool):
+        """The document's units changed, one old unit being `factor` new.
+
+        Every scale on the sheet is a ratio of real lengths, and stays the
+        ratio it was: a detail at 1:4 is at 1:4 in the new units too, and a
+        dimension or a scale bar reads lengths at the scale it did.
+        `rescaled` says the model was scaled by `factor` to keep its real
+        size, so what looks at it or is anchored to it moves with it, and
+        the sheet plots as it did.
+        """
+        for det in self.details:
+            det.scale_denom *= factor
+            if rescaled:
+                det.target = [c * factor for c in det.target]
+                det.perspective_distance *= factor
+                if det.section_offset is not None:
+                    det.section_offset *= factor
+        for dim in [*self.dims, *self.rdims]:
+            if not dim.measures_paper:
+                dim.scale_denom *= factor
+        for bar in self.scale_bars:
+            bar[2] *= factor
+        if rescaled:
+            for dim in self.dims:
+                if dim.m1 is not None:
+                    dim.m1 = [c * factor for c in dim.m1]
+                if dim.m2 is not None:
+                    dim.m2 = [c * factor for c in dim.m2]
+
+    def add(self, shape, name: str | None = None) -> PaperObject:
+        """Put geometry on the paper, in millimetres.
+
+        Named the way `Scene.add` names, from a counter rather than the length
+        of the list, so a name is not handed out twice after a delete. The
+        counter is not saved with the sheet, so it steps over the names that
+        came back from a file.
+        """
+        from . import geometry
+        kind = geometry.shape_kind(shape)
+        if name is None:
+            taken = {o.name for o in self.objects}
+            n = self._counters.get(kind, 0)
+            while True:
+                n += 1
+                name = f"{kind.capitalize()} {n:02d}"
+                if name not in taken:
+                    break
+            self._counters[kind] = n
+        obj = PaperObject(shape=shape, name=name)
+        self.objects.append(obj)
+        return obj
+
+    def clone(self) -> "Layout":
+        return copy.deepcopy(self)
+
+
+@dataclass
+class SheetGroup:
+    """A group of sheets, the way a set of drawings is bound: Plans,
+    Sections, and groups inside those (#38)."""
+    id: str = field(default_factory=_uid)
+    name: str = "Group"
+    parent: str | None = None            # the group this one sits in
+
+
+def sheet_tree(layouts: list, groups: list) -> list:
+    """The sheets and their groups as a tree, in the sheets' own order.
+
+    [(kind, item, children)], kind "group" or "sheet" (children [] for a
+    sheet). The order is `layouts`', the tab strip's and the print's: a
+    group sits where its first sheet does, so moving a group is moving its
+    sheets, and an empty group comes at the end of where it was made. A
+    sheet whose group is gone stands on its own, and a group that turns
+    out to sit inside itself is taken to sit at the top.
+    """
+    by_id = {g.id: g for g in groups}
+    entries: dict = {None: []}
+    placed: set = set()
+
+    def parent_of(group, seen):
+        parent = group.parent
+        if parent not in by_id or parent in seen:
+            return None
+        return parent
+
+    def place(gid, seen=()):
+        if gid in placed:
+            return
+        seen = set(seen) | {gid}
+        parent = parent_of(by_id[gid], seen)
+        if parent is not None:
+            place(parent, seen)
+        placed.add(gid)
+        entries.setdefault(parent, []).append(("group", by_id[gid]))
+        entries.setdefault(gid, [])
+
+    for lay in layouts:
+        gid = lay.group if lay.group in by_id else None
+        if gid is not None:
+            place(gid)
+        entries.setdefault(gid, []).append(("sheet", lay))
+    for group in groups:
+        place(group.id)
+
+    def build(key):
+        return [(kind, item, build(item.id) if kind == "group" else [])
+                for kind, item in entries.get(key, [])]
+    return build(None)
+
+
+def flatten_sheets(tree: list) -> list:
+    """The sheets of a `sheet_tree`, depth first: the order they go in."""
+    out = []
+    for kind, item, children in tree:
+        if kind == "group":
+            out.extend(flatten_sheets(children))
+        else:
+            out.append(item)
+    return out
+
+
+def sheet_label(layout) -> str:
+    """How a sheet is named in a list: its number, then its name."""
+    return f"{layout.number}  {layout.name}" if layout.number else layout.name
+
+
+def sheet_groups_to_json(groups: list) -> list:
+    return [vars(g).copy() for g in groups]
+
+
+def sheet_groups_from_json(data: list) -> list:
+    return [_rebuild(SheetGroup, d) for d in data or []]
+
+
+def unique_layout_name(layouts, base: str) -> str:
+    """`base`, or `base 2`, `base 3`… — the first of those not taken.
+
+    Sheets are told apart by name at the command line, so a second
+    'Site plan copy' would make `layout` > Delete a coin toss between
+    them. Duplicating is one click now, and it used to hand out the
+    same name every time.
+    """
+    taken = {lay.name.lower() for lay in layouts}
+    if base.lower() not in taken:
+        return base
+    n = 2
+    while f"{base} {n}".lower() in taken:
+        n += 1
+    return f"{base} {n}"
+
+
+# ------------------------------------------------------------- serialization
+
+def _paper_object_to_json(obj) -> dict:
+    """A paper shape as BREP text, the same way a model object is stored."""
+    import base64
+
+    from . import geometry
+    return {
+        "id": obj.id, "name": obj.name,
+        "color": list(obj.color) if obj.color else None,
+        "linetype": obj.linetype, "lineweight": obj.lineweight,
+        "item_locked": obj.item_locked,
+        "brep": base64.b64encode(
+            geometry.shape_to_bytes(obj.shape)).decode("ascii"),
+    }
+
+
+def _paper_object_from_json(od: dict) -> PaperObject:
+    import base64
+
+    from . import geometry
+    return PaperObject(
+        id=od.get("id", _uid()), name=od.get("name", ""),
+        color=tuple(od["color"]) if od.get("color") else None,
+        linetype=od.get("linetype", "Continuous"),
+        lineweight=float(od.get("lineweight", 0.25)),
+        item_locked=bool(od.get("item_locked", False)),
+        shape=geometry.shape_from_bytes(base64.b64decode(od["brep"])))
+
+
+def _rebuild(cls, d: dict):
+    """A sheet item from what the file says, keeping what the class knows.
+
+    `cls(**d)` demanded that the file name exactly the fields this build has,
+    which it will not do for long: the moment a field is added, a drawing
+    saved by the newer build stops opening in the older one — not with the
+    new field missing, but with a TypeError and no drawing at all. The same
+    the other way for a field ever dropped.
+
+    So a key this build has never heard of is let go, and a field the file
+    never mentions takes the class's default. Losing something there is no
+    way to draw is a small loss; refusing to open the sheet is a total one.
+    Letting it go rather than keeping it is deliberate too: an object holding
+    a field it does not understand would write it back out on the next save
+    and claim to have meant it.
+    """
+    known = {f.name for f in fields(cls)}
+    return cls(**{k: v for k, v in d.items() if k in known})
+
+
+def layouts_to_json(layouts: list) -> list:
+    out = []
+    for lay in layouts:
+        out.append({
+            "id": lay.id, "name": lay.name,
+            "number": lay.number, "group": lay.group,
+            "paper_w": lay.paper_w, "paper_h": lay.paper_h,
+            "margin": lay.margin,
+            "details": [vars(d).copy() for d in lay.details],
+            "objects": [_paper_object_to_json(o) for o in lay.objects],
+            "notes": [vars(n).copy() for n in lay.notes],
+            "dims": [vars(d).copy() for d in lay.dims],
+            "leaders": [vars(x).copy() for x in lay.leaders],
+            "hatches": [vars(x).copy() for x in lay.hatches],
+            "rdims": [vars(x).copy() for x in lay.rdims],
+            "adims": [vars(x).copy() for x in lay.adims],
+            "scale_bars": [list(b) for b in lay.scale_bars],
+            "title_block": dict(lay.title_block),
+            "revisions": [list(r) for r in lay.revisions],
+        })
+    return out
+
+
+def layouts_from_json(data: list) -> list:
+    layouts = []
+    for ld in data or []:
+        lay = Layout(id=ld.get("id", _uid()), name=ld.get("name", "Layout"),
+                     number=str(ld.get("number") or ""),
+                     group=ld.get("group") or None,
+                     paper_w=ld.get("paper_w", 420.0),
+                     paper_h=ld.get("paper_h", 297.0),
+                     margin=ld.get("margin", 10.0))
+        for od in ld.get("objects", []):
+            lay.objects.append(_paper_object_from_json(od))
+        for key, cls in (("details", DetailView), ("notes", TextNote),
+                         ("dims", LinearDim), ("leaders", Leader),
+                         ("hatches", Hatch), ("rdims", RadialDim),
+                         ("adims", AngularDim)):
+            pool = getattr(lay, key)
+            for d in ld.get(key, []):
+                pool.append(_rebuild(cls, d))
+                if key in ("dims", "rdims") and "measures_paper" not in d:
+                    pool[-1].measures_paper = _drawn_on_paper(lay, pool[-1])
+        lay.scale_bars = [list(b) for b in ld.get("scale_bars", [])]
+        lay.title_block = dict(ld.get("title_block", {}))
+        lay.revisions = [list(r) for r in ld.get("revisions", [])]
+        layouts.append(lay)
+    return layouts
+
+
+def _drawn_on_paper(lay: Layout, dim) -> bool:
+    """Whether a dimension saved before they said what they measure was
+    drawn on bare paper: one is given a scale of one there, and nothing
+    over a detail is unless the detail shows a model unit to the paper
+    millimetre, which a centimetre detail at 1:10 does. So it also has to
+    have no detail under it, and not be anchored to one."""
+    if getattr(dim, "detail_id", "") or abs(dim.scale_denom - 1.0) > 1e-12:
+        return False
+    if isinstance(dim, RadialDim):
+        x, y = dim.cx, dim.cy
+    else:
+        x, y = (dim.x1 + dim.x2) / 2, (dim.y1 + dim.y2) / 2
+    detail = lay.detail_at(x, y)
+    return detail is None or detail.perspective
+
+
+def _scale_ratio(text: str, units: str) -> float | None:
+    """The ratio of real lengths a typed scale says: N of 1:N."""
+    if "=" in text:
+        paper, _, model = text.partition("=")
+        # an architect's 1-1/2" is the 1 1/2" a length is typed as
+        paper = re.sub(r"(\d)\s*-\s*(\d+/\d+)", r"\1 \2", paper)
+        a, b = parse_length(paper, units), parse_length(model, units)
+        ratio = b / a if (a or 0) > 0 and (b or 0) > 0 else None
+    else:
+        text = text.strip().lower().replace(" ", "")
+        try:
+            if ":" in text:
+                a, _, b = text.partition(":")
+                a, b = float(a), float(b)
+                ratio = b / a if a > 0 and b > 0 else None
+            else:
+                ratio = float(text)
+        except ValueError:
+            return None
+    if ratio is None or not 0 < ratio < math.inf:
+        return None
+    return ratio
+
+
+def parse_scale(text: str, units: str) -> float | None:
+    """A typed scale, as the `scale_denom` it sets in a document of `units`.
+
+    A ratio is of real lengths, so it means the same in any units: '1:50'
+    is a fiftieth of real size, '2:1' twice it, a bare '50' is 1:50, and in
+    an inch document 1:50 is 50/25.4 inches to the paper millimetre.
+    Architects and engineers name theirs by a length of paper and the
+    length of model it stands for, 1/4" = 1'-0" (1:48) or 1" = 20'
+    (1:240); a length there without units is in the document's.
+    """
+    ratio = _scale_ratio(text, units)
+    return None if ratio is None else ratio / TO_MM[units]
+
+
+# what each scale on offer says, which is the same in any units
+_PRESET_RATIOS = {name: _scale_ratio(name, "mm")
+                  for name in (*METRIC_SCALES, *IMPERIAL_SCALES)}
+
+
+def format_scale(denom: float, units: str) -> str:
+    """A `scale_denom` written as the ratio of real lengths it is, 1:N or
+    N:1, or by its name when it is a scale on offer in `units`."""
+    ratio = denom * TO_MM[units]
+    for name in scale_presets(units):
+        if math.isclose(_PRESET_RATIOS[name], ratio, rel_tol=1e-9):
+            return name
+    if ratio >= 1:
+        return f"1:{ratio:g}"
+    return f"{1 / ratio:g}:1"

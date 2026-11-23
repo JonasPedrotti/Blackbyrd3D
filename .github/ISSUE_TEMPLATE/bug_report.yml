@@ -1,0 +1,94 @@
+name: Bug report
+description: Something crashed, misbehaved, or produced wrong geometry
+labels: [bug]
+body:
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What did you do, and what went wrong?
+      placeholder: |
+        Drew a box, ran `filletedge` with radius 2, the app crashed.
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: >
+        Exact commands / clicks, starting from an empty scene if possible.
+        A .byrd file that triggers the bug is even better — drag it into
+        this box.
+      placeholder: |
+        1. box 0 10 10 10
+        2. select it
+        3. filletedge, radius 2
+    validations:
+      required: true
+
+  - type: textarea
+    id: terminal-output
+    attributes:
+      label: Terminal output
+      description: >
+        Blackbyrd3D prints tracebacks to the terminal it was started from.
+        If it crashed, please relaunch from a terminal
+        (`./Blackbyrd3D-x86_64.AppImage` or `byrd3d`), reproduce, and paste
+        everything it printed.
+      render: text
+
+  - type: dropdown
+    id: install-method
+    attributes:
+      label: How did you install it?
+      options:
+        - AppImage
+        - pip install from source
+        - other (say below)
+    validations:
+      required: true
+
+  - type: dropdown
+    id: version
+    attributes:
+      label: Blackbyrd3D version
+      description: Shown in Help → About, or `pip show blackbyrd3d`.
+      options:
+        # versions:start (kept up to date by .github/workflows/issue-form-versions.yml)
+        - "0.1.0"
+        # versions:end
+    validations:
+      required: true
+
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options:
+        - Linux
+        - Windows
+        - macOS
+    validations:
+      required: true
+
+  - type: input
+    id: os-version
+    attributes:
+      label: OS version
+      placeholder: "Windows 11 / macOS 15 / Fedora 42"
+
+  - type: input
+    id: gpu
+    attributes:
+      label: GPU and driver
+      description: "`glxinfo | grep 'OpenGL renderer'` (package: mesa-utils)"
+      placeholder: "AMD Radeon 780M (Mesa 25.x)"
+
+  - type: textarea
+    id: extra
+    attributes:
+      label: Anything else?
+      description: >
+        Wayland or X11, multi-monitor, running in a VM, unusual scene size —
+        anything you suspect matters.

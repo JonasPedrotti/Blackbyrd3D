@@ -1,0 +1,119 @@
+"""Selection state, decoupled from UI."""
+
+from __future__ import annotations
+
+
+class SelectionManager:
+    def __init__(self, scene):
+        self.scene = scene
+        self._ids: list[str] = []      # ordered
+        # The same ids again, for asking. The draw loop asks once per object
+        # in the drawing, so reading the list instead cost objects x
+        # selection: 190 ms of every frame on a big file with all of it
+        # selected. Order matters elsewhere, hence both.
+        self._index: set[str] = set()
+        self.previous_ids: list[str] = []   # last non-empty selection
+        self.subobjects: list = []     # [(obj_id, "edge"|"face", index)]
+        # The object a live gumball drag is rebuilding, or None. Shared
+        # here rather than kept on a pane's gumball because every pane
+        # draws the sub-object highlight, and mid-drag the picked indices
+        # point into topology that replace_shape has already replaced.
+        self.rebuilding: str | None = None
+        # True while Properties is showing something other than these
+        # objects, a picked layer say: they stay selected, and every pane
+        # draws them dimmed, so full gold still means "what Properties is
+        # editing". Shared here for the reason `rebuilding` is.
+        self.held = False
+        self._listeners: list = []
+        self.filter_kinds: set = set()   # e.g. {"curve"}; empty = any
+        self.filter_active = False       # F6-style master toggle
+
+    def filter_allows(self, kind: str) -> bool:
+        """May viewport picking select objects of this kind?"""
+        if not self.filter_active or not self.filter_kinds:
+            return True
+        return kind in self.filter_kinds
+
+    def add_listener(self, fn):
+        self._listeners.append(fn)
+
+    def _notify(self):
+        for fn in self._listeners:
+            fn()
+
+    def _assign(self, ids):
+        """The one place the selection is written, so the two views of it
+        cannot drift apart."""
+        self._ids = list(ids)
+        self._index = set(self._ids)
+
+    @property
+    def ids(self) -> list[str]:
+        # prune stale ids lazily
+        live = [i for i in self._ids if i in self.scene.objects]
+        if len(live) != len(self._ids):
+            self._assign(live)
+        return live
+
+    def objects(self) -> list:
+        return [self.scene.objects[i] for i in self.ids]
+
+    def is_selected(self, obj_id: str) -> bool:
+        return obj_id in self._index
+
+    def set(self, ids: list[str]):
+        if self._ids:
+            self.previous_ids = list(self._ids)
+        self._assign(i for i in ids if i in self.scene.objects)
+        self.subobjects = []
+        self._notify()
+
+    def set_held(self, held: bool):
+        """Draw the selection dimmed, or at full strength again."""
+        held = bool(held)
+        if held != self.held:
+            self.held = held
+            self._notify()
+
+    def toggle_subobject(self, obj_id: str, kind: str, index: int):
+        entry = (obj_id, kind, index)
+        if entry in self.subobjects:
+            self.subobjects.remove(entry)
+        else:
+            self.subobjects.append(entry)
+        self._notify()
+
+    def set_subobjects(self, entries):
+        """Hold exactly these sub-objects, in one go.
+
+        Toggling them in one at a time tells everyone listening once per
+        entry, and a band dragged round a dense curve catches hundreds of
+        control points.
+        """
+        self.subobjects = list(dict.fromkeys(entries))
+        self._notify()
+
+    def subobjects_of(self, obj_id: str, kind: str) -> list[int]:
+        return [i for (oid, k, i) in self.subobjects
+                if oid == obj_id and k == kind]
+
+    def toggle(self, obj_id: str):
+        if obj_id in self._index:
+            self._ids.remove(obj_id)
+            self._index.discard(obj_id)
+        else:
+            self._ids.append(obj_id)
+            self._index.add(obj_id)
+        self._notify()
+
+    def select_all(self):
+        self._assign(o.id for o in self.scene.selectable_objects())
+        self._notify()
+
+    def clear(self):
+        if self._ids or self.subobjects:
+            if self._ids:
+                self.previous_ids = list(self._ids)
+            self._assign(())
+            self.subobjects = []
+            self._notify()

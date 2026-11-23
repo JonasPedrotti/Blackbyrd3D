@@ -1,0 +1,1134 @@
+"""View and display commands (non-mutating)."""
+
+from ..core import clipping as _clipping
+from ..core import geometry as g
+from .base import (
+    FileReq, OptionReq, PointReq, SelectReq, TextReq, command, frame_sides,
+)
+
+
+_IMAGE_FILTER = "Images (*.png *.jpg *.jpeg)"
+
+
+def _vp(ctx):
+    return ctx.viewport
+
+
+def _redraw_all(ctx):
+    """Repaint every pane, for the settings all of them share.
+
+    Points on is one of those: it lives on the drawing, so turning it on in
+    one pane changes what the other three are meant to be showing, and only
+    the one the command ran in would have been told to paint again.
+    """
+    listing = getattr(ctx.window, "all_viewports", None)
+    for pane in (listing() if listing is not None else []):
+        pane.update()
+    if ctx.viewport is not None:
+        ctx.viewport.update()
+
+
+def _turn(ctx, name: str, said: str | None = None):
+    """Turn the pane to a named view and say so. On a sheet the pane turns a
+    detail, or explains why it cannot, and that is what gets said (#131)."""
+    on_sheet = _vp(ctx).go_to_view(name)
+    if on_sheet is not None:
+        ctx.echo(on_sheet)
+    elif said is not None:
+        ctx.echo(said)
+
+
+@command("top", mutates=False)
+def cmd_top(ctx):
+    _turn(ctx, "top", "Top view.")
+    yield from ()
+
+
+@command("front", mutates=False)
+def cmd_front(ctx):
+    _turn(ctx, "front", "Front view.")
+    yield from ()
+
+
+@command("right", mutates=False)
+def cmd_right(ctx):
+    _turn(ctx, "right", "Right view.")
+    yield from ()
+
+
+@command("isometric", aliases=("iso",), mutates=False)
+def cmd_isometric(ctx):
+    _turn(ctx, "isometric", "Isometric view.")
+    yield from ()
+
+
+@command("perspective", aliases=("persp",), mutates=False)
+def cmd_persp(ctx):
+    _turn(ctx, "perspective", "Perspective view.")
+    yield from ()
+
+
+@command("zoomextents", aliases=("ze", "zea"), mutates=False, space="any")
+def cmd_zoom_extents(ctx):
+    _vp(ctx).zoom_extents()
+    ctx.echo("Zoomed to extents.")
+    yield from ()
+
+
+@command("undoview", mutates=False, space="any")
+def cmd_undoview(ctx):
+    """Put the view back where it was before the last view change.
+
+    Rhino's UndoView. It is a separate history from the drawing's undo
+    because nothing about the drawing changed: an orbit that went too far
+    leaves the model exactly as it was, and taking back the last edit is no
+    help when what you want back is the camera you had a moment ago. A whole
+    drag counts as one change, and each pane remembers its own.
+    """
+    vp = _vp(ctx)
+    if vp is None or not vp.undo_view():
+        ctx.echo("No earlier view to go back to.")
+    else:
+        ctx.echo("Previous view.")
+    yield from ()
+
+
+@command("redoview", mutates=False, space="any")
+def cmd_redoview(ctx):
+    """Go forward again through the views `undoview` stepped back through."""
+    vp = _vp(ctx)
+    if vp is None or not vp.redo_view():
+        ctx.echo("No later view to go forward to.")
+    else:
+        ctx.echo("Next view.")
+    yield from ()
+
+
+@command("wireframe", aliases=("wf",), mutates=False)
+def cmd_wireframe(ctx):
+    _vp(ctx).set_display_mode("wireframe")
+    ctx.echo("Wireframe display.")
+    yield from ()
+
+
+@command("shaded", aliases=("sh",), mutates=False)
+def cmd_shaded(ctx):
+    _vp(ctx).set_display_mode("shaded")
+    ctx.echo("Shaded display.")
+    yield from ()
+
+
+@command("ghosted", aliases=("gh",), mutates=False)
+def cmd_ghosted(ctx):
+    _vp(ctx).set_display_mode("ghosted")
+    ctx.echo("Ghosted display.")
+    yield from ()
+
+
+@command("back", mutates=False)
+def cmd_back(ctx):
+    _turn(ctx, "back")
+    yield from ()
+
+
+@command("left", mutates=False)
+def cmd_left(ctx):
+    _turn(ctx, "left")
+    yield from ()
+
+
+@command("bottom", mutates=False)
+def cmd_bottom(ctx):
+    _turn(ctx, "bottom")
+    yield from ()
+
+
+@command("viewcapturetofile", aliases=("vcf", "viewcapture"), mutates=False)
+def cmd_viewcapturetofile(ctx):
+    """Save the active viewport as a PNG image."""
+    import os
+    path = yield FileReq("Image path", default="~/viewport.png", save=True,
+                         title="Save viewport capture",
+                         filters=_IMAGE_FILTER)
+    path = os.path.abspath(os.path.expanduser(path.strip()))
+    if not path.lower().endswith((".png", ".jpg", ".jpeg")):
+        path += ".png"
+    img = _vp(ctx).grabFramebuffer()
+    img.save(path)
+    ctx.echo(f"Saved {img.width()}x{img.height()} capture to {path}")
+
+
+@command("viewcapturetoclipboard", aliases=("vcc",), mutates=False)
+def cmd_viewcapturetoclipboard(ctx):
+    """Copy the active viewport image to the clipboard."""
+    from PySide6.QtWidgets import QApplication
+    img = _vp(ctx).grabFramebuffer()
+    QApplication.clipboard().setImage(img)
+    ctx.echo(f"Copied {img.width()}x{img.height()} capture to the "
+             "clipboard.")
+    yield from ()
+
+
+@command("clippingplane", aliases=("clip",))
+def cmd_clippingplane(ctx):
+    """Place a rectangular clipping plane parallel to the CPlane through
+    the first corner. It cuts away the side toward the view it is drawn
+    in, as Rhino 8 does: drawn in Top it takes what is above and keeps what
+    is below, the way you are looking. Move or rotate the plane object to
+    move the cut; Flip reverses the kept side. The purple arrow points
+    toward the visible side, following Rhino's convention."""
+    c1 = yield PointReq("First corner of clipping plane")
+
+    def _rect(p):
+        cp = ctx.cplane
+        u1, v1, w1 = cp.from_world(c1)
+        u2, v2, _ = cp.from_world(p)
+        if abs(u2 - u1) < 1e-9 or abs(v2 - v1) < 1e-9:
+            return None
+        return g.planar_face(g.make_polyline(
+            [cp.to_world(u1, v1, w1), cp.to_world(u2, v1, w1),
+             cp.to_world(u2, v2, w1), cp.to_world(u1, v2, w1)], closed=True))
+
+    c2 = yield PointReq("Opposite corner", rubber_from=c1,
+                        choices={"Flip": ["No", "Yes"]}, preview_fn=_rect,
+                        rubber_sides=frame_sides(c1, ctx.cplane),
+                        pick_plane=(tuple(c1), tuple(ctx.cplane.normal)))
+    face = _rect(c2)
+    if face is None:
+        ctx.echo("Degenerate rectangle — no clipping plane created.")
+        return
+    # The side to cut away is the viewer's. The rectangle's own winding,
+    # which follows the way it was dragged, used to decide it, so one drag
+    # cut down and the next cut up.
+    away = _toward_viewer(ctx, c1, ctx.cplane.normal)
+    if ctx.opt("Flip", "No") == "Yes":
+        away = [-c for c in away]
+    normal = g.face_normal(next(iter(g.faces_of(face))))
+    if sum(a * b for a, b in zip(normal, away)) < 0:
+        face = g.mirror(face, tuple(c1), tuple(ctx.cplane.normal))
+    obj = ctx.scene.add(face, name=_next_clip_name(ctx.scene))
+    from ..core import clipping
+    clip_view = getattr(ctx.viewport, "clip_view", None)
+    view = clip_view() if clip_view is not None else None
+    ctx.scene.update(obj.id, clip_plane=(
+        clipping.drawn_in(view) if view else {"enabled": True}))
+    ctx.echo(f"Created {obj.name}. The purple arrow points toward the visible "
+             "side. 'disableclippingplane' pauses it.")
+
+
+def _toward_viewer(ctx, point, normal) -> list:
+    """The one of `normal` and its reverse that faces whoever is drawing.
+
+    A parallel view (Top, Front) is looked at along its direction wherever
+    its eye happens to sit, so a plane drawn above that eye is still seen
+    from above; a perspective view is looked at from its eye. With no view
+    at all, a script's, the construction plane's normal stands, and that
+    faces the viewer in every standard view.
+    """
+    n = [float(c) for c in normal]
+    cam = getattr(getattr(ctx, "viewport", None), "camera", None)
+    if cam is None:
+        return n
+    eye = [float(c) for c in cam.position]
+    if getattr(cam, "projection", "perspective") == "parallel":
+        target = [float(c) for c in cam.target]
+        toward = [e - t for e, t in zip(eye, target)]
+    else:
+        toward = [e - float(p) for e, p in zip(eye, point)]
+    if sum(a * b for a, b in zip(n, toward)) < 0:
+        return [-c for c in n]
+    return n
+
+
+def _next_clip_name(scene) -> str:
+    n = sum(1 for o in scene.all() if o.clip_plane) + 1
+    return f"Clipping Plane {n:02d}"
+
+
+def _clip_planes_from(ctx, objs):
+    planes = [o for o in objs if o.clip_plane]
+    if not planes:                       # fall back to every clip plane
+        planes = [o for o in ctx.scene.all() if o.clip_plane]
+    return planes
+
+
+@command("disableclippingplane", aliases=("dcc",), mutates=False)
+def cmd_disableclippingplane(ctx):
+    """Pause clipping planes (they stay in the scene, the cut stops)."""
+    # min_count=0: Enter on nothing is every plane, as the prompt says,
+    # rather than the command cancelled
+    objs = yield SelectReq("Select clipping planes (Enter or 'all' = all)",
+                           allow_preselected=True, min_count=0)
+    planes = _clip_planes_from(ctx, objs)
+    for o in planes:
+        # the views it is switched off in wait for it to resume
+        ctx.scene.update(o.id, clip_plane={**o.clip_plane, "enabled": False})
+    ctx.echo(f"Disabled {len(planes)} clipping plane(s).")
+
+
+@command("enableclippingplane", aliases=("ecc",), mutates=False)
+def cmd_enableclippingplane(ctx):
+    """Re-enable paused clipping planes."""
+    # min_count=0: Enter on nothing is every plane, as the prompt says,
+    # rather than the command cancelled
+    objs = yield SelectReq("Select clipping planes (Enter or 'all' = all)",
+                           allow_preselected=True, min_count=0)
+    planes = _clip_planes_from(ctx, objs)
+    for o in planes:
+        ctx.scene.update(o.id, clip_plane={**o.clip_plane, "enabled": True})
+    ctx.echo(f"Enabled {len(planes)} clipping plane(s).")
+
+
+def _view_here(ctx):
+    """The view a clipping plane is switched in from where you are: the
+    pane, or the detail you are inside on a sheet. None says why not."""
+    vp = getattr(ctx, "viewport", None)
+    view = vp.clip_view() if vp is not None else None
+    if view is None:
+        ctx.echo("No view to switch it in here: run this in a model "
+                 "view, or double-click a detail to go inside it first.")
+    return view
+
+
+@command("disableclippinginview", aliases=("dcv",), mutates=False)
+def cmd_disableclippinginview(ctx):
+    """Switch clipping planes off in the view you are in (the pane, or the
+    detail you are inside) and leave them cutting every other view."""
+    view = _view_here(ctx)
+    if view is None:
+        return
+    objs = yield SelectReq("Clipping planes to switch off in this view "
+                           "(Enter or 'all' = all)", allow_preselected=True,
+                           min_count=0)
+    planes = _clip_planes_from(ctx, objs)
+    for o in planes:
+        _clipping.switch(ctx.scene, o.id, view, False)
+    ctx.echo(f"{len(planes)} clipping plane(s) no longer cut this view; "
+             "'enableclippinginview' brings them back.")
+
+
+@command("enableclippinginview", aliases=("ecv",), mutates=False)
+def cmd_enableclippinginview(ctx):
+    """Switch clipping planes back on in the view you are in (the pane, or
+    the detail you are inside). A paused one resumes, and so cuts its
+    other views again as well."""
+    view = _view_here(ctx)
+    if view is None:
+        return
+    objs = yield SelectReq("Clipping planes to switch on in this view "
+                           "(Enter or 'all' = all)", allow_preselected=True,
+                           min_count=0)
+    planes = _clip_planes_from(ctx, objs)
+    resumed = 0
+    for o in planes:
+        if not o.clip_plane.get("enabled"):
+            resumed += 1
+            ctx.scene.update(o.id, clip_plane={**o.clip_plane,
+                                               "enabled": True})
+        _clipping.switch(ctx.scene, o.id, view, True)
+    ctx.echo(f"{len(planes)} clipping plane(s) cut this view.")
+    if resumed:
+        ctx.echo(f"{resumed} of them had been paused everywhere, so they "
+                 "cut their other views again too.")
+
+
+@command("selclippingplane", mutates=False)
+def cmd_selclippingplane(ctx):
+    """Select every clipping plane object."""
+    ids = [o.id for o in ctx.scene.all() if o.clip_plane]
+    ctx.selection.set(ids)
+    ctx.echo(f"Selected {len(ids)} clipping plane(s).")
+    yield from ()
+
+
+@command("spacemouse", aliases=("3dmouse",), mutates=False)
+def cmd_spacemouse(ctx):
+    """SpaceMouse status, on/off toggle, and a live axis readout for
+    checking the motion mapping."""
+    win = ctx.window
+    if win is None or not hasattr(win, "spacemouse"):
+        ctx.echo("SpaceMouse support needs the GUI.")
+        return
+        yield  # pragma: no cover
+    action = yield OptionReq("SpaceMouse",
+                             options=["Status", "Toggle", "Diag"],
+                             default="Status")
+    sm = win.spacemouse
+    cfg = win.cfg
+    if action == "Toggle":
+        new = not cfg.get("spacemouse", "enabled", default=True)
+        cfg.set("spacemouse", "enabled", new)
+        ctx.echo(f"SpaceMouse {'enabled' if new else 'disabled'} "
+                 f"({sm.status()}).")
+    elif action == "Diag":
+        import time
+        sm.diag_until = time.time() + 10
+        ctx.echo("SpaceMouse diagnostics for 10 s — move the puck and "
+                 "watch the axis values here.")
+    else:
+        state = "on" if cfg.get("spacemouse", "enabled",
+                                default=True) else "off"
+        ctx.echo(f"SpaceMouse: {sm.status()}; navigation {state}. "
+                 "Sensitivity and inversion live in Settings > Mouse.")
+
+
+@command("zoom", aliases=("z",), mutates=False, space="any")
+def cmd_zoom(ctx):
+    """Zoom the active view: Selected, Extents, a picked Window, In, Out."""
+    vp = _vp(ctx)
+    held = ctx.selection.ids or getattr(ctx.selection, "subobjects", None)
+    mode = yield OptionReq(
+        "Zoom", options=["Selected", "Extents", "Window", "In", "Out"],
+        default="Selected" if held else "Extents")
+    if mode == "Window":
+        p1 = yield PointReq("First corner of zoom window")
+        p2 = yield PointReq("Opposite corner", rubber_from=p1)
+        vp.zoom_to_points(p1, p2)
+    elif mode == "Selected":
+        if not vp.zoom_selected():
+            ctx.echo("Nothing selected — zooming extents instead.")
+            vp.zoom_extents()
+    elif mode == "Extents":
+        vp.zoom_extents()
+    else:
+        vp.zoom_steps(3.0 if mode == "In" else -3.0)
+
+
+@command("zoomselected", aliases=("zs",), mutates=False, space="any")
+def cmd_zoomselected(ctx):
+    """Frame the current selection in the active view."""
+    vp = _vp(ctx)
+    if not vp.zoom_selected():
+        ctx.echo("Nothing selected.")
+    yield from ()
+
+
+@command("zoomwindow", aliases=("zw",), mutates=False, space="any")
+def cmd_zoomwindow(ctx):
+    """Zoom into a window picked with two corner points."""
+    vp = _vp(ctx)
+    p1 = yield PointReq("First corner of zoom window")
+    p2 = yield PointReq("Opposite corner", rubber_from=p1)
+    vp.zoom_to_points(p1, p2)
+
+
+@command("wyrm", aliases=("nodes",), mutates=False)
+def cmd_wyrm(ctx):
+    """Open Wyrm, the visual graph editor: wire components together to
+    make geometry, watch it preview in the model, then Bake it in."""
+    win = ctx.window
+    if win is None:
+        ctx.echo("Wyrm needs the GUI.")
+        return
+        yield  # pragma: no cover
+    win.show_wyrm()
+    return
+    yield  # pragma: no cover
+
+
+@command("wyrmset", mutates=False, repeatable=False)
+def cmd_wyrmset(ctx):
+    """Pick the model objects a Wyrm component holds. Wyrm starts this
+    from a component's Set Crv... (or Pt, Brep, Mesh), filtered to its
+    kind."""
+    editor = getattr(ctx.window, "wyrm", None)
+    node = (editor.graph.nodes.get(editor.picking)
+            if editor is not None else None)
+    if node is None:
+        ctx.echo("Right-click a Wyrm component and choose Set Crv..., "
+                 "Set Brep... or the like")
+        return
+        yield  # pragma: no cover
+    comp = node.component
+    objs = yield SelectReq(
+        f"Select {comp.plural} for Wyrm, Enter when done",
+        kinds=comp.picks)
+    editor.set_references(node.id, [o.id for o in objs])
+    ctx.echo(f"Wyrm {comp.title} set to {len(objs)} object"
+             + ("" if len(objs) == 1 else "s"))
+
+
+@command("wyrmvector", mutates=False, repeatable=False)
+def cmd_wyrmvector(ctx):
+    """Pick the two points a Wyrm Vector runs between: where it starts,
+    then where its arrow points. Wyrm starts this from Set Vector..."""
+    from ..core.wyrm import arrow
+    editor = getattr(ctx.window, "wyrm", None)
+    node = (editor.graph.nodes.get(editor.picking)
+            if editor is not None else None)
+    if node is None:
+        ctx.echo("Right-click a Wyrm Vector and choose Set Vector...")
+        return
+        yield  # pragma: no cover
+    start = yield PointReq("Start of the vector")
+
+    def ghost(end):
+        try:
+            return arrow(start, end)
+        except Exception:                                  # noqa: BLE001
+            return None
+
+    end = yield PointReq("End of the vector, where the arrow points",
+                         rubber_from=start, rubber_band=False,
+                         preview_fn=ghost)
+    editor.set_inputs(node.id, {"A": tuple(start), "B": tuple(end)})
+    ctx.echo("Wyrm Vector set")
+
+
+@command("newviewport", aliases=("newvp", "splitview"), mutates=False)
+def cmd_newviewport(ctx):
+    """Open an extra live viewport in a dockable panel — drag its title
+    bar to rearrange or tear it off to float; a pane's own title menu picks
+    what it shows, so a paper sheet can sit beside the model."""
+    win = ctx.window
+    if win is None:
+        ctx.echo("Extra viewports need the GUI.")
+        return
+        yield  # pragma: no cover
+    where = yield OptionReq(
+        "Place the new viewport",
+        options=["Right", "Left", "Bottom", "Top", "Floating"],
+        default="Right")
+    space = "model"
+    if ctx.scene.layouts:
+        names = ["Model"] + [lay.name for lay in ctx.scene.layouts]
+        pick = yield OptionReq("Showing", options=names, default="Model")
+        if pick != "Model":
+            space = next(lay.id for lay in ctx.scene.layouts
+                         if lay.name == pick)
+    win.new_viewport_dock(where, space)
+    ctx.echo("New viewport opened — drag its title bar to rearrange; "
+             "its title menu picks what it shows.")
+
+
+@command("floatviewport", aliases=("floatvp",), mutates=False)
+def cmd_floatviewport(ctx):
+    """Open a floating viewport window (drag it to another monitor)."""
+    win = ctx.window
+    if win is None:
+        ctx.echo("Extra viewports need the GUI.")
+    else:
+        win.new_viewport_dock("Floating")
+        ctx.echo("Floating viewport opened.")
+    yield from ()
+
+
+@command("4view", aliases=("fourview", "quadview"), mutates=False)
+def cmd_4view(ctx):
+    """Split the model area into Top / Front / Right / Perspective."""
+    win = ctx.window
+    if win is None:
+        ctx.echo("Viewport layouts need the GUI.")
+    else:
+        win.set_view_layout("quad")
+        ctx.echo("Four viewports. '1view' returns to a single view.")
+    yield from ()
+
+
+@command("1view", aliases=("oneview", "singleview"), mutates=False)
+def cmd_1view(ctx):
+    win = ctx.window
+    if win is None:
+        ctx.echo("Viewport layouts need the GUI.")
+    else:
+        win.set_view_layout("single")
+        ctx.echo("Single viewport.")
+    yield from ()
+
+
+@command("maxviewport", aliases=("max", "maximizeviewport"), mutates=False)
+def cmd_maxviewport(ctx):
+    """Give the pane you are in the whole window; again puts it back."""
+    win = ctx.window
+    if win is None:
+        ctx.echo("Viewport layouts need the GUI.")
+        yield from ()
+        return
+    was = win.maximized_viewport is not None
+    if win.toggle_maximized_viewport():
+        ctx.echo("Viewport maximised. 'max' again restores the layout.")
+    elif was:
+        ctx.echo("Layout restored.")
+    else:
+        ctx.echo("Only one viewport is open; it already fills the window.")
+    yield from ()
+
+
+# Not `iso`: that has meant an isometric view since long before this
+# command existed, and registration is last one wins without saying so.
+@command("isocurves", aliases=("showisocurves",), mutates=False)
+def cmd_isocurves(ctx):
+    """Show or hide the wires across surfaces in this viewport.
+
+    Rendered leaves them off by default; this overrules whatever the mode
+    wanted, in this pane only, until 'default' hands it back.
+    """
+    from .base import OptionReq
+    vp = _vp(ctx)
+    now = vp.shows_isocurves()
+    choice = yield OptionReq(
+        f"Surface isocurves (currently {'on' if now else 'off'})",
+        options=["On", "Off", "Toggle", "Default"],
+        default="Off" if now else "On")
+    if choice == "Default":
+        vp.set_isocurves(None)
+        ctx.echo("Surface isocurves follow the display mode again "
+                 f"({'on' if vp.shows_isocurves() else 'off'} in "
+                 f"{vp.display_mode}).")
+        return
+    vp.set_isocurves(not now if choice == "Toggle" else choice == "On")
+    ctx.echo(f"Surface isocurves {'on' if vp.shows_isocurves() else 'off'}.")
+
+
+@command("surfaceedges", aliases=("showedges",), mutates=False)
+def cmd_surfaceedges(ctx):
+    """Show or hide the outlines of faces. Curves and text are unaffected."""
+    from .base import OptionReq
+    vp = _vp(ctx)
+    now = vp.shows_edges()
+    choice = yield OptionReq(
+        f"Surface edges (currently {'on' if now else 'off'})",
+        options=["On", "Off", "Toggle"],
+        default="Off" if now else "On")
+    vp.set_edges(not now if choice == "Toggle" else choice == "On")
+    ctx.echo(f"Surface edges {'on' if vp.shows_edges() else 'off'}.")
+
+
+@command("rendered", aliases=("render",), mutates=False)
+def cmd_rendered(ctx):
+    """Environment-lit display with materials and a ground shadow."""
+    _vp(ctx).set_display_mode("rendered")
+    ctx.echo("Rendered display. Assign looks with 'material'.")
+    yield from ()
+
+
+@command("plaster", aliases=("clay", "arctic"), mutates=False)
+def cmd_plaster(ctx):
+    """Every surface in matte white under soft light, like a plaster model."""
+    _vp(ctx).set_display_mode("plaster")
+    ctx.echo("Plaster display.")
+    yield from ()
+
+
+@command("plastercolor", aliases=("claycolor",), mutates=False)
+def cmd_plastercolor(ctx):
+    """Plaster's soft light, with every object in its own colour."""
+    _vp(ctx).set_display_mode("plastercolor")
+    ctx.echo("Plaster Color display.")
+    yield from ()
+
+
+@command("technical", aliases=("tech",), mutates=False)
+def cmd_technical(ctx):
+    """Hidden-line technical display (parallel projection linework)."""
+    _vp(ctx).set_display_mode("technical")
+    ctx.echo("Technical display — visible edges solid, hidden dashed. "
+             "Navigation shows wireframe until you release.")
+    yield from ()
+
+
+@command("grid", mutates=False)
+def cmd_grid(ctx):
+    vp = _vp(ctx)
+    vp.grid_visible = not vp.grid_visible
+    vp.update()
+    ctx.echo(f"Grid {'on' if vp.grid_visible else 'off'}.")
+    yield from ()
+
+
+@command("snap", mutates=False)
+def cmd_snap(ctx):
+    vp = _vp(ctx)
+    vp.snaps.enabled = not vp.snaps.enabled
+    ctx.echo(f"Object snap {'on' if vp.snaps.enabled else 'off'} "
+             "(end / mid / center).")
+    yield from ()
+
+
+_OSNAP_KINDS = ("End", "Point", "Mid", "Center", "Quad", "Int", "AppInt", "Perp",
+                "Near")
+
+
+@command("osnap", mutates=False)
+def cmd_osnap(ctx):
+    """Toggle one object-snap type (or All = the master switch) —
+    scriptable, e.g. bind a key to 'osnap mid toggle'."""
+    kind = yield OptionReq("Snap type",
+                           options=["All", *_OSNAP_KINDS, "Project"],
+                           default="All")
+    action = yield OptionReq("Action", options=["Toggle", "On", "Off"],
+                             default="Toggle")
+    vp = _vp(ctx)
+    cfg = getattr(vp, "config", None)
+    if kind == "All":
+        vp.snaps.enabled = (not vp.snaps.enabled if action == "Toggle"
+                            else action == "On")
+        if cfg:
+            cfg.set("osnaps", "enabled", vp.snaps.enabled)
+        state = "on" if vp.snaps.enabled else "off"
+        ctx.echo(f"Object snaps {state}.")
+    elif kind == "Project":
+        vp.snaps.project_enabled = (not vp.snaps.project_enabled if action == "Toggle"
+                            else action == "On")
+        ctx.echo(f"Project {'on' if vp.snaps.project_enabled else 'off'} "
+                 f"(Z {vp.snaps.project_z:g}).")
+    else:
+        key = kind.lower()
+        # what is running, not what is on disk: the config holds what the
+        # next launch starts with, so reading the answer out of it toggled
+        # against a setting this session may have moved on from, and writing
+        # only there left the bar to redraw itself from a snap index that
+        # never heard about it
+        cur = bool(vp.snaps.types.get(key, False))
+        new = (not cur) if action == "Toggle" else action == "On"
+        vp.snaps.types[key] = new
+        if cfg:
+            cfg.set("osnaps", key, new)
+        ctx.echo(f"{kind} snap {'on' if new else 'off'}.")
+    win = ctx.window
+    if win is not None and hasattr(win, "osnap_bar"):
+        win.osnap_bar.refresh()
+
+
+@command("gridsnap", mutates=False)
+def cmd_gridsnap(ctx):
+    vp = _vp(ctx)
+    vp.grid_snap = not vp.grid_snap
+    ctx.echo(f"Grid snap {'on' if vp.grid_snap else 'off'} "
+             f"(step {vp.grid_snap_step:g}).")
+    yield from ()
+
+
+@command("pointson", aliases=("po",), mutates=False)
+def cmd_pointson(ctx):
+    """Show control points for selected curves, surfaces and meshes
+    (F10); a mesh's are its corners."""
+    from ..core import geometry as gm
+    objs = yield SelectReq("Select curves, surfaces or meshes to show "
+                           "control points",
+                           kinds=("curve", "surface", "mesh"))
+    vp = _vp(ctx)
+    shown = 0
+    for o in objs:
+        try:
+            if o.kind == "surface":
+                gm.surface_control_points(o.shape)
+            else:
+                gm.get_control_points(o.shape)
+            vp.cv_enabled.add(o.id)
+            ctx.scene.cv_auto.discard(o.id)     # kept once the curve is let go
+            shown += 1
+        except gm.GeometryError as exc:
+            ctx.echo(f"{o.name}: {exc}")
+    _redraw_all(ctx)
+    if shown:
+        ctx.echo(f"Control points on for {shown} object(s) — drag to edit, "
+                 "F11 or Esc to hide.")
+
+
+@command("pointsoff", aliases=("pf",), mutates=False)
+def cmd_pointsoff(ctx):
+    vp = _vp(ctx)
+    n = len(vp.cv_enabled)
+    vp.cv_enabled.clear()
+    ctx.scene.cv_auto.clear()
+    # Let go of the points it just hid. A held point is what the transform
+    # commands work on and what the gumball stands on, and neither should be
+    # holding a marker nobody can see.
+    kept = [e for e in ctx.selection.subobjects if e[1] != "cv"]
+    if len(kept) != len(ctx.selection.subobjects):
+        ctx.selection.set_subobjects(kept)
+    _redraw_all(ctx)
+    ctx.echo(f"Control points off ({n} curve(s)).")
+    yield from ()
+
+
+# --- analysis ----------------------------------------------------------------
+
+@command("units", mutates=False)
+def cmd_units(ctx):
+    """Set document units; optionally rescale the model to keep real size."""
+    from .base import OptionReq
+    from ..utils.units import TO_MM, UNIT_LABELS, UNITS
+    current = ctx.scene.units
+    choice = yield OptionReq(
+        f"Document units (currently {UNIT_LABELS[current]})",
+        options=["mm", "cm", "m", "in", "ft"], default=current)
+    if choice == current:
+        ctx.echo(f"Units unchanged ({UNIT_LABELS[current]}).")
+        return
+    factor = TO_MM[current] / TO_MM[choice]
+    rescale = "No"
+    if ctx.scene.all():
+        rescale = yield OptionReq(
+            f"Scale model by {factor:g} so objects keep their real size?",
+            options=["Yes", "No"], default="Yes")
+    # Before anything changes, so that one undo puts the units back with the
+    # model and the sheets. Taken after the units had changed, undo left the
+    # new units on the old model; and without a rescale there was none.
+    ctx.history.checkpoint("units")
+    # What is lettered keeps its sizes, in the built-in styles it was
+    # lettered in; a drawing with nothing lettered takes the new units' set.
+    from ..core.layout import lettered_in_builtin_styles, style_set
+    ctx.scene.annot_style_set = (style_set(ctx.scene)
+                                 if lettered_in_builtin_styles(ctx.scene)
+                                 else None)
+    ctx.scene.units = choice
+    if rescale == "Yes":
+        for o in ctx.scene.all():
+            ctx.scene.replace_shape(
+                o.id, g.scale(o.shape, (0, 0, 0), factor))
+    for lay in ctx.scene.layouts:
+        lay.convert_units(factor, rescaled=rescale == "Yes")
+    ctx.scene.notify()
+    ctx.echo(f"Document units: {UNIT_LABELS[choice]}."
+             + (" Model rescaled." if rescale == "Yes" else ""))
+
+
+@command("distance", aliases=("dist",), mutates=False)
+def cmd_distance(ctx):
+    p1 = yield PointReq("First point")
+    p2 = yield PointReq("Second point", rubber_from=p1)
+    d = sum((b - a) ** 2 for a, b in zip(p1, p2)) ** 0.5
+    ctx.echo(f"Distance: {ctx.scene.format_length(d)}")
+
+
+@command("area", mutates=False)
+def cmd_area(ctx):
+    objs = yield SelectReq("Select surfaces or solids",
+                           kinds=("surface", "solid"))
+    total = sum(g.surface_area(o.shape) for o in objs)
+    ctx.echo(f"Area: {total:.4f} {ctx.scene.units}²")
+
+
+@command("volume", aliases=("vol",), mutates=False)
+def cmd_volume(ctx):
+    objs = yield SelectReq("Select solids", kinds=("solid",))
+    total = sum(g.volume(o.shape) for o in objs)
+    ctx.echo(f"Volume: {total:.4f} {ctx.scene.units}³")
+
+
+@command("length", aliases=("len",), mutates=False)
+def cmd_length(ctx):
+    objs = yield SelectReq("Select curves", kinds=("curve",))
+    total = sum(g.curve_length(o.shape) for o in objs)
+    ctx.echo(f"Length: {ctx.scene.format_length(total)}")
+
+
+@command("printcheck", aliases=("printinfo",), mutates=False)
+def cmd_printcheck(ctx):
+    """Check selected objects for 3D-print readiness: watertight, manifold,
+    degenerate facets, thin walls, overhangs and print size."""
+    objs = yield SelectReq("Select objects to check for printing",
+                           kinds=("solid", "surface", "mesh"))
+    if not objs:
+        ctx.echo("Nothing selected.")
+        return
+    from ..core import printcheck as pc
+    u = ctx.scene.units
+    for o in objs:
+        try:
+            r = pc.analyze(o.shape)
+        except Exception as exc:                      # noqa: BLE001
+            ctx.echo(f"{o.name}: analysis failed ({exc})")
+            continue
+        head = "PRINT-READY" if r["ok"] else "NEEDS ATTENTION"
+        wt = "yes" if r["watertight"] else f"NO ({r['open_edges']} open edges)"
+        mf = ("yes" if r["manifold"]
+              else f"NO ({r['nonmanifold_edges']} bad edges)")
+        sx, sy, sz = r["size"]
+        lines = [f"{o.name} — {head}",
+                 f"  watertight: {wt} · manifold: {mf}",
+                 f"  size: {sx:.3g} x {sy:.3g} x {sz:.3g} {u}"]
+        if r.get("brep_valid") is False:
+            lines.append("  WARNING: geometry is invalid (self-intersections?)")
+        if r["degenerate"]:
+            lines.append(f"  degenerate facets: {r['degenerate']}")
+        if r["min_wall"] is not None:
+            tag = "  (THIN)" if r["thin"] else ""
+            lines.append(f"  min wall: {r['min_wall']:.3g} {u}{tag}")
+        pct = r["overhang_fraction"] * 100.0
+        note = " — may need supports" if pct > 1.0 else ""
+        lines.append(f"  overhangs >{r['overhang_deg']:.0f}°: "
+                     f"{pct:.1f}% of surface{note}")
+        ctx.echo("\n".join(lines))
+
+
+@command("curvature", mutates=False)
+def cmd_curvature(ctx):
+    objs = yield SelectReq("Select curve", kinds=("curve",), max_count=1)
+    pt = yield PointReq("Point on curve to evaluate")
+    info = g.curvature_at(objs[0].shape, pt)
+    r = info["radius"]
+    r_text = f"{r:.4f}" if r != float("inf") else "infinite (straight)"
+    ctx.echo(f"Curvature: {info['curvature']:.6f}   Radius: {r_text}")
+
+
+@command("cplane", mutates=False)
+def cmd_cplane(ctx):
+    """Reposition the construction plane (drawing plane + grid)."""
+    from .base import OptionReq
+    from ..core import cplane as cp
+    choice = yield OptionReq(
+        "Construction plane",
+        options=["World", "Front", "Back", "Right", "Left", "3Point"],
+        default="World")
+    vp = _vp(ctx)
+    if choice == "3Point":
+        origin = yield PointReq("CPlane origin")
+        xpt = yield PointReq("Point on the X axis", rubber_from=origin)
+        ypt = yield PointReq("Point in the plane (Y side)",
+                             rubber_from=origin)
+        try:
+            vp.set_cplane(cp.from_three_points(origin, xpt, ypt))
+        except ValueError as exc:
+            ctx.echo(f"CPlane failed: {exc}")
+            return
+    else:
+        vp.set_cplane(cp.PRESETS[choice.lower()]())
+    ctx.echo(f"Construction plane: {vp.cplane.name}. Drawing commands, "
+             "grid and picking now use this plane.")
+
+
+@command("curvatureanalysis", aliases=("curvmap",), mutates=False)
+def cmd_curvature_analysis(ctx):
+    vp = _vp(ctx)
+    if vp.display_mode == "curvature":
+        vp.set_display_mode("shaded")
+        ctx.echo("Curvature analysis off.")
+    else:
+        vp.set_display_mode("curvature")
+        ctx.echo("Curvature analysis on — blue concave, green flat, "
+                 "red convex (run again to turn off).")
+    yield from ()
+
+
+@command("namedview", aliases=("nv",), mutates=False)
+def cmd_namedview(ctx):
+    from .base import OptionReq, TextReq
+    action = yield OptionReq("Named view",
+                             options=["Save", "Restore", "List", "Delete"],
+                             default="Save")
+    views = ctx.scene.named_views
+    vp = _vp(ctx)
+    if action == "List":
+        ctx.echo("Named views: " + (", ".join(sorted(views))
+                                    if views else "(none)"))
+        return
+    name = yield TextReq("View name")
+    if action == "Save":
+        # the same shape the view history keeps, so a view saved into a file
+        # and a view stepped back to cannot drift apart
+        views[name] = vp.camera.state()
+        ctx.scene.notify()
+        ctx.echo(f"Saved view '{name}'.")
+    elif action == "Restore":
+        v = views.get(name)
+        if v is None:
+            ctx.echo(f"No view named '{name}'.")
+            return
+        vp.camera.restore(v)
+        vp.update()
+        ctx.echo(f"Restored view '{name}'.")
+    elif action == "Delete":
+        if views.pop(name, None) is not None:
+            ctx.scene.notify()
+            ctx.echo(f"Deleted view '{name}'.")
+        else:
+            ctx.echo(f"No view named '{name}'.")
+
+
+@command("zebra", mutates=False)
+def cmd_zebra(ctx):
+    vp = _vp(ctx)
+    if vp.display_mode == "zebra":
+        vp.set_display_mode("shaded")
+        ctx.echo("Zebra analysis off.")
+    else:
+        vp.set_display_mode("zebra")
+        ctx.echo("Zebra analysis on — stripes reveal surface continuity "
+                 "(run again to turn off).")
+    yield from ()
+
+
+@command("gumball", mutates=False)
+def cmd_gumball(ctx):
+    gb = _vp(ctx).gumball
+    gb.set_enabled(not gb.enabled)
+    ctx.echo(f"Gumball {'on' if gb.enabled else 'off'}.")
+    yield from ()
+
+
+_GUMBALL_ALIGNMENTS = {"CPlane": "cplane", "Object": "object",
+                       "World": "world", "View": "view"}
+
+
+@command("gumballalignment", mutates=False)
+def cmd_gumballalignment(ctx):
+    """Choose what the gumball's axes follow: the CPlane, the object, the world or the view."""
+    gb = _vp(ctx).gumball
+    current = {v: k for k, v in _GUMBALL_ALIGNMENTS.items()}[gb.align]
+    choice = yield OptionReq("Gumball alignment",
+                             options=list(_GUMBALL_ALIGNMENTS),
+                             default=current)
+    gb.set_align(_GUMBALL_ALIGNMENTS[choice])
+    ctx.echo(f"Gumball aligned to the {choice if choice == 'CPlane' else choice.lower()}.")
+
+
+@command("pictureframe", aliases=("picture",), space="any")
+def cmd_pictureframe(ctx):
+    """Choose and place an embedded reference image for tracing."""
+    from .base import OptionReq, PointReq
+    action = "Add"
+    if ctx.scene.image_planes:
+        action = yield OptionReq("Picture frame",
+                                 options=["Add", "RemoveAll"], default="Add")
+    if action == "RemoveAll":
+        n = len(ctx.scene.image_planes)
+        ctx.scene.image_planes = []
+        ctx.scene.notify()
+        ctx.echo(f"Removed {n} picture frame(s).")
+        return
+    from .. import fileio
+    path = yield FileReq("Image path (.png/.jpg/.jpeg/.webp)",
+                         title="Choose picture", filters=fileio.picture_filter())
+    # With no picture in the scene the Add/RemoveAll question is not asked,
+    # but a script can't see that and may answer it anyway. The words mean
+    # what they would have meant; neither is a file anyone means to open.
+    if path.strip().lower() == "removeall":
+        ctx.echo("No picture frames to remove.")
+        return
+    if path.strip().lower() == "add":
+        path = yield FileReq("Image path (.png/.jpg/.jpeg/.webp)",
+                             title="Choose picture",
+                             filters=fileio.picture_filter())
+    yield from place_picture(ctx, path)
+
+
+def place_picture(ctx, path):
+    """Place a known image path; shared by Picture and interactive Import."""
+    import os
+    path = os.path.abspath(os.path.expanduser(path.strip()))
+    try:
+        with open(path, "rb") as image_file:
+            image_data = image_file.read()
+    except OSError as exc:
+        raise ValueError(f"Could not read the image: {path}") from exc
+    from PySide6.QtGui import QImage
+    img = QImage.fromData(image_data)
+    if img.isNull():
+        raise ValueError(f"Could not decode the image: {path}")
+    c1 = yield PointReq("First corner")
+    aspect = img.height() / max(img.width(), 1)
+    paper = bool(getattr(ctx, "on_bare_paper", lambda: False)())
+    cp = ctx.cplane
+    if paper:
+        u1, v1, w1 = map(float, c1)
+        origin = (u1, v1, w1)
+    else:
+        u1, v1, w1 = cp.from_world(c1)
+        origin = cp.to_world(u1, v1, w1)
+    from ..core.picture import PictureShape
+
+    def picture_at(corner):
+        if paper:
+            u2, v2 = float(corner[0]), float(corner[1])
+        else:
+            u2, v2, _ = cp.from_world(corner)
+        width = u2 - u1
+        if abs(width) < 1e-12:
+            raise ValueError("The picture needs a non-zero width.")
+        height = abs(width) * aspect * (1 if v2 >= v1 else -1)
+        if paper:
+            u_vec = (width, 0.0, 0.0)
+            v_vec = (0.0, height, 0.0)
+        else:
+            u_vec = tuple(a - b for a, b in zip(
+                cp.to_world(u2, v1, w1), origin))
+            v_vec = tuple(a - b for a, b in zip(
+                cp.to_world(u1, v1 + height, w1), origin))
+        return PictureShape({
+            "path": path, "origin": list(origin), "u": list(u_vec),
+            "v": list(v_vec), "alpha": 1.0, "image_data": image_data,
+        })
+
+    c2 = yield PointReq("Opposite corner (width; height follows the "
+                        "image aspect)", rubber_from=c1, rubber_band=False,
+                        preview_fn=picture_at)
+    if paper:
+        ctx.add(picture_at(c2), name=os.path.basename(path))
+    else:
+        ctx.scene.add(picture_at(c2), name=os.path.basename(path))
+        ctx.scene.notify()
+    ctx.echo(f"Picture frame placed ({os.path.basename(path)}).")
+
+
+@command("tolerance", mutates=False)
+def cmd_tolerance(ctx):
+    """Show or set the document's absolute modelling tolerance."""
+    from .base import LengthReq
+    from ..core.tolerance import set_tolerance, tol
+    value = yield LengthReq(
+        f"Absolute tolerance (currently {ctx.scene.format_length(tol())})",
+        default=tol(), minimum=1e-9)
+    set_tolerance(float(value))
+    ctx.echo(f"Modelling tolerance: {ctx.scene.format_length(value)}.")
+
+
+@command("ai", aliases=("assistant",), label="AI Assistant", mutates=False)
+def cmd_ai(ctx):
+    """Open the AI assistant panel — model by describing what you want."""
+    ctx.window.show_ai_panel()
+    yield from ()
+
+
+@command("ortho", mutates=False)
+def cmd_ortho(ctx):
+    """Toggle ortho: picked points lock to CPlane axes from the last
+    point (hold Shift for the momentary opposite)."""
+    vp = _vp(ctx)
+    vp.ortho = not vp.ortho
+    if getattr(ctx, "window", None) is not None:
+        bar = getattr(ctx.window, "osnap_bar", None)
+        if bar is not None:
+            bar.refresh()
+    ctx.echo(f"Ortho {'on' if vp.ortho else 'off'}.")
+    yield from ()
+
+
+@command("angle", mutates=False)
+def cmd_angle(ctx):
+    """Angle at a vertex point between two directions."""
+    import math
+
+    import numpy as np
+    pv = yield PointReq("Vertex point")
+    p1 = yield PointReq("First direction point", rubber_from=pv)
+    p2 = yield PointReq("Second direction point", rubber_from=pv)
+    v1 = np.subtract(p1, pv)
+    v2 = np.subtract(p2, pv)
+    n1, n2 = np.linalg.norm(v1), np.linalg.norm(v2)
+    if n1 < 1e-12 or n2 < 1e-12:
+        ctx.echo("Degenerate direction — cancelled.")
+        return
+    cosang = float(np.clip(np.dot(v1, v2) / (n1 * n2), -1.0, 1.0))
+    a = math.degrees(math.acos(cosang))
+    ctx.echo(f"Angle: {a:.4g} degrees ({360 - a if a else 0:.4g} reflex)")
+
+
+@command("radius", mutates=False)
+def cmd_radius(ctx):
+    """Radius of curvature of a curve at a picked point."""
+    curves = yield SelectReq("Select curve", kinds=("curve",), max_count=1)
+    p = yield PointReq("Point on curve")
+    try:
+        info = g.curvature_at(curves[0].shape, p)
+    except g.GeometryError as exc:
+        ctx.echo(str(exc))
+        return
+    k = info["curvature"]
+    if k <= 1e-12:
+        ctx.echo("Curve is straight there (infinite radius).")
+    else:
+        ctx.echo(f"Radius: {ctx.scene.format_length(info['radius'])}"
+                 f"  (curvature {k:.6g})")

@@ -1,0 +1,417 @@
+import math
+import os
+
+import pytest
+
+from blackbyrd3d import fileio
+from blackbyrd3d.core import geometry as g
+from blackbyrd3d.core.scene import Scene
+
+
+@pytest.fixture
+def scene():
+    s = Scene()
+    s.add(g.make_box((0, 0, 0), 10, 10, 10), name="Box A")
+    s.add(g.make_circle((20, 0, 0), 5), name="Profile")
+    layer = s.layers.create("Set pieces", (0.9, 0.4, 0.2))
+    s.add(g.make_sphere((0, 30, 0), 4), name="Ball", layer_id=layer.id)
+    return s
+
+
+def test_native_roundtrip(scene, tmp_path):
+    path = str(tmp_path / "test.byrd")
+    fileio.export_file(scene, path)
+    assert os.path.exists(path)
+
+    loaded = Scene()
+    fileio.import_file(loaded, path)
+    assert len(loaded.all()) == 3
+    names = {o.name for o in loaded.all()}
+    assert names == {"Box A", "Profile", "Ball"}
+    box = loaded.find_by_name("Box A")
+    assert g.volume(box.shape) == pytest.approx(1000)
+    ball = loaded.find_by_name("Ball")
+    layer = loaded.layers.get(ball.layer_id)
+    assert layer.name == "Set pieces"
+    assert layer.color == pytest.approx((0.9, 0.4, 0.2))
+
+
+def test_step_roundtrip(scene, tmp_path):
+    path = str(tmp_path / "test.step")
+    fileio.export_file(scene, path)
+    assert os.path.exists(path)
+
+    loaded = Scene()
+    n = fileio.import_file(loaded, path)
+    assert n >= 2   # solids survive; curve may or may not
+    vols = sorted(g.volume(o.shape) for o in loaded.all()
+                  if o.kind == "solid")
+    assert vols[-1] == pytest.approx(1000, rel=1e-3)
+
+
+def test_obj_export_import(scene, tmp_path):
+    path = str(tmp_path / "test.obj")
+    fileio.export_file(scene, path)
+    text = open(path, encoding="utf-8").read()
+    assert "v " in text and "f " in text
+
+    loaded = Scene()
+    n = fileio.import_file(loaded, path)
+    assert n >= 2   # box + sphere meshes (curve has no faces)
+    mn, mx = loaded.bbox()
+    assert mx[0] == pytest.approx(10, abs=0.5)
+
+
+def test_export_selected_only(scene, tmp_path):
+    path = str(tmp_path / "sel.step")
+    box = scene.find_by_name("Box A")
+    fileio.export_file(scene, path, only_ids=[box.id])
+    loaded = Scene()
+    fileio.import_file(loaded, path)
+    assert len(loaded.all()) == 1
+
+
+def test_unsupported_format(scene, tmp_path):
+    with pytest.raises(ValueError):
+        fileio.export_file(scene, str(tmp_path / "x.xyz"))
+
+
+def test_3dm_roundtrip(tmp_path):
+    import math as _m
+    import rhino3dm as r3
+
+    # build a 3dm file with rhino3dm directly (as Rhino would)
+    model = r3.File3dm()
+    layer = r3.Layer()
+    layer.Name = "Rhino Layer"
+    layer.Color = (200, 100, 50, 255)
+    model.Layers.Add(layer)
+    attrs = r3.ObjectAttributes()
+    attrs.Name = "RhinoCircle"
+    attrs.LayerIndex = 0
+    circle = r3.Circle(r3.Point3d(0, 0, 0), 5.0)
+    model.Objects.AddCurve(circle.ToNurbsCurve(), attrs)
+    sphere = r3.Sphere(r3.Point3d(20, 0, 0), 3.0)
+    model.Objects.AddSphere(sphere, None)
+    path = str(tmp_path / "rhino_file.3dm")
+    assert model.Write(path, 8)
+
+    # import: circle must come in as an exact NURBS curve
+    scene = Scene()
+    n = fileio.import_file(scene, path)
+    assert n >= 1
+    circle_obj = scene.find_by_name("RhinoCircle")
+    assert circle_obj is not None
+    assert g.curve_length(circle_obj.shape) == pytest.approx(
+        2 * _m.pi * 5, rel=1e-6)
+    layer_names = {l.name for l in scene.layers.all()}
+    assert "Rhino Layer" in layer_names
+
+
+def test_3dm_export_and_reimport(scene, tmp_path):
+    path = str(tmp_path / "out.3dm")
+    fileio.export_file(scene, path)
+
+    # verify with rhino3dm directly
+    import rhino3dm as r3
+    model = r3.File3dm.Read(path)
+    assert model is not None
+    geos = [o.Geometry for o in model.Objects]
+    assert any(isinstance(gg, r3.Curve) for gg in geos)
+    assert any(isinstance(gg, r3.Mesh) for gg in geos)
+
+    # and re-import into blackbyrd3d
+    loaded = Scene()
+    n = fileio.import_file(loaded, path)
+    assert n >= 3
+    prof = loaded.find_by_name("Profile")
+    assert prof is not None
+    assert g.curve_length(prof.shape) == pytest.approx(
+        g.curve_length(scene.find_by_name("Profile").shape), rel=1e-6)
+
+
+def test_3dm_trimmed_planar_face(tmp_path):
+    """CreateTrimmedPlane: a plane trimmed to a circle must import as a
+    disc, not the whole rectangle."""
+    import math as _m
+    import rhino3dm as r3
+    model = r3.File3dm()
+    circle = r3.Circle(r3.Point3d(0, 0, 0), 5.0)
+    plane = r3.Plane.WorldXY()
+    brep = r3.Brep.CreateTrimmedPlane(plane, circle.ToNurbsCurve())
+    assert brep is not None
+    model.Objects.AddBrep(brep, None)
+    path = str(tmp_path / "trimmed.3dm")
+    assert model.Write(path, 8)
+
+    scene = Scene()
+    n = fileio.import_file(scene, path)
+    assert n == 1
+    obj = scene.all()[0]
+    area = g.surface_area(obj.shape)
+    assert area == pytest.approx(_m.pi * 25, rel=0.01)
+
+
+def test_3dm_capped_cylinder_becomes_solid(tmp_path):
+    """A multi-face capped-cylinder brep with no render mesh must import
+    with exactly trimmed disc caps and sew into a closed solid — the old
+    heuristic left the caps untrimmed (area/volume inflated)."""
+    import math as _m
+    import rhino3dm as r3
+    model = r3.File3dm()
+    cyl = r3.Cylinder(r3.Circle(r3.Point3d(0, 0, 0), 5.0), 12.0)
+    model.Objects.AddBrep(r3.Brep.CreateFromCylinder(cyl, True, True))
+    path = str(tmp_path / "capped_cyl.3dm")
+    assert model.Write(path, 7)
+
+    scene = Scene()
+    fileio.import_file(scene, path)
+    obj = scene.all()[0]
+    assert obj.kind == "solid"
+    assert g.is_valid(obj.shape)
+    # 2*pi*5*12 side + 2*pi*25 caps = 534.07;  pi*25*12 = 942.48
+    assert g.surface_area(obj.shape) == pytest.approx(534.07, rel=0.01)
+    assert g.volume(obj.shape) == pytest.approx(942.48, rel=0.01)
+
+
+def test_3dm_sphere_area(tmp_path):
+    import math as _m
+    import rhino3dm as r3
+    model = r3.File3dm()
+    model.Objects.AddBrep(
+        r3.Brep.CreateFromSphere(r3.Sphere(r3.Point3d(0, 0, 0), 4.0)))
+    path = str(tmp_path / "sph.3dm")
+    assert model.Write(path, 7)
+    scene = Scene()
+    fileio.import_file(scene, path)
+    obj = scene.all()[0]
+    assert g.surface_area(obj.shape) == pytest.approx(4 * _m.pi * 16,
+                                                      rel=0.01)
+
+
+def test_3dm_box_solid(tmp_path):
+    import rhino3dm as r3
+    model = r3.File3dm()
+    box = r3.Box(r3.BoundingBox(r3.Point3d(0, 0, 0), r3.Point3d(2, 3, 4)))
+    model.Objects.AddBrep(r3.Brep.CreateFromBox(box))
+    path = str(tmp_path / "box.3dm")
+    assert model.Write(path, 7)
+    scene = Scene()
+    fileio.import_file(scene, path)
+    obj = scene.all()[0]
+    assert obj.kind == "solid"
+    assert g.volume(obj.shape) == pytest.approx(24.0, rel=1e-6)
+
+
+def test_surface_control_points():
+    circle = g.make_circle((0, 0, 0), 4)
+    c2 = g.make_circle((0, 0, 8), 2)
+    srf = g.loft([circle, c2])
+    faces = [f for f in g.faces_of(srf)]
+    pts, (nu, nv) = g.surface_control_points(faces[0])
+    assert nu >= 2 and nv >= 2
+    assert len(pts) == nu * nv
+    moved = g.move_surface_control_point(faces[0], 0, (10, 10, 10))
+    assert g.shape_kind(moved) == "surface"
+    pts2, _ = g.surface_control_points(moved)
+    assert pts2[0] == pytest.approx((10, 10, 10))
+
+
+def test_dxf_roundtrip(scene, tmp_path):
+    path = str(tmp_path / "out.dxf")
+    fileio.export_file(scene, path)
+    loaded = Scene()
+    n = fileio.import_file(loaded, path)
+    assert n >= 1                       # the circle curve at minimum
+    curves = [o for o in loaded.all() if o.kind == "curve"]
+    assert len(curves) >= 1
+    assert g.curve_length(curves[0].shape) == pytest.approx(
+        g.curve_length(scene.find_by_name("Profile").shape), rel=1e-3)
+
+
+def test_svg_import(tmp_path):
+    svg_path = str(tmp_path / "in.svg")
+    with open(svg_path, "w", encoding="utf-8") as f:
+        f.write('''<svg xmlns="http://www.w3.org/2000/svg">
+<circle cx="50" cy="50" r="20"/>
+<rect x="0" y="0" width="30" height="20"/>
+<path d="M 0 0 L 100 0 C 120 0 120 40 100 40"/>
+</svg>''')
+    scene = Scene()
+    n = fileio.import_file(scene, svg_path)
+    assert n >= 3
+    kinds = {o.kind for o in scene.all()}
+    assert kinds == {"curve"}
+
+
+def test_glb_export(scene, tmp_path):
+    import json, struct
+    path = str(tmp_path / "out.glb")
+    fileio.export_file(scene, path)
+    with open(path, "rb") as f:
+        magic, ver, total = struct.unpack("<III", f.read(12))
+        assert magic == 0x46546C67 and ver == 2
+        jlen, jtype = struct.unpack("<II", f.read(8))
+        doc = json.loads(f.read(jlen))
+    assert len(doc["meshes"]) == 2       # box + sphere (curve skipped)
+    assert doc["asset"]["generator"] == "Blackbyrd3D"
+    assert len(doc["materials"]) == 2
+
+
+def test_glb_export_uses_the_colour_on_the_material(scene, tmp_path):
+    """glTF writes a PBR material, so its base colour is the rendered one.
+
+    Taking the metal and roughness off the material and the colour from
+    somewhere else exports a material that is half of two.
+    """
+    import json, struct
+    obj = next(o for o in scene.all() if o.kind != "curve")
+    obj.color = (1.0, 0.0, 0.0)
+    obj.material = {"color": (0.0, 0.0, 1.0), "opacity": 1.0,
+                    "roughness": 0.3, "metallic": 0.0}
+    path = str(tmp_path / "out.glb")
+    fileio.export_file(scene, path)
+    with open(path, "rb") as f:
+        f.read(12)
+        jlen, _ = struct.unpack("<II", f.read(8))
+        doc = json.loads(f.read(jlen))
+    base = [m["pbrMetallicRoughness"]["baseColorFactor"][:3]
+            for m in doc["materials"]]
+    assert [0.0, 0.0, 1.0] in base
+
+
+def test_usda_export(scene, tmp_path):
+    path = str(tmp_path / "out.usda")
+    fileio.export_file(scene, path)
+    text = open(path, encoding="utf-8").read()
+    assert text.startswith("#usda 1.0")
+    assert 'def Mesh' in text
+    assert 'upAxis = "Z"' in text
+    assert text.count("def Mesh") == 2
+
+
+def test_obj_mtl_colors(scene, tmp_path):
+    path = str(tmp_path / "colored.obj")
+    box = scene.find_by_name("Box A")
+    scene.update(box.id, color=(1.0, 0.0, 0.0))
+    fileio.export_file(scene, path)
+    assert "usemtl" in open(path, encoding="utf-8").read()
+    mtl = open(str(tmp_path / "colored.mtl"), encoding="utf-8").read()
+    assert "Kd 1 0 0" in mtl
+
+
+def test_adding_objects_to_the_scene_reports_progress(tmp_path):
+    """The bar used to stop at whatever the converter last said and sit there
+    while every object was added to the scene — on a 522 MB file that is the
+    part people watch, and it looked like a hang at 98%."""
+    import rhino3dm as r3
+    path = str(tmp_path / "many.3dm")
+    model = r3.File3dm()
+    for i in range(12):
+        box = r3.Box(r3.BoundingBox(r3.Point3d(i * 10, 0, 0),
+                                    r3.Point3d(i * 10 + 5, 5, 5)))
+        model.Objects.AddBrep(r3.Brep.CreateFromBox(box), None)
+    assert model.Write(path, 8)
+
+    seen = []
+    fileio.import_file(Scene(), path, progress=lambda f, m: seen.append(m))
+    assert any("Adding" in m for m in seen), seen
+
+
+def test_a_scene_is_never_left_half_built(tmp_path):
+    """Cancel during the conversion leaves the scene untouched, so a caller
+    can discard its checkpoint. Once objects are going in it is too late to
+    offer — a fragment of the file is not what anyone asked for."""
+    import rhino3dm as r3
+    path = str(tmp_path / "one.3dm")
+    model = r3.File3dm()
+    box = r3.Box(r3.BoundingBox(r3.Point3d(0, 0, 0), r3.Point3d(5, 5, 5)))
+    model.Objects.AddBrep(r3.Brep.CreateFromBox(box), None)
+    assert model.Write(path, 8)
+
+    scene = Scene()
+    fileio.import_file(scene, path,
+                       progress=lambda f, m: "Adding" not in m)
+    assert len(scene.all()) == 1
+
+
+def test_3dm_export_honours_the_asked_version(scene, tmp_path):
+    """GitHub #5: the file must open in whatever Rhino the recipient runs."""
+    import rhino3dm as r3
+    for version in (5, 6, 7, 8):
+        path = str(tmp_path / f"v{version}.3dm")
+        fileio.export_file(scene, path, rhino_version=version)
+        back = r3.File3dm.Read(path)
+        assert back is not None
+        assert back.ArchiveVersion == version * 10
+        assert len(back.Objects)
+
+
+def test_save_command_keeps_a_typed_3dm_extension(scene, tmp_path):
+    """`save out.3dm` used to write out.3dm.byrd — the .byrd suffix was
+    forced onto anything typed, so saving to Rhino needed the menus (#5)."""
+    from blackbyrd3d.commands.file import cmd_save
+
+    class _Ctx:
+        def __init__(self):
+            self.scene = scene
+            self.current_path = None
+            self.window = None
+            self.viewport = None
+
+        def echo(self, msg):
+            self.said = msg
+
+    target = str(tmp_path / "typed.3dm")
+    gen = cmd_save(_Ctx())
+    next(gen)
+    try:
+        gen.send(target)
+    except StopIteration:
+        pass
+    assert os.path.exists(target)
+    assert not os.path.exists(target + ".byrd")
+
+    # a bare name still gets the native suffix
+    bare = str(tmp_path / "untyped")
+    gen = cmd_save(_Ctx())
+    next(gen)
+    try:
+        gen.send(bare)
+    except StopIteration:
+        pass
+    assert os.path.exists(bare + ".byrd")
+
+
+def test_a_step_export_says_what_it_could_not_carry(tmp_path):
+    """STEP has nowhere to put a triangle mesh.
+
+    Handing one to the writer used to surface a raw OCP TypeError about
+    argument overloads in an "Export failed" box, which tells a person
+    nothing about their drawing. The solids go out, and the note says
+    what stayed behind.
+    """
+    import numpy as np
+    from blackbyrd3d.core.mesh import MeshShape
+    from blackbyrd3d.core.scene import Scene
+    scene = Scene()
+    scene.add(g.make_box((0, 0, 0), 2, 2, 2), name="solid")
+    scene.add(MeshShape(np.array([[0, 0, 0], [1, 0, 0], [0, 1, 0]], float),
+                        np.array([[0, 1, 2]], np.uint32)), name="imported")
+    out = tmp_path / "out.step"
+    note = fileio.export_file(scene, str(out))
+    assert out.exists() and out.stat().st_size > 0
+    assert note and "mesh" in note.lower()
+    assert len(fileio.step.import_step(str(out))) == 1
+
+
+def test_a_step_export_of_nothing_but_meshes_says_so(tmp_path):
+    import numpy as np
+    import pytest
+    from blackbyrd3d.core.mesh import MeshShape
+    from blackbyrd3d.core.scene import Scene
+    scene = Scene()
+    scene.add(MeshShape(np.array([[0, 0, 0], [1, 0, 0], [0, 1, 0]], float),
+                        np.array([[0, 1, 2]], np.uint32)), name="imported")
+    with pytest.raises(ValueError, match="mesh"):
+        fileio.export_file(scene, str(tmp_path / "out.step"))

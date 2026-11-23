@@ -1,0 +1,629 @@
+"""Organisation: groups, locking, blocks."""
+
+import uuid
+
+from ..core import geometry as g
+from ..core.scene import grouped_in, ungrouped_once
+from .base import (FormField, FormReq, NumberReq, OptionReq, PointReq,
+                   SelectReq, TextReq, command)
+
+
+@command("group")
+def cmd_group(ctx):
+    objs = yield SelectReq("Select objects to group", min_count=2)
+    gid = uuid.uuid4().hex[:8]
+    # round the groups already there, not instead of them: Ungroup takes
+    # this one off again and leaves them as they were
+    with ctx.scene.batched():
+        for o in objs:
+            ctx.scene.update(o.id, group_id=grouped_in(gid, o.group_id))
+    ctx.select_result(objs)
+    ctx.echo(f"Grouped {len(objs)} object(s) — clicking one now selects "
+             "them all.")
+
+
+@command("ungroup")
+def cmd_ungroup(ctx):
+    objs = yield SelectReq("Select grouped objects to ungroup")
+    grouped = [o for o in objs if o.group_id]
+    # the outermost group ends; any inside it are groups of their own again
+    with ctx.scene.batched():
+        for o in grouped:
+            ctx.scene.update(o.id, group_id=ungrouped_once(o.group_id))
+    ctx.select_result(objs)
+    ctx.echo(f"Ungrouped {len(grouped)} object(s).")
+
+
+def _sheet_items(lay):
+    """Everything a sheet holds, as (kind, item)."""
+    from ..core.layout import sheet_pools
+    return [(kind, item) for kind, pool in sheet_pools(lay).items()
+            for item in pool]
+
+
+def _sheet_picks(ctx, lv, what: str):
+    """What is picked on the sheet, or None after saying how to pick it."""
+    lv._prune()
+    if not lv.selected:
+        ctx.echo(f"Nothing picked on the sheet: click {what} first.")
+        return None
+    return list(lv.selected)
+
+
+def _picks_changed(ctx, lv):
+    ctx.scene.notify("layouts")
+    lv.vp.layoutSelectionChanged.emit()
+
+
+@command("lock", space="any")
+def cmd_lock(ctx):
+    """Lock what is picked: still drawn and snapped to, but not pickable.
+
+    On a sheet that is what is picked there, the way move and delete take
+    it, which a model pick cannot reach. A detail's frame locked this way is
+    not its view: that lock is `detaillock`'s (#130).
+    """
+    lv = ctx.sheet_view()
+    if lv is not None:
+        picks = _sheet_picks(ctx, lv, "what to lock")
+        if picks is None:
+            return
+        for _kind, item in picks:
+            item.item_locked = True
+        lv.selected, lv.corners = [], []
+        _picks_changed(ctx, lv)
+        ctx.echo(f"Locked {len(picks)} sheet item(s): still drawn, but "
+                 "they cannot be picked. 'unlockall' releases them.")
+        return
+    objs = yield SelectReq("Select objects to lock")
+    ctx.scene.update_many([o.id for o in objs], locked=True)
+    ctx.selection.clear()
+    ctx.echo(f"Locked {len(objs)} object(s) — visible but unselectable. "
+             "'unlockall' releases them.")
+
+
+@command("lockother", space="any")
+def cmd_lockother(ctx):
+    """Lock everything except what you picked, as Rhino's LockOther does.
+
+    The other half of isolate. Isolate takes the rest of the drawing off the
+    screen; this leaves it up to line the new work against, and only stops
+    you picking it, which is what you actually wanted when the thing you
+    keep catching is a background curve you have no intention of moving.
+
+    What you picked stays picked, so you can get straight on with it. On a
+    sheet it is the rest of that sheet that is locked.
+    """
+    lv = ctx.sheet_view()
+    if lv is not None:
+        picks = _sheet_picks(ctx, lv, "what to leave unlocked")
+        if picks is None:
+            return
+        keep = {id(item) for _kind, item in picks}
+        n = 0
+        for _kind, item in _sheet_items(lv.layout):
+            if id(item) not in keep and not item.item_locked:
+                item.item_locked = True
+                n += 1
+        _picks_changed(ctx, lv)
+        ctx.echo(f"Locked {n} sheet item(s); {len(picks)} left to work on. "
+                 "'unlockall' releases them.")
+        return
+    objs = yield SelectReq("Select objects to leave unlocked")
+    keep = {o.id for o in objs}
+    n = ctx.scene.update_many([o.id for o in ctx.scene.all()
+                               if o.id not in keep and not o.locked],
+                              locked=True)
+    # a command normally lets go of the selection on the way out, and here
+    # that would leave you holding nothing and everything else unpickable
+    ctx.select_result(list(keep))
+    ctx.echo(f"Locked {n} object(s); {len(keep)} left to work on. "
+             "'unlockall' releases them.")
+
+
+@command("unlockall", aliases=("unlock",))
+def cmd_unlockall(ctx):
+    """Unlock every locked object, and every locked item on every sheet,
+    whichever space it is run from. A detail's view lock is not one of
+    them: that is `detaillock`'s."""
+    scene = ctx.scene
+    held = [item for lay in scene.layouts
+            for _kind, item in _sheet_items(lay) if item.item_locked]
+    with scene.batched():
+        n = scene.update_many([o.id for o in scene.all() if o.locked],
+                              locked=False)
+        for item in held:
+            item.item_locked = False
+        if held:
+            scene.notify("layouts")
+    said = [f"{n} object(s)"] if n or not held else []
+    if held:
+        said.append(f"{len(held)} sheet item(s)")
+    ctx.echo(f"Unlocked {' and '.join(said)}.")
+    yield from ()
+
+
+# ---------------------------------------------------------------- blocks
+
+# hatches, meshes, pictures and point clouds are not OCC shapes and cannot
+# go into the compound an instance is
+_BLOCK_KINDS = ("curve", "surface", "solid", "point", "compound")
+
+
+def _block_name_form(default: str) -> FormReq:
+    return FormReq("Block name", title="Block", fields=(
+        FormField("name", TextReq("Block name", default=default)),))
+
+
+@command("block")
+def cmd_block(ctx):
+    """Turn a selection into a block definition and one instance in its
+    place: pick the objects, then the base point, then name it. The base
+    point is where 'insert' later puts its point."""
+    objs = yield SelectReq("Select objects for the block", min_count=1,
+                           kinds=_BLOCK_KINDS, keep=True)
+    base = yield PointReq("Block base point")
+    defs = ctx.scene.block_defs
+    n = len(defs) + 1
+    while any(bd["name"].lower() == f"block {n}" for bd in defs.values()):
+        n += 1
+    default = f"Block {n}"
+    while True:
+        answers = yield _block_name_form(default)
+        name = str(answers.get("name") or "").strip() or default
+        if not any(bd["name"].lower() == name.lower()
+                   for bd in defs.values()):
+            break
+        ctx.echo(f"A block named '{name}' already exists, choose another.")
+        default = name
+    shapes = [o.shape for o in objs]
+    origin = (-base[0], -base[1], -base[2])
+    bid = uuid.uuid4().hex[:8]
+    layer_id = objs[0].layer_id
+    compound = g.make_compound(shapes)
+    with ctx.scene.batched():
+        defs[bid] = {"name": name,
+                     "shapes": [g.translate(s, origin) for s in shapes]}
+        for o in objs:
+            ctx.scene.remove(o.id)
+        inst = ctx.scene.add(compound, name=f"{name} 01", layer_id=layer_id)
+        ctx.scene.update(inst.id, block_id=bid)
+    ctx.select_result([inst])
+    ctx.echo(f"Block '{name}' defined ({len(shapes)} shape(s)). Place more "
+             "copies with 'insert'.")
+
+
+@command("insert")
+def cmd_insert(ctx):
+    defs = ctx.scene.block_defs
+    if not defs:
+        ctx.echo("No block definitions yet — create one with 'block'.")
+        return
+        yield  # pragma: no cover
+    names = [bd["name"] for bd in defs.values()]
+    choice = yield OptionReq("Block to insert", options=names,
+                             default=names[0])
+    point = yield PointReq("Insertion point")
+    bid, bd = next((k, v) for k, v in defs.items()
+                   if v["name"] == choice)
+    compound = g.make_compound(bd["shapes"])
+    placed = g.translate(compound, point)
+    count = sum(1 for o in ctx.scene.all() if o.block_id == bid) + 1
+    inst = ctx.scene.add(placed, name=f"{choice} {count:02d}")
+    ctx.scene.update(inst.id, block_id=bid)
+    ctx.echo(f"Inserted '{choice}' at {point}.")
+
+
+@command("blocklist", aliases=("blockmanager",), mutates=False)
+def cmd_blocklist(ctx):
+    defs = ctx.scene.block_defs
+    if not defs:
+        ctx.echo("No block definitions.")
+    else:
+        lines = []
+        for bid, bd in defs.items():
+            n = sum(1 for o in ctx.scene.all() if o.block_id == bid)
+            lines.append(f"{bd['name']}: {n} instance(s), "
+                         f"{len(bd['shapes'])} shape(s)")
+        ctx.echo("Blocks — " + "; ".join(lines))
+    yield from ()
+
+
+@command("count", mutates=False)
+def cmd_count(ctx):
+    """Count objects: totals by block, kind and layer (for takeoffs)."""
+    objs = ctx.scene.visible_objects()
+    by_block = {}
+    by_kind = {}
+    for o in objs:
+        by_kind[o.kind] = by_kind.get(o.kind, 0) + 1
+        if o.block_id and o.block_id in ctx.scene.block_defs:
+            bname = ctx.scene.block_defs[o.block_id]["name"]
+            by_block[bname] = by_block.get(bname, 0) + 1
+    parts = [f"{n}× {k}" for k, n in sorted(by_kind.items())]
+    ctx.echo(f"{len(objs)} visible object(s): " + ", ".join(parts))
+    if by_block:
+        ctx.echo("Blocks: " + ", ".join(
+            f"{n}× {b}" for b, n in sorted(by_block.items())))
+    clouds = [o for o in objs if o.kind == "pointcloud"]
+    if clouds:
+        points = sum(o.shape.count for o in clouds)
+        ctx.echo(f"Points: {points:,} in {len(clouds)} point cloud(s)")
+    yield from ()
+
+
+@command("pointcloud", aliases=("pc",))
+def cmd_pointcloud(ctx):
+    """Point clouds: `info` says what a scan holds; `subsample` keeps an
+    even fraction of its points, which is the cheap way to make a scan
+    the laptop can orbit."""
+    objs = yield SelectReq("Select point clouds", kinds=("pointcloud",))
+    if not objs:
+        ctx.echo("No point clouds selected.")
+        return
+    what = yield OptionReq("Action", options=["info", "subsample"],
+                           default="info")
+    if what == "info":
+        for o in objs:
+            c = o.shape
+            (x0, y0, z0), (x1, y1, z1) = c.bbox()
+            fmt = ctx.scene.format_length
+            parts = [f"{c.count:,} points",
+                     f"{fmt(x1 - x0)} × {fmt(y1 - y0)} × {fmt(z1 - z0)}",
+                     "colour" if c.rgb is not None else "no colour"]
+            if c.conf is not None:
+                parts.append(f"confidence mean {float(c.conf.mean()):.2f}")
+            counts = c.level_counts()
+            if counts is not None:
+                parts.append("levels " + "/".join(f"{n:,}" for n in counts))
+            if c.provenance:
+                prov = c.provenance
+                parts.append("from " + ", ".join(
+                    str(prov[k]) for k in ("backbone", "scale", "session")
+                    if prov.get(k)))
+            ctx.echo(f"{o.name}: " + "; ".join(parts))
+        return
+    fraction = yield NumberReq("Fraction of points to keep", default=0.25)
+    if not 0 < fraction <= 1:
+        ctx.echo("Fraction must be between 0 and 1.")
+        return
+    for o in objs:
+        thinned = o.shape.subsampled(fraction)
+        ctx.scene.replace_shape(o.id, thinned)
+        ctx.echo(f"{o.name}: {thinned.count:,} points kept.")
+
+
+@command("meshtobrep")
+def cmd_meshtobrep(ctx):
+    """Convert mesh objects into exact BREP shells (slow for big meshes)."""
+    objs = yield SelectReq("Select meshes to convert", kinds=("mesh",))
+    from ..core.mesh import brep_from_mesh
+    done = 0
+    for o in objs:
+        try:
+            ctx.scene.replace_shape(o.id, brep_from_mesh(o.shape))
+            done += 1
+        except g.GeometryError as exc:
+            ctx.echo(f"{o.name}: {exc}")
+    ctx.echo(f"Converted {done} mesh(es) to BREP.")
+
+
+@command("breptomesh", aliases=("meshify",))
+def cmd_breptomesh(ctx):
+    """Convert BREP objects into lightweight native meshes."""
+    objs = yield SelectReq("Select objects to mesh",
+                           kinds=("surface", "solid"))
+    from ..core.mesh import mesh_from_brep
+    done = 0
+    for o in objs:
+        try:
+            ctx.scene.replace_shape(o.id, mesh_from_brep(o.shape))
+            done += 1
+        except Exception as exc:                              # noqa: BLE001
+            ctx.echo(f"{o.name}: {exc}")
+    ctx.echo(f"Converted {done} object(s) to mesh.")
+
+
+@command("purge")
+def cmd_purge(ctx):
+    """Remove empty layers and unused block definitions."""
+    used_layers = {o.layer_id for o in ctx.scene.all()}
+    layers = ctx.scene.layers
+    keep = used_layers | {layers.current_id}
+    # A layer goes only if nothing in its whole branch is wanted: deleting
+    # a parent takes its children with it, and an empty Walls with a busy
+    # Walls::Interior under it is not an empty layer.
+    doomed = {la.id for la in layers.all()
+              if not ({la.id, *(d.id for d in layers.descendants(la.id))}
+                      & keep)}
+    removed_layers = 0
+    for layer_id in [i for i in doomed if layers.get(i).parent not in doomed]:
+        removed_layers += len(layers.remove(layer_id))
+    used_blocks = {o.block_id for o in ctx.scene.all() if o.block_id}
+    removed_blocks = 0
+    for bid in list(ctx.scene.block_defs):
+        if bid not in used_blocks:
+            del ctx.scene.block_defs[bid]
+            removed_blocks += 1
+    ctx.scene.notify()
+    ctx.echo(f"Purged {removed_layers} empty layer(s) and "
+             f"{removed_blocks} unused block definition(s).")
+    yield from ()
+
+
+@command("what", mutates=False)
+def cmd_what(ctx):
+    """Report details of the selected objects."""
+    objs = yield SelectReq("Select objects to describe")
+    for o in objs:
+        layer = ctx.scene.layers.get(o.layer_id)
+        lines = [f"{o.name} — {o.kind}",
+                 f"  layer: {layer.name if layer else o.layer_id}"]
+        try:
+            if o.kind == "curve":
+                closed = g.is_closed_curve(o.shape)
+                lines.append(f"  length: {g.curve_length(o.shape):.4g}"
+                             f"  ({'closed' if closed else 'open'})")
+            elif o.kind == "surface":
+                lines.append(f"  area: {g.surface_area(o.shape):.4g}")
+            elif o.kind == "solid":
+                lines.append(f"  area: {g.surface_area(o.shape):.4g}"
+                             f"  volume: {g.volume(o.shape):.4g}")
+            elif o.kind == "point":
+                x, y, z = g.point_coords(o.shape)
+                lines.append(f"  at: {x:g}, {y:g}, {z:g}")
+            (mn, mx) = g.bbox(o.shape)
+            lines.append("  bbox: "
+                         f"({mn[0]:.4g}, {mn[1]:.4g}, {mn[2]:.4g}) to "
+                         f"({mx[0]:.4g}, {mx[1]:.4g}, {mx[2]:.4g})")
+            valid = g.is_valid(o.shape)
+            if not valid:
+                lines.append("  WARNING: geometry is invalid")
+        except Exception as exc:
+            lines.append(f"  (analysis failed: {exc})")
+        ctx.echo("\n".join(lines))
+    if not objs:
+        ctx.echo("Nothing selected.")
+
+
+@command("matchprops", aliases=("matchproperties",))
+def cmd_matchprops(ctx):
+    """Copy an object's layer, colour, material, print width and hatch.
+
+    From one object to others, the section hatch and print width coming
+    over as overrides only where the source had them."""
+    src = yield SelectReq("Select source object", max_count=1)
+    targets = yield SelectReq("Select objects to change",
+                              allow_preselected=False)
+    s = src[0]
+    targets = [o for o in targets if o.id != s.id]
+    # one notification, not one a target; not update_many, since each
+    # target gets its own copy of the material
+    with ctx.scene.batched():
+        for o in targets:
+            ctx.scene.update(o.id, layer_id=s.layer_id, color=s.color,
+                             material=dict(s.material) if s.material else None,
+                             print_width=s.print_width,
+                             section_fill=(dict(s.section_fill)
+                                           if s.section_fill else None),
+                             hatch_style=(dict(s.hatch_style)
+                                          if s.hatch_style else None))
+    ctx.echo(f"Matched properties on {len(targets)} object(s) from {s.name}.")
+
+
+@command("linetype", aliases=("lt", "setlinetype"))
+def cmd_linetype(ctx):
+    """Set the dash style of selected objects (Continuous/Dashed/…/ByLayer)."""
+    from ..core import linetype as lt
+    objs = yield SelectReq("Select objects to set linetype")
+    if not objs:
+        ctx.echo("Nothing selected.")
+        return
+    style = yield OptionReq("Linetype", options=["ByLayer", *lt.LINETYPES],
+                            default="ByLayer")
+    ctx.scene.update_many([o.id for o in objs], linetype=style)
+    ctx.echo(f"Set linetype '{style}' on {len(objs)} object(s).")
+
+
+@command("printwidth", aliases=("plotweight", "printweight"))
+def cmd_printwidth(ctx):
+    """Set the pen width selected objects plot with, or ByLayer.
+
+    A width of their own in millimetres, Default for the printer's, or
+    ByLayer to take their layer's again."""
+    objs = yield SelectReq("Select objects to set print width")
+    if not objs:
+        ctx.echo("Nothing selected.")
+        return
+    answer = yield TextReq("Print width in mm, Default or ByLayer",
+                           default="ByLayer")
+    text = (answer or "ByLayer").strip().lower().removesuffix("mm").strip()
+    if text in ("bylayer", "by layer"):
+        width, said = None, "ByLayer"
+    elif text == "default":
+        width, said = 0.0, "Default"
+    else:
+        try:
+            width = max(0.0, float(text))
+        except ValueError:
+            ctx.echo(f"Not a print width: '{answer}'.")
+            return
+        said = f"{width:g} mm"
+    ctx.scene.update_many([o.id for o in objs], print_width=width)
+    ctx.echo(f"Set print width {said} on {len(objs)} object(s).")
+
+
+@command("setusertext", aliases=("setattributeusertext",))
+def cmd_setusertext(ctx):
+    """Set a key of user text on the selected objects, as Rhino's
+    SetUserText does.
+
+    The key, then its value; no value takes the key away. A key already
+    there under another case is the same key, and keeps its spelling."""
+    from ..core import user_text
+    objs = yield SelectReq("Select objects to set user text on")
+    if not objs:
+        ctx.echo("Nothing selected.")
+        return
+    key = ((yield TextReq("Key")) or "").strip()
+    if not key:
+        ctx.echo("A key needs a name.")
+        return
+    value = yield TextReq(f"Value for {key} (Enter for none, which takes "
+                          "the key away)", default="")
+    with ctx.scene.batched():
+        for o in objs:
+            ctx.scene.update(o.id, user_text=user_text.with_value(
+                o.user_text, key, value))
+    ctx.echo(f"Set {key} = {value} on {len(objs)} object(s)." if value
+             else f"Took {key} off {len(objs)} object(s).")
+
+
+@command("getusertext", mutates=False)
+def cmd_getusertext(ctx):
+    """Report the user text on the selected objects, as Rhino's
+    GetUserText does: one key's value, or with Enter every key."""
+    from ..core import user_text
+    objs = yield SelectReq("Select objects to read user text from")
+    if not objs:
+        ctx.echo("Nothing selected.")
+        return
+    key = ((yield TextReq("Key (Enter for all of them)", default=""))
+           or "").strip()
+    for o in objs:
+        text = o.user_text or {}
+        if key:
+            held = user_text.key_in(text, key)
+            ctx.echo(f"{o.name}: {held} = {text[held]}" if held is not None
+                     else f"{o.name} has no {key}.")
+        elif text:
+            ctx.echo("\n".join([f"{o.name}:", *(f"  {k} = {v}"
+                                                for k, v in text.items())]))
+        else:
+            ctx.echo(f"{o.name} has no user text.")
+
+
+@command("sectionhatch", aliases=("sectionstyle",))
+def cmd_sectionhatch(ctx):
+    """Set how a section cut through selected objects is filled.
+
+    ByLayer, or a hatch of their own, which starts from the first one's
+    layer's angle, spacing and colour."""
+    from ..core.layers import section_fill_dict
+    from ..core.layout import pattern_label, pattern_named, section_fills_of
+    objs = yield SelectReq("Select objects to set section hatch")
+    if not objs:
+        ctx.echo("Nothing selected.")
+        return
+    pattern = yield OptionReq(
+        "Section hatch",
+        options=["ByLayer", *(pattern_label(p)
+                              for p in section_fills_of(ctx.scene))],
+        default="ByLayer")
+    if pattern == "ByLayer":
+        ctx.scene.update_many([o.id for o in objs], section_fill=None)
+        ctx.echo(f"{len(objs)} object(s) hatched by layer.")
+        return
+    layer = ctx.scene.layers.get(objs[0].layer_id)
+    angle, spacing = layer.hatch_angle, layer.hatch_spacing
+    pattern = pattern_named(ctx.scene, pattern) or pattern
+    if pattern.lower() not in ("none", "solid"):
+        angle = yield NumberReq("Hatch angle (degrees)", default=angle)
+        spacing = yield NumberReq("Hatch spacing on paper (mm)",
+                                  default=spacing, minimum=0.2)
+    fill = section_fill_dict(pattern, angle, spacing, layer.hatch_color,
+                             layer.cut_line_width, layer.cut_line_color,
+                             layer.hatch_background)
+    # one notification, not one an object; each gets its own copy
+    with ctx.scene.batched():
+        for o in objs:
+            ctx.scene.update(o.id, section_fill=dict(fill))
+    ctx.echo(f"Section hatch {fill['pattern']} on {len(objs)} object(s).")
+
+
+def _reorder(scene, objs, mode: str):
+    orders = [o.draw_order for o in scene.all()] or [0]
+    hi, lo = max(orders), min(orders)
+    # one notification, not one an object; not update_many, since each
+    # object lands at its own order
+    with scene.batched():
+        for i, o in enumerate(objs):
+            if mode == "front":
+                scene.update(o.id, draw_order=hi + 1 + i)
+            elif mode == "back":
+                scene.update(o.id, draw_order=lo - 1 - i)
+            elif mode == "forward":
+                scene.update(o.id, draw_order=o.draw_order + 1)
+            elif mode == "backward":
+                scene.update(o.id, draw_order=o.draw_order - 1)
+
+
+@command("bringtofront", aliases=("bf",))
+def cmd_bringtofront(ctx):
+    """Draw the selected objects on top of overlapping ones."""
+    objs = yield SelectReq("Select objects to bring to front")
+    if objs:
+        _reorder(ctx.scene, objs, "front")
+        ctx.echo(f"Brought {len(objs)} object(s) to front.")
+
+
+@command("sendtoback", aliases=("sb",))
+def cmd_sendtoback(ctx):
+    """Draw the selected objects behind overlapping ones."""
+    objs = yield SelectReq("Select objects to send to back")
+    if objs:
+        _reorder(ctx.scene, objs, "back")
+        ctx.echo(f"Sent {len(objs)} object(s) to back.")
+
+
+@command("bringforward", aliases=("bringforwards",))
+def cmd_bringforward(ctx):
+    """Nudge the selected objects one step towards the front."""
+    objs = yield SelectReq("Select objects to bring forward")
+    if objs:
+        _reorder(ctx.scene, objs, "forward")
+        ctx.echo(f"Brought {len(objs)} object(s) forward.")
+
+
+@command("sendbackward", aliases=("sendbackwards",))
+def cmd_sendbackward(ctx):
+    """Nudge the selected objects one step towards the back."""
+    objs = yield SelectReq("Select objects to send backward")
+    if objs:
+        _reorder(ctx.scene, objs, "backward")
+        ctx.echo(f"Sent {len(objs)} object(s) backward.")
+
+
+@command("changelayer", aliases=("tolayer",))
+def cmd_changelayer(ctx):
+    """Move objects to a layer by name (created if missing)."""
+    objs = yield SelectReq("Select objects to move to a layer")
+    name = yield TextReq("Layer name")
+    name = name.strip()
+    if not name:
+        ctx.echo("No layer name given.")
+        return
+    layer = ctx.scene.layers.find_by_name(name)
+    if layer is None:
+        layer = ctx.scene.layers.create(name)
+        ctx.echo(f"Created layer {layer.name}.")
+    ctx.scene.update_many([o.id for o in objs], layer_id=layer.id)
+    ctx.scene.notify("layers")
+    ctx.echo(f"Moved {len(objs)} object(s) to {layer.name}.")
+
+
+@command("audit", mutates=False)
+def cmd_audit(ctx):
+    """Check every object's geometry for validity."""
+    bad = []
+    for o in ctx.scene.all():
+        try:
+            if not g.is_valid(o.shape):
+                bad.append(o.name)
+        except Exception:
+            bad.append(o.name)
+    if bad:
+        ctx.echo(f"{len(bad)} invalid object(s): " + ", ".join(bad))
+    else:
+        ctx.echo(f"All {len(ctx.scene.all())} object(s) are valid.")
+    yield from ()

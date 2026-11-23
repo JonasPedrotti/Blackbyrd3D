@@ -1,0 +1,921 @@
+"""Native .byrd format: JSON scene description with base64 BREP geometry.
+
+Versions: 1 was bare JSON; 2 is the zip container (document.json,
+meta.json, thumbnail.png); 3 adds point clouds, trajectories and a session
+record, with the big arrays as binary members under blobs/ — see
+protocol/SERP-SESSION-RECORD.md in the Mica repository, which this module
+implements the reader and writer of. A document without any of the new
+kinds is still written as version 2, so nothing older than this reader
+notices.
+"""
+
+from __future__ import annotations
+
+import base64
+import json
+
+from ..core import geometry, user_text, view_settings
+from ..utils.units import convert, converted_note, rescale
+from ..core.layers import (DEFAULT_CUT_LINE_WIDTH, DEFAULT_LAYER_ID,
+                           DEFAULT_SCREEN_WIDTH, Layer, section_fill_dict)
+
+# The newest version this reader understands. Anything newer is refused
+# with the version it asks for, never a traceback.
+FORMAT_VERSION = 10
+# What a document with none of the version-3 kinds is written as.
+PLAIN_VERSION = 2
+# The Blackbyrd3D release a version-3 file asks its reader to be.
+REQUIRES = "0.9.0"
+
+
+def _write_container(doc: dict, path: str, thumbnail: bytes | None,
+                     blobs: dict | None = None):
+    """.byrd v2/v3: a zip with document.json, meta.json, a thumbnail and,
+    for v3, the point-cloud arrays as binary members."""
+    import datetime
+    import zipfile
+    version = doc.get("version", PLAIN_VERSION)
+    meta = {
+        "format": "blackbyrd3d",
+        "version": version,
+        "saved": datetime.datetime.now().isoformat(timespec="seconds"),
+        "objects": len(doc.get("objects", [])),
+        "layouts": len(doc.get("layouts", [])),
+    }
+    if version >= 3:
+        clouds = doc.get("pointclouds", [])
+        meta["pointclouds"] = len(clouds)
+        meta["points"] = int(sum(c.get("count", 0) for c in clouds))
+        meta["trajectories"] = len(doc.get("trajectories", []))
+        session = doc.get("session")
+        if session:
+            meta["session"] = {k: session[k] for k in
+                               ("id", "engine", "backbone") if k in session}
+    tmp = path + ".tmp"
+    with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr("meta.json", json.dumps(meta, indent=1))
+        z.writestr("document.json", json.dumps(doc))
+        if thumbnail:
+            z.writestr("thumbnail.png", thumbnail)
+        # Stored, not deflated: float32 coordinates barely compress and a
+        # million-point scan would spend seconds finding that out.
+        for name, data in (blobs or {}).items():
+            z.writestr(name, data, compress_type=zipfile.ZIP_STORED)
+    import os
+    os.replace(tmp, path)          # atomic: a crash never corrupts the file
+
+
+def read_meta(path: str) -> dict | None:
+    """Container metadata without loading geometry (None for v1 files)."""
+    import zipfile
+    if not zipfile.is_zipfile(path):
+        return None
+    with zipfile.ZipFile(path) as z:
+        return json.loads(z.read("meta.json"))
+
+
+def read_thumbnail(path: str) -> bytes | None:
+    import zipfile
+    if not zipfile.is_zipfile(path):
+        return None
+    with zipfile.ZipFile(path) as z:
+        if "thumbnail.png" in z.namelist():
+            return z.read("thumbnail.png")
+    return None
+
+
+def save_scene(scene, path: str, thumbnail: bytes | None = None,
+               progress=None):
+    if getattr(scene, "before_save", None) is not None:
+        scene.before_save()
+    from ..core.layout import layouts_to_json, sheet_groups_to_json, style_set
+    clouds = [o for o in scene.all() if o.kind == "pointcloud"]
+    trajectories = list(getattr(scene, "trajectories", None) or [])
+    session = getattr(scene, "session", None) or None
+    blobs = {}
+    # In their own list below, so a reader older than version 3 opens the
+    # rest of the drawing with the scan simply absent.
+    drawn = [o for o in scene.all() if o.kind not in ("pointcloud", "picture")]
+    objects = []
+    for n, obj in enumerate(drawn):
+        if progress is not None:
+            progress(0.9 * n / len(drawn))
+        objects.append(_object_to_json(obj))
+    doc = {
+        "format": "blackbyrd3d",
+        "version": PLAIN_VERSION,
+        "named_views": scene.named_views,
+        "view_settings": view_settings.to_json(scene.view_settings, blobs),
+        "units": scene.units,
+        "image_planes": _image_planes_to_json([
+            dict(obj.shape.plane, id=obj.id, name=obj.name, layer=obj.layer_id,
+                 visible=obj.visible, locked=obj.locked, group=obj.group_id,
+                 block=obj.block_id, color=obj.color, material=obj.material,
+                 linetype=obj.linetype, draw_order=obj.draw_order,
+                 annotation=obj.annotation, user_text=obj.user_text)
+            for obj in scene.all() if obj.kind == "picture"], blobs),
+        "block_defs": {
+            bid: {
+                "name": bd["name"],
+                "shapes": [base64.b64encode(
+                    geometry.shape_to_bytes(s)).decode("ascii")
+                    for s in bd["shapes"]],
+            }
+            for bid, bd in scene.block_defs.items()
+        },
+        "layouts": layouts_to_json(scene.layouts),
+        "sheet_groups": sheet_groups_to_json(scene.sheet_groups),
+        "annot_styles": {k: dict(v) for k, v in scene.annot_styles.items()},
+        # which built-in styles its lettering is in, so it keeps their sizes
+        "annot_style_set": style_set(scene),
+        # whether its text heights are capital heights, or font sizes
+        "text_height_measures": scene.text_height_measures,
+        # that a clipping plane it hides still cuts, which before this one
+        # hidden did not
+        "hidden_planes_cut": True,
+        "hatch_patterns": [p.to_dict() for p in _patterns_used(scene)],
+        "history_records": scene.history_records,
+        "layers": [
+            {
+                "id": layer.id,
+                "name": layer.name,
+                "color": list(layer.color),
+                "visible": layer.visible,
+                "locked": layer.locked,
+                "lineweight": layer.lineweight,
+                "linetype": layer.linetype,
+                "print_width": layer.print_width,
+                "screen_pinned": layer.screen_pinned,
+                "hatch": layer.hatch,
+                "hatch_angle": layer.hatch_angle,
+                "hatch_spacing": layer.hatch_spacing,
+                "hatch_color": layer.hatch_color,
+                "hatch_background": layer.hatch_background,
+                "cut_line_width": layer.cut_line_width,
+                "cut_line_color": layer.cut_line_color,
+                "parent": layer.parent,
+            }
+            for layer in scene.layers.all()
+        ],
+        "current_layer": scene.layers.current_id,
+        "objects": objects,
+    }
+    if clouds or trajectories or session:
+        doc["version"] = 3
+        doc["requires"] = REQUIRES
+        doc["pointclouds"] = [_cloud_to_json(obj, blobs) for obj in clouds]
+        doc["trajectories"] = trajectories
+        if session:
+            doc["session"] = session
+    # Earlier readers silently lose picture edits and text typography, or
+    # cannot decode editable text BReps. Ordinary CAD/cloud files stay v2/v3.
+    from ..core.picture import PictureShape
+    from ..core.text_object import TextShape
+    new_shapes = [obj.shape for obj in scene.all()]
+    new_shapes.extend(obj.shape for lay in scene.layouts for obj in lay.objects)
+    new_shapes.extend(shape for block in scene.block_defs.values()
+                      for shape in block["shapes"])
+    formatted_notes = any(note.font_family or note.font_style
+                          or note.alignment != "left"
+                          for lay in scene.layouts for note in lay.notes)
+    if formatted_notes or any(isinstance(shape, (PictureShape, TextShape))
+                              for shape in new_shapes):
+        doc["version"] = 4
+        doc["requires"] = "0.10.0"
+    # A release before model hatches has no reader for one (#33).
+    from ..core.hatch import HatchShape
+    if any(isinstance(shape, HatchShape) for shape in new_shapes):
+        doc["version"] = 5
+        doc["requires"] = "0.10.5"
+    # A release before user text opens the file and drops every key without
+    # a word, and a save there loses them for good.
+    if any(obj.user_text for obj in scene.all()):
+        doc["version"] = 6
+        doc["requires"] = "0.12.1"
+    # Geometry far from the world's origin is written as float32 offsets
+    # from a float64 origin, which is the only way four bytes can hold a
+    # millimetre out at survey coordinates. A reader that knows nothing of
+    # that origin takes the offsets for the coordinates themselves and
+    # puts the object at the world's origin, without a word, and a save
+    # there makes it stick. So a file carrying one says so.
+    if any(_carries_an_origin(shape) for shape in new_shapes):
+        doc["version"] = 7
+        doc["requires"] = "0.12.2"
+    # A release that knows only Lines, Cross and Solid refuses a model
+    # hatch drawn with any other pattern, and the whole file with it
+    # (#92). Other hatching it opens and keeps only as far as it knows it,
+    # so a save there loses the rest for good, and that asks too.
+    from ..core.hatch_patterns import is_legacy
+    if (any(isinstance(shape, HatchShape) and not is_legacy(shape.pattern)
+            for shape in new_shapes)
+            or doc["hatch_patterns"] or _hatching_0121_loses(scene)):
+        doc["version"] = 8
+        doc["requires"] = "0.12.2"
+    # Version 9 (0.13.0): a release before it refuses a model dimension and
+    # the whole file with it, and drops what a detail hides of its own when
+    # it rebuilds the detail, so a save there would lose that silently.
+    from ..core.dimension import DimensionShape
+    if (any(isinstance(shape, DimensionShape) for shape in new_shapes)
+            or any(d.hidden_objects for lay in scene.layouts
+                   for d in lay.details)):
+        doc["version"] = 9
+        doc["requires"] = "0.13.0"
+    # A release before text backgrounds opens a drawing with one and drops
+    # it without a word, so a save there would lose it.
+    from ..core.text import TextShape
+    if (any(isinstance(shape, TextShape) and shape.background
+            for shape in new_shapes)
+            or any(note.background for lay in scene.layouts
+                   for note in lay.notes)):
+        doc["version"] = 9
+        doc["requires"] = "0.13.0"
+    # 0.13.0 reads a dimension's look through a fixed list and fails partway
+    # into the load on a key it has never seen, as Rhino's alternate units.
+    in_blocks = [shape for bd in scene.block_defs.values()
+                 for shape in bd["shapes"]]
+    if any(isinstance(shape, DimensionShape) and shape.style["alternate"]
+           for shape in new_shapes + in_blocks):
+        doc["version"] = 10
+        doc["requires"] = "0.13.1"
+    _write_container(doc, path, thumbnail, blobs)
+
+
+def _object_to_json(obj) -> dict:
+    return {
+        "id": obj.id,
+        "name": obj.name,
+        "layer": obj.layer_id,
+        "visible": obj.visible,
+        "color": list(obj.color) if obj.color else None,
+        "material": dict(obj.material) if obj.material else None,
+        "clip_plane": (dict(obj.clip_plane) if obj.clip_plane
+                       else None),
+        "annotation": (dict(obj.annotation) if obj.annotation
+                       else None),
+        "locked": obj.locked,
+        "linetype": obj.linetype,
+        "draw_order": obj.draw_order,
+        "print_width": obj.print_width,
+        "section_fill": (dict(obj.section_fill)
+                         if obj.section_fill else None),
+        "hatch_style": (dict(obj.hatch_style)
+                        if obj.hatch_style else None),
+        "user_text": (dict(obj.user_text) if obj.user_text
+                      else None),
+        "group": obj.group_id,
+        "block": obj.block_id,
+        "brep": (None if obj.kind == "mesh" else
+                 base64.b64encode(geometry.shape_to_bytes(
+                     obj.shape)).decode("ascii")),
+        "mesh": (_mesh_to_json(obj.shape)
+                 if obj.kind == "mesh" else None),
+    }
+
+
+def _hatching_0121_loses(scene) -> bool:
+    """Whether 0.12.1 would open this drawing and let some of its hatching
+    go without a word: a hatch's own colour or background, a cut's
+    background (#91), or a cut in any pattern but none, Lines, Cross and
+    Solid, which it fills with lines. The patterns a drawing carries go
+    the same way, and are asked about where they are written."""
+    from ..core.hatch_patterns import is_legacy
+    from ..core.layers import HATCH_BACKGROUND_NONE
+
+    def kept(pattern) -> bool:
+        name = str(pattern or "").strip().lower()
+        return name in ("", "none") or is_legacy(name)
+
+    for layer in scene.layers.all():
+        if (layer.hatch_background != HATCH_BACKGROUND_NONE
+                or not kept(layer.hatch)):
+            return True
+    for obj in scene.all():
+        if any((obj.hatch_style or {}).values()):
+            return True
+        fill = obj.section_fill
+        if fill and (fill.get("background", HATCH_BACKGROUND_NONE)
+                     != HATCH_BACKGROUND_NONE
+                     or not kept(fill.get("pattern"))):
+            return True
+    return False
+
+
+def _carries_an_origin(shape) -> bool:
+    """Whether this shape is written as offsets from an origin.
+
+    Meshes and clouds are, wherever they are written from: an object, a
+    block definition, or a layout. A picture is a mesh by inheritance but
+    writes itself its own way, with no offsets in it.
+    """
+    from ..core.mesh import MeshShape
+    from ..core.picture import PictureShape
+    from ..core.pointcloud import PointCloudShape
+    from ..utils.math3d import origin_for
+    if isinstance(shape, PointCloudShape):
+        return bool(shape.far)
+    if isinstance(shape, PictureShape):
+        return False
+    if isinstance(shape, MeshShape):
+        return origin_for(shape.vertices) is not None
+    return False
+
+
+def _image_planes_to_json(planes, blobs: dict) -> list[dict]:
+    """Move embedded picture bytes out of JSON and into archive members."""
+    import hashlib
+    import os
+
+    entries = []
+    for index, plane in enumerate(planes):
+        data = plane.get("image_data")
+        entry = {key: value for key, value in plane.items()
+                 if key not in ("image_data", "image")}
+        if isinstance(data, (bytes, bytearray, memoryview)):
+            data = bytes(data)
+            suffix = os.path.splitext(str(plane.get("path", "")))[1].lower()
+            if suffix not in (".png", ".jpg", ".jpeg", ".bmp", ".gif",
+                              ".webp", ".tif", ".tiff"):
+                suffix = ".img"
+            digest = hashlib.sha256(data).hexdigest()[:16]
+            member = f"images/{index:04d}-{digest}{suffix}"
+            blobs[member] = data
+            entry.pop("path", None)
+            entry["image"] = member
+        entries.append(entry)
+    return entries
+
+
+def _cloud_to_json(obj, blobs: dict) -> dict:
+    """One point cloud's entry, its arrays added to `blobs` by member name.
+
+    Little-endian, contiguous, in the file's own dtypes: what was read is
+    what is written."""
+    import numpy as np
+    cloud = obj.shape
+    base = f"blobs/{obj.id}/"
+    names = {"xyz": base + "xyz.f32"}
+    blobs[names["xyz"]] = np.ascontiguousarray(cloud.local, "<f4").tobytes()
+    if cloud.rgb is not None:
+        names["rgb"] = base + "rgb.u8"
+        blobs[names["rgb"]] = np.ascontiguousarray(
+            cloud.rgb, np.uint8).tobytes()
+    if cloud.conf is not None:
+        names["conf"] = base + "conf.f32"
+        blobs[names["conf"]] = np.ascontiguousarray(
+            cloud.conf, "<f4").tobytes()
+    if cloud.level is not None:
+        names["level"] = base + "level.u8"
+        blobs[names["level"]] = np.ascontiguousarray(
+            cloud.level, np.uint8).tobytes()
+    mn, mx = cloud.bbox()
+    entry = {
+        "id": obj.id,
+        "name": obj.name,
+        "layer": obj.layer_id,
+        "visible": obj.visible,
+        "count": int(cloud.count),
+        "bbox": [list(mn), list(mx)],
+        "blobs": names,
+    }
+    if cloud.far:
+        # What the float32 blob is measured from. Only a scan standing far
+        # from the world's origin carries one, so a file of near-home
+        # clouds is byte for byte what it was before.
+        entry["origin"] = [float(c) for c in cloud.origin]
+    if cloud.provenance:
+        entry["provenance"] = dict(cloud.provenance)
+    if obj.color:
+        entry["color"] = list(obj.color)
+    if obj.locked:
+        entry["locked"] = True
+    if obj.user_text:
+        entry["user_text"] = dict(obj.user_text)
+    return entry
+
+
+def load_scene(scene, path: str, progress=None):
+    """Replace scene contents with the file's contents (v1 JSON, v2 zip
+    container, or v3 container with point-cloud blobs). `progress` is a
+    `Progress` or a callback as `import_file` takes one."""
+    import zipfile
+    from .progress import Progress
+    report = (progress if isinstance(progress, Progress)
+              else Progress(progress))
+    report(0.0, "Reading file")
+    if zipfile.is_zipfile(path):          # v2 / v3 container
+        with zipfile.ZipFile(path) as z:
+            doc = json.loads(z.read("document.json"))
+            _check_version(doc)
+            _load_doc(scene, doc, blobs=z, progress=report.part(0.1, 1.0))
+    else:                                 # v1: bare JSON
+        with open(path, encoding="utf-8") as f:
+            doc = json.load(f)
+        _check_version(doc)
+        _load_doc(scene, doc, progress=report.part(0.1, 1.0))
+
+
+_CARRIED_FIELDS = ("visible", "locked", "group_id", "block_id", "color",
+                   "material", "clip_plane", "annotation", "linetype",
+                   "draw_order", "print_width", "section_fill",
+                   "hatch_style", "user_text")
+
+
+def merge_scene(scene, path: str, notes: list | None = None,
+                progress=None) -> int:
+    """Add a .byrd file's objects to `scene`, keeping everything already there.
+
+    What Import means for every other format. The file is read into a scene
+    of its own and its objects are carried across onto layers found by path,
+    so `Kit::Parts` in the file lands on a `Kit::Parts` the scene already
+    has, or on one made for it under the same parents. The scene's own
+    settings stay the scene's: units, current layer, named views, layouts.
+    A file in other units is scaled into the scene's first (#101).
+    Returns the number of objects added.
+    """
+    from ..core.scene import Scene
+    incoming = Scene()
+    load_scene(incoming, path, progress)
+    # Scaled on the way across rather than in `incoming`, where replacing a
+    # shape rebuilds what its history built from it, which would then be
+    # scaled a second time.
+    factor = convert(1.0, incoming.units, scene.units)
+    if factor != 1.0 and notes is not None:
+        notes.append(converted_note(incoming.units, scene.units))
+    layer_for = {}
+
+    def target_layer(layer_id):
+        if layer_id in layer_for:
+            return layer_for[layer_id]
+        source = incoming.layers.get(layer_id)
+        found = scene.layers.find_by_path(incoming.layers.full_path(layer_id))
+        if found is None:
+            parent = target_layer(source.parent) if source.parent else None
+            found = scene.layers.create(source.name, source.color, parent=parent)
+            scene.layers.set_visible(found.id, source.visible)
+            scene.layers.set_locked(found.id, source.locked)
+            scene.layers.set_linetype(found.id, source.linetype)
+            scene.layers.set_print_width(found.id, source.print_width)
+            if source.screen_pinned:
+                scene.layers.set_lineweight(found.id, source.lineweight)
+            scene.layers.set_hatch(found.id, source.hatch)
+            _copy_hatch_look(scene.layers, found.id, vars(source))
+        layer_for[layer_id] = found.id
+        return found.id
+
+    current = scene.layers.current_id
+    # What the objects lean on comes with them, but never over the scene's
+    # own: a block the file instances, a style its dimensions are drawn in,
+    # a view it named. Units, layouts and the current layer stay the scene's.
+    for block_id, block in incoming.block_defs.items():
+        if factor != 1.0:
+            block = {**block, "shapes": [rescale(s, factor)
+                                         for s in block["shapes"]]}
+        scene.block_defs.setdefault(block_id, block)
+    for name, style in incoming.annot_styles.items():
+        scene.annot_styles.setdefault(name, style)
+    from ..core.hatch_patterns import lookup
+    for name, pattern in incoming.hatch_patterns.items():
+        if lookup(scene.hatch_patterns, name) is None:
+            scene.hatch_patterns[name] = pattern
+    for name, view in incoming.named_views.items():
+        if factor != 1.0:
+            view = {**view, "target": [c * factor for c in view["target"]],
+                    "distance": view["distance"] * factor}
+        scene.named_views.setdefault(name, view)
+    # The whole layer tree comes in, empty layers too, as it does in Rhino:
+    # a layer is set up before anything is drawn on it.
+    for layer in incoming.layers.all():
+        target_layer(layer.id)
+    new_id = {}
+    for source in incoming.all():
+        shape = (source._shape if factor == 1.0
+                 else rescale(source._shape, factor))
+        obj = scene.add(shape, name=source.name,
+                        layer_id=target_layer(source.layer_id))
+        new_id[source.id] = obj.id
+        carried = {f: getattr(source, f) for f in _CARRIED_FIELDS
+                   if getattr(source, f) != getattr(obj, f)}
+        if carried:
+            scene.update(obj.id, **carried)
+    # History records rebuild objects from their inputs, so they follow the
+    # objects to their new ids.
+    for record in incoming.history_records:
+        record = dict(record)
+        record["inputs"] = [new_id.get(i, i) for i in record.get("inputs", [])]
+        if "output" in record:
+            record["output"] = new_id.get(record["output"], record["output"])
+        if factor != 1.0:
+            record["params"] = _rescaled_params(record.get("params", {}),
+                                                factor)
+        scene.history_records.append(record)
+    scene.layers.current_id = current
+    return len(incoming.all())
+
+
+def _rescaled_params(params: dict, factor: float) -> dict:
+    """A history record's parameters with its lengths in the new units:
+    an extrusion's distance and a revolve's axis point. Directions and
+    angles have no size."""
+    params = dict(params)
+    if "dist" in params:
+        params["dist"] = float(params["dist"]) * factor
+    if "origin" in params:
+        params["origin"] = [float(c) * factor for c in params["origin"]]
+    return params
+
+
+def _check_version(doc: dict):
+    """Refuse a file from the future by name, before touching the scene.
+
+    A newer writer says which release reads it (`requires`); an older
+    reader that has none of that vocabulary would otherwise fail somewhere
+    inside the load with a traceback about a key it never heard of."""
+    try:
+        version = int(doc.get("version", 1))
+    except (TypeError, ValueError):
+        version = 1
+    if version > FORMAT_VERSION:
+        needs = doc.get("requires") or f"a newer release (file version {version})"
+        raise ValueError(f"This file needs Blackbyrd3D {needs} or newer")
+
+
+def _patterns_used(scene) -> list:
+    """The patterns a drawing is drawn with that are not the app's own,
+    its own or installed: saved with it, so it is drawn the same where
+    they were never installed. One nothing names is not kept (#92).
+
+    A hatch carries the pattern it is drawn with, so one that is neither
+    the drawing's nor installed any more is saved from the hatch."""
+    from ..core.hatch import HatchShape
+    from ..core.hatch_patterns import HatchPattern, is_builtin
+    names = {la.hatch for la in scene.layers.all()}
+    names.update(str(h.pattern) for lay in scene.layouts
+                 for h in lay.hatches)
+    for obj in scene.all():
+        if obj.section_fill:
+            names.add(obj.section_fill.get("pattern", ""))
+    shapes = [obj.shape for obj in scene.all()]
+    shapes.extend(obj.shape for lay in scene.layouts for obj in lay.objects)
+    shapes.extend(shape for block in scene.block_defs.values()
+                  for shape in block["shapes"])
+    carried = {}
+    for shape in shapes:
+        if isinstance(shape, HatchShape):
+            names.add(str(shape.pattern))
+            if isinstance(shape.definition, HatchPattern):
+                carried.setdefault(str(shape.pattern).lower(),
+                                   shape.definition)
+    out, seen = [], set()
+    for name in names:
+        if not name or is_builtin(name) or name.lower() in seen:
+            continue
+        pattern = scene.hatch_pattern(name) or carried.get(name.lower())
+        if pattern is not None:
+            seen.add(name.lower())
+            out.append(pattern)
+    return sorted(out, key=lambda p: p.key)
+
+
+def _hatch_style(data: dict) -> dict | None:
+    """A hatch's own colour and background as a file has them, put right:
+    what is not one of its tokens is the layer's."""
+    from ..core.layers import hatch_background_token, hatch_color_token
+    out = {}
+    if data.get("color"):
+        out["color"] = hatch_color_token(data["color"])
+    if data.get("background"):
+        out["background"] = hatch_background_token(data["background"])
+    return out or None
+
+
+def _copy_hatch_look(layers, layer_id: str, ld: dict):
+    """A layer's hatch angle, spacing and colour and the width and colour
+    of its cut line, or the 45 degrees, 2.5 mm, ink and 0.5 mm of ink
+    every cut had before a layer could say otherwise."""
+    layers.set_hatch_angle(layer_id, ld.get("hatch_angle", 45.0))
+    layers.set_hatch_spacing(layer_id, ld.get("hatch_spacing", 2.5))
+    layers.set_hatch_color(layer_id, ld.get("hatch_color", "ink"))
+    layers.set_hatch_background(layer_id,
+                                ld.get("hatch_background", "none"))
+    layers.set_cut_line_width(layer_id, ld.get("cut_line_width",
+                                               DEFAULT_CUT_LINE_WIDTH))
+    layers.set_cut_line_color(layer_id, ld.get("cut_line_color", "ink"))
+
+
+def _restore_widths(layers, layer_id: str, ld: dict):
+    """A layer's two widths, put back the way the file left them.
+
+    The print width goes first, since a screen width that follows it is
+    worked out from it. A file written before screen widths followed
+    print widths has no word on which this is, so a screen width left at
+    the default follows and one somebody changed stays where they put it.
+    """
+    layers.set_print_width(layer_id, ld.get("print_width", 0.0))
+    lineweight = ld.get("lineweight", DEFAULT_SCREEN_WIDTH)
+    pinned = ld.get("screen_pinned")
+    if pinned is None:
+        pinned = abs(lineweight - DEFAULT_SCREEN_WIDTH) > 1e-6
+    if pinned:
+        layers.set_lineweight(layer_id, lineweight)
+    else:
+        layers.follow_print(layer_id)
+
+
+def _load_doc(scene, doc: dict, blobs=None, progress=None):
+    # Serpentine3D files (.serp, and its older "serpentine") stay readable
+    if doc.get("format") not in ("blackbyrd3d", "serpentine3d", "serpentine"):
+        raise ValueError("Not a Blackbyrd3D or Serpentine3D file")
+
+    scene.clear()
+    layers = scene.layers
+    id_map = {}
+    for ld in doc.get("layers", []):
+        if ld["id"] == "default" or ld["name"].lower() == "default":
+            layers.rename("default", ld["name"])
+            layers.set_color("default", tuple(ld["color"]))
+            layers.set_visible("default", ld.get("visible", True))
+            layers.set_linetype("default", ld.get("linetype", "Continuous"))
+            _restore_widths(layers, "default", ld)
+            layers.set_hatch("default", ld.get("hatch", ""))
+            _copy_hatch_look(layers, "default", ld)
+            id_map[ld["id"]] = "default"
+        else:
+            layer = layers.create(ld["name"], tuple(ld["color"]))
+            layers.set_visible(layer.id, ld.get("visible", True))
+            layers.set_linetype(layer.id, ld.get("linetype", "Continuous"))
+            layers.set_locked(layer.id, ld.get("locked", False))
+            _restore_widths(layers, layer.id, ld)
+            layers.set_hatch(layer.id, ld.get("hatch", ""))
+            _copy_hatch_look(layers, layer.id, ld)
+            id_map[ld["id"]] = layer.id
+
+    # The file's order is the user's, arrows and all: Default is not
+    # nailed to the top, and creating the rest around it would put it back
+    # there.
+    layers.set_order([id_map[ld["id"]] for ld in doc.get("layers", [])
+                      if ld["id"] in id_map])
+
+    # Parents in a second pass: a file lists its layers in the order they
+    # were made, which a move can put out of order, so the parent of the
+    # first layer read may be the last one made.
+    for ld in doc.get("layers", []):
+        parent = ld.get("parent")
+        if parent:
+            layers.set_parent(id_map[ld["id"]], id_map.get(parent))
+
+    current = doc.get("current_layer", "default")
+    layers.current_id = id_map.get(current, "default")
+    scene.named_views = dict(doc.get("named_views", {}))
+    scene.view_settings = view_settings.from_json(doc.get("view_settings"),
+                                                  blobs)
+    scene.units = doc.get("units", scene.units)
+    object_id_map = {}
+    from ..core.picture import PictureShape
+    for plane in _image_planes_from_json(doc.get("image_planes", []), blobs):
+        obj = scene.add(PictureShape(plane), name=plane.get("name"),
+                        layer_id=id_map.get(plane.get("layer"), "default"),
+                        obj_id=plane.get("id"))
+        if plane.get("id"):
+            object_id_map[plane["id"]] = obj.id
+        scene.update(obj.id, visible=plane.get("visible", True),
+                     locked=plane.get("locked", False), group_id=plane.get("group"),
+                     block_id=plane.get("block"), color=plane.get("color"),
+                     material=plane.get("material"),
+                     annotation=plane.get("annotation"),
+                     user_text=user_text.cleaned(plane.get("user_text")),
+                     linetype=plane.get("linetype", "ByLayer"),
+                     draw_order=plane.get("draw_order", 0))
+    for bid, bd in doc.get("block_defs", {}).items():
+        scene.block_defs[bid] = {
+            "name": bd["name"],
+            "shapes": [geometry.shape_from_bytes(base64.b64decode(s))
+                       for s in bd["shapes"]],
+        }
+    from ..core.layout import (layouts_from_json, lettered_by_font_size,
+                               lettered_in_builtin_styles,
+                               sheet_groups_from_json)
+    scene.layouts = layouts_from_json(doc.get("layouts", []))
+    scene.sheet_groups = sheet_groups_from_json(doc.get("sheet_groups", []))
+    scene.annot_styles = {k: dict(v) for k, v in
+                          doc.get("annot_styles", {}).items()}
+    # What is lettered keeps the sizes it was lettered at: in the built-in
+    # styles the file names, or, from a release before inch styles, the
+    # metric ones. With nothing lettered, the units choose (style_set).
+    scene.annot_style_set = (doc.get("annot_style_set", "metric")
+                             if lettered_in_builtin_styles(scene) else None)
+    # A drawing from before text heights were capital heights prints as it
+    # did, its heights font sizes; one with nothing lettered by them has
+    # nothing to keep (layout.letters_capitals).
+    scene.text_height_measures = doc.get(
+        "text_height_measures",
+        "em" if lettered_by_font_size(scene) else "capitals")
+    from ..core.hatch_patterns import HatchPattern
+    scene.hatch_patterns = {}
+    for data in doc.get("hatch_patterns", []):
+        pattern = HatchPattern.from_dict(data)
+        scene.hatch_patterns[pattern.name] = pattern
+    scene.history_records = list(doc.get("history_records", []))
+
+    objects = doc.get("objects", [])
+    for n, od in enumerate(objects):
+        if progress is not None:
+            progress(0.9 * n / len(objects))
+        if od.get("mesh"):
+            shape = _mesh_from_json(od["mesh"])
+        else:
+            shape = geometry.shape_from_bytes(base64.b64decode(od["brep"]))
+        obj = scene.add(shape, name=od["name"],
+                        layer_id=id_map.get(od["layer"], "default"),
+                        obj_id=od.get("id"))
+        if od.get("id"):
+            object_id_map[od["id"]] = obj.id
+        updates = {}
+        if not od.get("visible", True):
+            updates["visible"] = False
+        if od.get("color"):
+            updates["color"] = tuple(od["color"])
+        if od.get("material"):
+            updates["material"] = dict(od["material"])
+        if od.get("clip_plane"):
+            updates["clip_plane"] = dict(od["clip_plane"])
+        if od.get("annotation"):
+            updates["annotation"] = dict(od["annotation"])
+        if od.get("linetype") and od["linetype"] != "ByLayer":
+            updates["linetype"] = od["linetype"]
+        if od.get("draw_order"):
+            updates["draw_order"] = int(od["draw_order"])
+        if od.get("print_width") is not None:
+            updates["print_width"] = max(0.0, float(od["print_width"]))
+        if od.get("section_fill"):
+            updates["section_fill"] = section_fill_dict(**{
+                k: v for k, v in od["section_fill"].items()
+                if k in ("pattern", "angle", "spacing", "color",
+                         "cut_line_width", "cut_line_color", "background")})
+        if od.get("hatch_style"):
+            updates["hatch_style"] = _hatch_style(od["hatch_style"])
+        text = user_text.cleaned(od.get("user_text"))
+        if text:
+            updates["user_text"] = text
+        if od.get("locked"):
+            updates["locked"] = True
+        if od.get("group"):
+            updates["group_id"] = od["group"]
+        if od.get("block"):
+            updates["block_id"] = od["block"]
+        if updates:
+            scene.update(obj.id, **updates)
+
+    # A drawing from before a hidden clipping plane cut stopped a plane by
+    # hiding it, or its layer: one it hid is paused, so it opens as saved.
+    if not doc.get("hidden_planes_cut"):
+        from ..core import clipping
+        for obj in clipping.planes_of(scene):
+            if obj.clip_plane.get("enabled") and clipping.hidden(scene, obj):
+                scene.update(obj.id, clip_plane={**obj.clip_plane,
+                                                 "enabled": False})
+
+    clouds = doc.get("pointclouds", [])
+    for n, cd in enumerate(clouds):
+        if progress is not None:
+            progress(0.9 + 0.1 * n / len(clouds))
+        cloud = _cloud_from_json(cd, blobs)
+        if cloud is None:
+            continue
+        obj = scene.add(cloud, name=cd.get("name") or None,
+                        layer_id=id_map.get(cd.get("layer"), "default"),
+                        obj_id=cd.get("id"))
+        if cd.get("id"):
+            object_id_map[cd["id"]] = obj.id
+        updates = {}
+        if not cd.get("visible", True):
+            updates["visible"] = False
+        if cd.get("color"):
+            updates["color"] = tuple(cd["color"])
+        if cd.get("locked"):
+            updates["locked"] = True
+        text = user_text.cleaned(cd.get("user_text"))
+        if text:
+            updates["user_text"] = text
+        if updates:
+            scene.update(obj.id, **updates)
+
+    # Loading assigns fresh scene IDs. Regeneration and script ownership must
+    # follow the loaded objects, rather than retain the file's obsolete IDs.
+    for record in scene.history_records:
+        record["inputs"] = [object_id_map.get(oid, oid)
+                            for oid in record.get("inputs", [])]
+        if "output" in record:
+            record["output"] = object_id_map.get(record["output"], record["output"])
+    # So must what a detail hides of its own, or it all comes back.
+    for layout in scene.layouts:
+        for detail in layout.details:
+            if detail.hidden_objects:
+                detail.hidden_objects = [object_id_map[oid] for oid
+                                         in detail.hidden_objects
+                                         if oid in object_id_map]
+
+    scene.trajectories = list(doc.get("trajectories", []))
+    scene.session = doc.get("session") or None
+    _drop_unsaved_default(scene, doc, id_map)
+
+
+def _drop_unsaved_default(scene, doc, id_map):
+    """An empty scene starts with a Default layer; a file saved after that
+    was deleted would get it back, empty, every time it opened."""
+    layers = scene.layers
+    if (not doc.get("layers") or DEFAULT_LAYER_ID in id_map.values()
+            or DEFAULT_LAYER_ID not in {la.id for la in layers.all()}
+            or len(layers.all()) < 2
+            or any(o.layer_id == DEFAULT_LAYER_ID for o in scene.all())):
+        return
+    layers.remove(DEFAULT_LAYER_ID)
+
+
+def _image_planes_from_json(planes, blobs=None) -> list[dict]:
+    """Restore embedded pictures, leaving legacy external paths untouched."""
+    restored = []
+    for saved_plane in planes:
+        plane = dict(saved_plane)
+        member = plane.pop("image", None)
+        if member and blobs is not None:
+            try:
+                data = blobs.read(member)
+            except (KeyError, OSError, RuntimeError):
+                data = None
+            if data is not None:
+                plane["image_data"] = data
+        restored.append(plane)
+    return restored
+
+
+def _cloud_from_json(cd: dict, blobs):
+    """A PointCloudShape from its entry and the container's blobs, or None
+    when the arrays it names are not in the file."""
+    import numpy as np
+    from ..core.pointcloud import PointCloudShape
+    names = cd.get("blobs") or {}
+    if blobs is None or "xyz" not in names:
+        return None
+    members = set(blobs.namelist())
+
+    def read(key, dtype, cols=None):
+        name = names.get(key)
+        if not name or name not in members:
+            return None
+        arr = np.frombuffer(blobs.read(name), dtype=dtype)
+        return arr.reshape(-1, cols) if cols else arr
+
+    xyz = read("xyz", "<f4", 3)
+    if xyz is None:
+        return None
+    n = len(xyz)
+
+    def sized(arr):
+        # An array of the wrong length is worse than none: it would pair
+        # colours with the wrong points from the first row.
+        return arr if arr is not None and len(arr) == n else None
+
+    return PointCloudShape(xyz, sized(read("rgb", np.uint8, 3)),
+                           sized(read("conf", "<f4")),
+                           sized(read("level", np.uint8)),
+                           provenance=cd.get("provenance"),
+                           origin=cd.get("origin"))
+
+
+def _mesh_to_json(mesh) -> dict:
+    """The vertices as float32, with an origin when the mesh needs one.
+
+    float32 steps 6cm at a million units, so a survey mesh written in
+    absolute coordinates came back from its own file on that grid. Out
+    there the vertices are written as offsets from "o" instead, which the
+    same four bytes hold to a fraction of a micron. A mesh near the
+    origin carries no "o" and is written exactly as it always was."""
+    import numpy as np
+    from ..utils.math3d import offsets_from, origin_for
+    origin = origin_for(mesh.vertices)
+    verts = (mesh.vertices if origin is None
+             else offsets_from(mesh.vertices, origin))
+    out = {
+        "v": base64.b64encode(
+            np.asarray(verts).astype("<f4").tobytes()).decode("ascii"),
+        "t": base64.b64encode(
+            mesh.triangles.astype("<u4").tobytes()).decode("ascii"),
+    }
+    if origin is not None:
+        out["o"] = [float(c) for c in origin]
+    if mesh.faceted:
+        out["f"] = 1             # drawn flat, every edge shown
+    return out
+
+
+def _mesh_from_json(data: dict):
+    import numpy as np
+    from ..core.mesh import MeshShape
+    v = np.frombuffer(base64.b64decode(data["v"]),
+                      dtype="<f4").reshape(-1, 3).astype(float)
+    t = np.frombuffer(base64.b64decode(data["t"]),
+                      dtype="<u4").reshape(-1, 3)
+    origin = data.get("o")
+    if origin is not None:
+        v = v + np.asarray(origin, float)
+    return MeshShape(v, t, faceted=bool(data.get("f")))

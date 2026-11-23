@@ -1,0 +1,6920 @@
+"""Geometry construction and interrogation on top of the OCCT kernel.
+
+Every builder takes plain Python tuples/floats and returns a TopoDS_Shape.
+Points are (x, y, z) tuples throughout; vectors likewise.
+"""
+
+from __future__ import annotations
+
+import math
+import os
+import struct
+import tempfile
+import warnings
+
+from . import occ
+from .tolerance import tight, tol
+from .occ import (
+    gp_Pnt, gp_Vec, gp_Dir, gp_Ax1, gp_Ax2, gp_Trsf, gp_GTrsf, gp_Circ,
+    gp_Elips, gp_XYZ, gp_Mat,
+    TopoDS_Shape, TopoDS_Compound, TopExp_Explorer, TopLoc_Location,
+    BRep_Builder,
+    BRepBuilderAPI_MakeEdge, BRepBuilderAPI_MakeWire, BRepBuilderAPI_MakeFace,
+    BRepBuilderAPI_MakeVertex, BRepBuilderAPI_Transform,
+    BRepBuilderAPI_GTransform, BRepBuilderAPI_Copy,
+    BRepPrimAPI_MakePrism, BRepPrimAPI_MakeRevol, BRepPrimAPI_MakeBox,
+    BRepPrimAPI_MakeSphere, BRepPrimAPI_MakeCylinder, BRepPrimAPI_MakeCone,
+    BRepPrimAPI_MakeTorus,
+    BRepAlgoAPI_Fuse, BRepAlgoAPI_Cut, BRepAlgoAPI_Common,
+    BRepOffsetAPI_ThruSections, BRepOffsetAPI_MakePipe,
+    GC_MakeArcOfCircle, GC_MakeCircle,
+    GeomAPI_Interpolate, GeomAPI_PointsToBSpline,
+    Geom_BSplineCurve,
+    TColgp_Array1OfPnt, TColgp_HArray1OfPnt, TColStd_Array1OfReal,
+    TColStd_Array1OfInteger,
+    Bnd_Box, BRepCheck_Analyzer,
+)
+
+Point = tuple[float, float, float]
+
+
+class GeometryError(Exception):
+    """Raised when a geometric operation cannot be performed."""
+
+
+def _pnt(p: Point) -> gp_Pnt:
+    return gp_Pnt(float(p[0]), float(p[1]), float(p[2]))
+
+
+def _vec(v: Point) -> gp_Vec:
+    return gp_Vec(float(v[0]), float(v[1]), float(v[2]))
+
+
+def _dir(v: Point) -> gp_Dir:
+    try:
+        return gp_Dir(float(v[0]), float(v[1]), float(v[2]))
+    except Exception as exc:
+        raise GeometryError(f"Invalid direction {v}: {exc}") from exc
+
+
+def pnt_tuple(p: gp_Pnt) -> Point:
+    return (p.X(), p.Y(), p.Z())
+
+
+# --- curves -----------------------------------------------------------------
+
+def make_line(p1: Point, p2: Point) -> TopoDS_Shape:
+    if _pnt(p1).Distance(_pnt(p2)) < tight():
+        raise GeometryError("Line endpoints are coincident")
+    return BRepBuilderAPI_MakeEdge(_pnt(p1), _pnt(p2)).Edge()
+
+
+def make_polyline(points: list[Point], closed: bool = False) -> TopoDS_Shape:
+    if len(points) < 2:
+        raise GeometryError("Polyline needs at least 2 points")
+    wire = BRepBuilderAPI_MakeWire()
+    pts = [_pnt(p) for p in points]
+    if closed and pts[0].Distance(pts[-1]) > tight():
+        pts.append(pts[0])
+    for a, b in zip(pts, pts[1:]):
+        if a.Distance(b) < tight():
+            continue
+        wire.Add(BRepBuilderAPI_MakeEdge(a, b).Edge())
+    if not wire.IsDone():
+        raise GeometryError("Failed to build polyline")
+    return wire.Wire()
+
+
+def make_circle(center: Point, radius: float,
+                normal: Point = (0, 0, 1)) -> TopoDS_Shape:
+    if radius <= 0:
+        raise GeometryError("Circle radius must be positive")
+    ax = gp_Ax2(_pnt(center), _dir(normal))
+    return BRepBuilderAPI_MakeEdge(gp_Circ(ax, float(radius))).Edge()
+
+
+def make_arc_3pt(p1: Point, p2: Point, p3: Point) -> TopoDS_Shape:
+    arc = GC_MakeArcOfCircle(_pnt(p1), _pnt(p2), _pnt(p3))
+    if not arc.IsDone():
+        raise GeometryError("Cannot fit an arc through these points")
+    return BRepBuilderAPI_MakeEdge(arc.Value()).Edge()
+
+
+def make_arc_center(center: Point, start: Point, angle: float,
+                    normal: Point = (0, 0, 1)) -> TopoDS_Shape:
+    """Arc swept about `center` from `start`, `angle` radians about `normal`.
+
+    Positive sweeps counterclockwise looking down the normal, negative the
+    other way, which is what lets a typed -90 mean the quarter you meant.
+    Built through three rotated copies of the start point rather than by
+    trimming a circle, so there is no seam parameter to land on.
+    """
+    c = tuple(float(v) for v in center)
+    r = math.dist(c, tuple(float(v) for v in start))
+    if r < tight():
+        raise GeometryError("Arc radius is zero")
+    if abs(angle) < 1e-9:
+        raise GeometryError("Zero sweep — no arc")
+    if abs(angle) > 2 * math.pi - 1e-9:
+        raise GeometryError("A full sweep is a circle, not an arc")
+    ax = gp_Ax1(_pnt(c), _dir(normal))
+
+    def turned(by: float) -> Point:
+        tr = gp_Trsf()
+        tr.SetRotation(ax, float(by))
+        p = _pnt(start).Transformed(tr)
+        return (p.X(), p.Y(), p.Z())
+
+    return make_arc_3pt(start, turned(angle / 2), turned(angle))
+
+
+def make_circle_3pt(p1: Point, p2: Point, p3: Point) -> TopoDS_Shape:
+    """The one circle through three points, however they lean."""
+    mk = GC_MakeCircle(_pnt(p1), _pnt(p2), _pnt(p3))
+    if not mk.IsDone():
+        raise GeometryError("Cannot fit a circle through these points")
+    return BRepBuilderAPI_MakeEdge(mk.Value()).Edge()
+
+
+def make_ellipse_axis(center: Point, xdir: Point, r1: float, r2: float,
+                      normal: Point = (0, 0, 1),
+                      start: float | None = None,
+                      end: float | None = None) -> TopoDS_Shape:
+    """Ellipse with its first axis pointed along `xdir`, radii r1 and r2.
+
+    Unlike make_ellipse, which leaves the axes wherever the kernel puts
+    them, this one is for when the axis was picked. gp_Elips insists the
+    major radius comes first, so when the named axis is the short one the
+    frame is turned a quarter rather than letting the radii swap and drag
+    the axis with them.
+
+    `start` and `end` trim it to an arc, measured in radians from `xdir`
+    the way a DXF states one. The quarter turn above carries the parameter
+    origin with it, so the trim turns by a quarter too.
+    """
+    if r1 <= 0 or r2 <= 0:
+        raise GeometryError("Ellipse radii must be positive")
+    n = _dir(normal)
+    x = _dir(xdir)
+    if r1 >= r2:
+        ax = gp_Ax2(_pnt(center), n, x)
+        el = gp_Elips(ax, float(r1), float(r2))
+        shift = 0.0
+    else:
+        y = gp_Dir(n.Crossed(x).XYZ())
+        ax = gp_Ax2(_pnt(center), n, y)
+        el = gp_Elips(ax, float(r2), float(r1))
+        shift = -math.pi / 2
+    if start is None or end is None:
+        return BRepBuilderAPI_MakeEdge(el).Edge()
+    sweep = float(end) - float(start)
+    if sweep <= 1e-12 or sweep >= 2 * math.pi - 1e-12:
+        return BRepBuilderAPI_MakeEdge(el).Edge()
+    return BRepBuilderAPI_MakeEdge(
+        el, float(start) + shift, float(end) + shift).Edge()
+
+
+def make_ellipse(center: Point, major_radius: float, minor_radius: float,
+                 normal: Point = (0, 0, 1)) -> TopoDS_Shape:
+    if minor_radius > major_radius:
+        major_radius, minor_radius = minor_radius, major_radius
+    if minor_radius <= 0:
+        raise GeometryError("Ellipse radii must be positive")
+    ax = gp_Ax2(_pnt(center), _dir(normal))
+    return BRepBuilderAPI_MakeEdge(
+        gp_Elips(ax, float(major_radius), float(minor_radius))).Edge()
+
+
+def make_rectangle(corner1: Point, corner2: Point) -> TopoDS_Shape:
+    """Axis-aligned rectangle in the world XY plane (z from corner1)."""
+    x1, y1, z = corner1
+    x2, y2, _ = corner2
+    if abs(x2 - x1) < 1e-9 or abs(y2 - y1) < 1e-9:
+        raise GeometryError("Degenerate rectangle")
+    pts = [(x1, y1, z), (x2, y1, z), (x2, y2, z), (x1, y2, z)]
+    return make_polyline(pts, closed=True)
+
+
+def make_interp_curve(points: list[Point], closed: bool = False) -> TopoDS_Shape:
+    """NURBS curve interpolated through the given points."""
+    if len(points) < 2:
+        raise GeometryError("Curve needs at least 2 points")
+    arr = TColgp_HArray1OfPnt(1, len(points))
+    for i, p in enumerate(points, start=1):
+        arr.SetValue(i, _pnt(p))
+    interp = GeomAPI_Interpolate(arr, closed, tol() * 0.01)
+    interp.Perform()
+    if not interp.IsDone():
+        raise GeometryError("Curve interpolation failed")
+    return BRepBuilderAPI_MakeEdge(interp.Curve()).Edge()
+
+
+def make_nurbs_curve(control_points: list[Point], degree: int = 3,
+                     knots: list[float] | None = None,
+                     weights: list[float] | None = None) -> TopoDS_Shape:
+    """NURBS curve from the whole description: poles, weights and knots.
+
+    make_control_curve invents a uniform clamped knot vector, which is what
+    you want for poles somebody clicked and wrong for a curve that arrived
+    in a file. A conic written as a NURBS keeps its shape in the weights
+    and its parameterisation in the knots, so dropping either turns an
+    exact ellipse into a blob that misses it by half a unit in ten
+    (issue #28).
+
+    Knots arrive flat, one entry per repeat, the way a DXF writes them;
+    OCCT wants each distinct value once with its multiplicity beside it.
+    """
+    n = len(control_points)
+    if n < 2:
+        raise GeometryError("Need at least 2 control points")
+    if not knots:
+        raise GeometryError("Need a knot vector")
+
+    values: list[float] = []
+    mults: list[int] = []
+    for k in knots:
+        if values and abs(float(k) - values[-1]) < 1e-12:
+            mults[-1] += 1
+        else:
+            values.append(float(k))
+            mults.append(1)
+    if sum(mults) != n + degree + 1:
+        # only a clamped curve is described this way; anything else (a
+        # periodic one, or a file that disagrees with itself) is not ours
+        # to guess at
+        raise GeometryError("Knot vector does not match the control points")
+
+    poles = TColgp_Array1OfPnt(1, n)
+    for i, p in enumerate(control_points, start=1):
+        poles.SetValue(i, _pnt(p))
+    karr = TColStd_Array1OfReal(1, len(values))
+    marr = TColStd_Array1OfInteger(1, len(values))
+    for i, (v, m) in enumerate(zip(values, mults), start=1):
+        karr.SetValue(i, v)
+        marr.SetValue(i, m)
+
+    if weights:
+        if len(weights) != n:
+            raise GeometryError("One weight per control point, or none")
+        warr = TColStd_Array1OfReal(1, n)
+        for i, w in enumerate(weights, start=1):
+            warr.SetValue(i, float(w))
+        curve = Geom_BSplineCurve(poles, warr, karr, marr, degree, False)
+    else:
+        curve = Geom_BSplineCurve(poles, karr, marr, degree, False)
+    return BRepBuilderAPI_MakeEdge(curve).Edge()
+
+
+def make_control_curve(control_points: list[Point], degree: int = 3,
+                       closed: bool = False) -> TopoDS_Shape:
+    """NURBS curve from explicit control points.
+
+    Open, the knots are uniform and clamped, so the curve starts and ends on
+    its first and last poles and is pulled toward the rest. Closed, it is
+    periodic instead: the poles are a ring with no first or last, so the
+    curve runs through the seam as smoothly as anywhere else rather than
+    meeting itself at a corner. Repeating the first point as the last would
+    also close it, and would put a kink exactly where the eye looks first.
+    """
+    n = len(control_points)
+    if n < 2:
+        raise GeometryError("Need at least 2 control points")
+    poles = TColgp_Array1OfPnt(1, n)
+    for i, p in enumerate(control_points, start=1):
+        poles.SetValue(i, _pnt(p))
+    if closed:
+        if n < 3:
+            raise GeometryError("Need at least 3 control points to close")
+        # A periodic knot vector is unclamped and one longer than the poles,
+        # every multiplicity 1: the ring joins back on itself.
+        degree = max(1, min(degree, n))
+        n_knots = n + 1
+        knots = TColStd_Array1OfReal(1, n_knots)
+        mults = TColStd_Array1OfInteger(1, n_knots)
+        for i in range(1, n_knots + 1):
+            knots.SetValue(i, float(i - 1))
+            mults.SetValue(i, 1)
+        curve = Geom_BSplineCurve(poles, knots, mults, degree, True)
+        return BRepBuilderAPI_MakeEdge(curve).Edge()
+    degree = max(1, min(degree, n - 1))
+    n_knots = n - degree + 1
+    knots = TColStd_Array1OfReal(1, n_knots)
+    mults = TColStd_Array1OfInteger(1, n_knots)
+    for i in range(1, n_knots + 1):
+        knots.SetValue(i, float(i - 1) / (n_knots - 1) if n_knots > 1 else 0.0)
+        mults.SetValue(i, degree + 1 if i in (1, n_knots) else 1)
+    curve = Geom_BSplineCurve(poles, knots, mults, degree, False)
+    return BRepBuilderAPI_MakeEdge(curve).Edge()
+
+
+# --- wires / joining --------------------------------------------------------
+
+def edges_of(shape) -> list:
+    """The shape's edges, each once. A mesh, a point cloud or a picture has
+    none of OpenCascade's, so it gives none: a mesh edge picked with
+    Ctrl+Shift is not one a Brep tool can take."""
+    if not isinstance(shape, TopoDS_Shape):
+        return []
+    out, seen = [], set()
+    exp = TopExp_Explorer(shape, occ.EDGE)
+    while exp.More():
+        # a shell visits a shared edge once per face it belongs to, so dedupe.
+        # On the edge, whose hash is OCC's own — same underlying shape and
+        # placement, either orientation. Not on `TShape()`: that hands back a
+        # fresh wrapper each call and hashes its address, so it says nothing
+        # about the edge, and a freed address handed out again would collide
+        # and lose one.
+        edge = occ.to_edge(exp.Current())
+        key = hash(edge)
+        if key not in seen:
+            seen.add(key)
+            out.append(edge)
+        exp.Next()
+    return out
+
+
+def vertices_of(shape) -> list:
+    """The shape's corners, each once, in a stable order: what a
+    Ctrl+Shift click on a point of a curve, a surface or a solid holds by
+    its index. None for a mesh, as edges_of gives none."""
+    if not isinstance(shape, TopoDS_Shape):
+        return []
+    out, seen = [], set()
+    exp = TopExp_Explorer(shape, occ.VERTEX)
+    while exp.More():
+        vertex = occ.to_vertex(exp.Current())
+        key = hash(vertex)
+        if key not in seen:
+            seen.add(key)
+            out.append(vertex)
+        exp.Next()
+    return out
+
+
+def vertex_points(shape) -> list:
+    """Where each of `vertices_of(shape)` is."""
+    return [pnt_tuple(occ.point_of_vertex(v)) for v in vertices_of(shape)]
+
+
+def curve_points(shape) -> list:
+    """A curve's points a click can hold: its corners (vertex_points),
+    then the kinks inside its edges, where a polyline kept as one edge of
+    degree 1 turns. Held by index in this order."""
+    out = vertex_points(shape)
+    seen = {tuple(round(c, 9) for c in p) for p in out}
+    for edge in edges_of(shape):
+        try:
+            bs = _bspline_of_edge(edge)
+        except Exception:                                   # noqa: BLE001
+            continue
+        if bs.Degree() != 1:
+            continue
+        for j in range(2, bs.NbPoles()):
+            p = pnt_tuple(bs.Pole(j))
+            key = tuple(round(c, 9) for c in p)
+            if key not in seen:
+                seen.add(key)
+                out.append(p)
+    return out
+
+
+def faces_of(shape) -> list:
+    """The shape's faces; none for a mesh, a point cloud or a picture, as
+    edges_of gives none."""
+    if not isinstance(shape, TopoDS_Shape):
+        return []
+    out = []
+    exp = TopExp_Explorer(shape, occ.FACE)
+    while exp.More():
+        out.append(occ.to_face(exp.Current()))
+        exp.Next()
+    return out
+
+
+def loose_pieces(shape) -> list:
+    """The separate solids a severed shape falls into, or [] if it is whole.
+
+    A boolean that cuts right through hands back a compound holding one
+    solid per piece, which is what says a cut fell through rather than
+    merely notched something.
+
+    Everything else comes back empty, and the two ways that happens are
+    both deliberate. A lone solid has not been severed however many shells
+    it has, so a solid with a void in it stays one object. And a compound
+    holding anything other than solids is not ours to take apart, because
+    handing back only the solids would quietly lose the rest.
+    """
+    if shape.ShapeType() != occ.COMPOUND:
+        return []
+    from .occ import TopoDS_Iterator
+    out = []
+    it = TopoDS_Iterator(shape)
+    while it.More():
+        out.append(it.Value())
+        it.Next()
+    if len(out) < 2 or any(p.ShapeType() != occ.SOLID for p in out):
+        return []
+    return [occ.to_solid(p) for p in out]
+
+
+def to_wire(shape) -> TopoDS_Shape:
+    """Promote an edge (or wire) to a wire."""
+    st = shape.ShapeType()
+    if st == occ.WIRE:
+        return shape
+    if st == occ.EDGE:
+        mk = BRepBuilderAPI_MakeWire(occ.to_edge(shape))
+        if not mk.IsDone():
+            raise GeometryError("Failed to make wire from edge")
+        return mk.Wire()
+    raise GeometryError(f"Cannot convert {shape_kind(shape)} to wire")
+
+
+def join_curves(shapes: list) -> TopoDS_Shape:
+    """Join edges/wires into a single wire (must connect end-to-end)."""
+    from OCP.TopTools import TopTools_ListOfShape
+
+    edges = []
+    for shape in shapes:
+        if shape.ShapeType() not in (occ.EDGE, occ.WIRE):
+            raise GeometryError("join expects curves")
+        edges.extend(edges_of(shape))
+    # Adding curves one by one silently discards an initially disconnected
+    # piece, even if a later connector would join it. Submit the whole set.
+    pending = TopTools_ListOfShape()
+    for edge in edges:
+        pending.Append(edge)
+    mk = BRepBuilderAPI_MakeWire()
+    mk.Add(pending)
+    if not mk.IsDone() or len(edges_of(mk.Wire())) != len(edges):
+        raise GeometryError("Curves do not connect end-to-end")
+    return mk.Wire()
+
+
+def _rough_volume(shape) -> float:
+    """Volume to a relative 1e-3, a few times quicker than volume(): enough
+    to tell an empty or inside-out solid."""
+    from OCP.BRepGProp import BRepGProp
+    from OCP.GProp import GProp_GProps
+    props = GProp_GProps()
+    BRepGProp.VolumeProperties_s(shape, props, 1e-3, True)
+    return props.Mass()
+
+
+def join_surfaces(shapes: list) -> TopoDS_Shape:
+    """Sew touching surfaces into one polysurface, sealed to a solid if closed.
+
+    This is Rhino's Join for surfaces: coincident edges are stitched so the
+    pieces stop being separate objects, and a polysurface that ends up
+    enclosing a volume becomes a solid. Surfaces that meet nothing come back
+    still loose inside the result, so the caller reads joined_pieces() to
+    tell a clean join from a partial one rather than trusting this to have
+    merged everything it was handed.
+    """
+    from OCP.BRepCheck import BRepCheck_Shell, BRepCheck_Status
+
+    from .occ import BRepBuilderAPI_MakeSolid, BRepBuilderAPI_Sewing
+    sew = BRepBuilderAPI_Sewing(tol())
+    for s in shapes:
+        sew.Add(s)
+    sew.Perform()
+    sewn = sew.SewedShape()
+    if sewn is None or sewn.IsNull():
+        raise GeometryError("Surfaces could not be joined")
+    # A single closed shell is a solid waiting to happen. Only a closed one:
+    # MakeSolid will wrap an open shell just as happily and hand back a
+    # bogus volume, so the closedness check is what keeps a half-box a
+    # surface rather than a lie about a solid.
+    if sewn.ShapeType() == occ.SHELL:
+        shell = occ.to_shell(sewn)
+        if BRepCheck_Shell(shell).Closed() == BRepCheck_Status.BRepCheck_NoError:
+            mk = BRepBuilderAPI_MakeSolid(shell)
+            if mk.IsDone() and abs(_rough_volume(mk.Solid())) > 1e-12:
+                return mk.Solid()
+    return sewn
+
+
+def joined_pieces(shape) -> list:
+    """The separate pieces a join produced: one if it all stitched together.
+
+    Sewing hands back a compound when some surfaces never met their
+    neighbours, one child per piece that could not be merged into the rest.
+    Anything that is not a compound is a single joined piece.
+    """
+    if shape.ShapeType() != occ.COMPOUND:
+        return [shape]
+    from .occ import TopoDS_Iterator
+    out = []
+    it = TopoDS_Iterator(shape)
+    while it.More():
+        out.append(it.Value())
+        it.Next()
+    return out
+
+
+def merge_coplanar_faces(shape) -> TopoDS_Shape:
+    """Fuse coplanar neighbours into single faces, seam edges and all.
+
+    Rhino's MergeAllCoplanarFaces. A union of two boxes side by side comes
+    back with each spanning side split into two coplanar strips; this fuses
+    them so the box has its six faces again. It is a change of description,
+    not of the solid, so the volume is left exactly where it was.
+
+    ShapeUpgrade_UnifySameDomain does both halves of the tidy-up: unify the
+    faces that share a surface, and unify the edges that share a curve so
+    the redundant seams do not linger as splits in the remaining faces.
+    """
+    from OCP.ShapeUpgrade import ShapeUpgrade_UnifySameDomain
+    up = ShapeUpgrade_UnifySameDomain(shape, True, True, False)
+    up.Build()
+    return up.Shape()
+
+
+def apply_matrix(shape, matrix):
+    """Apply any 4x4 affine transform: rotation, translation, scale, shear.
+
+    A gp_Trsf only holds similarities, and handed a matrix it cannot express
+    it does not refuse — it quietly rounds to the nearest one it can, so a
+    1x1x3 stretch used to come back a cube of the same volume. Anything that
+    is not a similarity goes through gp_GTrsf instead, which costs more but
+    means what it says. Block instances in a .3dm are routinely scaled
+    unevenly, so this is a road well travelled.
+    """
+    import numpy as np
+    from .mesh import MeshShape
+    from .pointcloud import PointCloudShape
+    from .text_object import TextShape
+    from .hatch import HatchShape
+    from .dimension import DimensionShape
+    m = np.asarray(matrix, float)
+    if isinstance(shape, (MeshShape, PointCloudShape, TextShape, HatchShape,
+                          DimensionShape)):
+        return shape.transformed(m)
+    a = m[:3, :3]
+    # a similarity is a rotation times a single scale, so A@A.T is that
+    # scale squared on the diagonal and nothing anywhere else
+    square = a @ a.T
+    if np.allclose(square, np.eye(3) * square[0, 0], atol=1e-9):
+        trsf = gp_Trsf()
+        trsf.SetValues(m[0, 0], m[0, 1], m[0, 2], m[0, 3],
+                       m[1, 0], m[1, 1], m[1, 2], m[1, 3],
+                       m[2, 0], m[2, 1], m[2, 2], m[2, 3])
+        return BRepBuilderAPI_Transform(shape, trsf, True).Shape()
+    gt = gp_GTrsf()
+    gt.SetVectorialPart(gp_Mat(*a.flatten()))
+    gt.SetTranslationPart(gp_XYZ(*m[:3, 3]))
+    return _gtransform(shape, gt)
+
+
+def curve_endpoints(shape) -> tuple[Point, Point]:
+    """(start, end) of an open edge or wire."""
+    st = shape.ShapeType()
+    if st == occ.EDGE:
+        ad = occ.edge_adaptor(occ.to_edge(shape))
+        p0 = ad.Value(ad.FirstParameter())
+        p1 = ad.Value(ad.LastParameter())
+        return ((p0.X(), p0.Y(), p0.Z()), (p1.X(), p1.Y(), p1.Z()))
+    if st == occ.WIRE:
+        from OCP.BRep import BRep_Tool
+        from OCP.TopExp import TopExp
+        from OCP.TopoDS import TopoDS_Vertex
+        v1, v2 = TopoDS_Vertex(), TopoDS_Vertex()
+        TopExp.Vertices_s(occ.to_wire(shape), v1, v2)
+        p0 = BRep_Tool.Pnt_s(v1)
+        p1 = BRep_Tool.Pnt_s(v2)
+        return ((p0.X(), p0.Y(), p0.Z()), (p1.X(), p1.Y(), p1.Z()))
+    raise GeometryError("Not a curve")
+
+
+def close_curve(shape) -> TopoDS_Shape:
+    """Close an open curve with a straight segment start-to-end."""
+    if is_closed_curve(shape):
+        raise GeometryError("Curve is already closed")
+    a, b = curve_endpoints(shape)
+    import math
+    if math.dist(a, b) < tol() * 0.1:
+        raise GeometryError("Curve ends already coincide")
+    return join_curves([shape, make_line(b, a)])
+
+
+def is_closed_curve(shape) -> bool:
+    st = shape.ShapeType()
+    if st == occ.EDGE:
+        ad = occ.edge_adaptor(occ.to_edge(shape))
+        p0 = ad.Value(ad.FirstParameter())
+        p1 = ad.Value(ad.LastParameter())
+        return p0.Distance(p1) < tol() * 0.1
+    if st == occ.WIRE:
+        return occ.to_wire(shape).Closed()
+    return False
+
+
+# --- surfaces ---------------------------------------------------------------
+
+def extrude(shape, direction: Point, distance: float,
+            cap: bool = False) -> TopoDS_Shape:
+    """Extrude a curve into a surface (or a capped solid if closed+cap)."""
+    d = _dir(direction)
+    vec = gp_Vec(d.X(), d.Y(), d.Z()).Multiplied(float(distance))
+    base = shape
+    if cap and is_closed_curve(shape):
+        base = planar_face(shape)
+    result = BRepPrimAPI_MakePrism(base, vec)
+    if not result.IsDone():
+        raise GeometryError("Extrusion failed")
+    return result.Shape()
+
+
+def _contour_face(shape) -> TopoDS_Shape:
+    """The face a closed planar curve bounds. A curve that crosses itself,
+    as font outlines often do where a stem meets a bowl, makes no valid
+    face; it is filled the way type is rasterised instead, by the nonzero
+    winding rule."""
+    from OCP.BRepCheck import BRepCheck_Analyzer
+    face = planar_face(shape)
+    if BRepCheck_Analyzer(face).IsValid():
+        return face
+    try:
+        return _untangled(shape, face)
+    except Exception:                                      # noqa: BLE001
+        return face
+
+
+def _untangled(shape, face) -> TopoDS_Shape:
+    """`face`'s self-crossing boundary cut into the cells it encloses, the
+    ones it winds round kept and merged."""
+    from OCP.BOPTools import BOPTools_AlgoTools3D
+    from OCP.BRep import BRep_Tool
+    from OCP.BRepAlgoAPI import BRepAlgoAPI_Splitter
+    from OCP.BRepTools import BRepTools_WireExplorer
+    from OCP.ElSLib import ElSLib
+    from OCP.GeomAdaptor import GeomAdaptor_Surface
+    from OCP.IntTools import IntTools_Context
+    from OCP.TopAbs import TopAbs_Orientation
+    from OCP.TopTools import TopTools_ListOfShape
+    from OCP.gp import gp_Pnt, gp_Pnt2d
+    import numpy as np
+    from .tessellate import _edge_polyline
+
+    plane = GeomAdaptor_Surface(BRep_Tool.Surface_s(face)).Plane()
+    wire = occ.to_wire(to_wire(shape))
+    lo, hi = bbox(wire)
+    reach = math.dist(lo, hi) + 1.0
+
+    def uv(p):
+        u, v = ElSLib.Parameters_s(plane, p)
+        return u, v
+
+    ring = []
+    explorer = BRepTools_WireExplorer(wire)
+    while explorer.More():
+        edge = explorer.Current()
+        pts = _edge_polyline(edge, reach * 1e-4)
+        if pts is not None and len(pts) >= 2:
+            if edge.Orientation() == TopAbs_Orientation.TopAbs_REVERSED:
+                pts = pts[::-1]
+            ring.extend(uv(gp_Pnt(*map(float, p))) for p in pts)
+        explorer.Next()
+    ring = np.asarray(ring, float)
+    if len(ring) < 3:
+        raise GeometryError("Nothing to untangle")
+    a, b = ring, np.roll(ring, -1, axis=0)
+
+    def winding(x, y):
+        up = (a[:, 1] <= y) & (b[:, 1] > y)
+        down = (a[:, 1] > y) & (b[:, 1] <= y)
+        side = ((b[:, 0] - a[:, 0]) * (y - a[:, 1])
+                - (x - a[:, 0]) * (b[:, 1] - a[:, 1]))
+        return int(np.sum(up & (side > 0)) - np.sum(down & (side < 0)))
+
+    (u0, v0), (u1, v1) = ring.min(axis=0) - reach, ring.max(axis=0) + reach
+    sheet = BRepBuilderAPI_MakeFace(plane, u0, u1, v0, v1).Face()
+    splitter = BRepAlgoAPI_Splitter()
+    args, tools = TopTools_ListOfShape(), TopTools_ListOfShape()
+    args.Append(sheet)
+    # each edge on its own: a single shape's crossings with itself are
+    # not looked for
+    for edge in edges_of(wire):
+        tools.Append(edge)
+    splitter.SetArguments(args)
+    splitter.SetTools(tools)
+    splitter.Build()
+    if not splitter.IsDone():
+        raise GeometryError("Could not cut the curve where it crosses itself")
+    context = IntTools_Context()
+    kept = []
+    for cell in faces_of(splitter.Shape()):
+        p, p2 = gp_Pnt(), gp_Pnt2d()
+        if BOPTools_AlgoTools3D.PointInFace_s(cell, p, p2, context) != 0:
+            continue
+        if winding(*uv(p)):
+            kept.append(cell)
+    if not kept:
+        raise GeometryError("The curve encloses nothing")
+    merged = merge_planar_regions(kept)
+    only = faces_of(merged)
+    return only[0] if len(only) == 1 else merged
+
+
+def _planar_region_items(shapes: list) -> list[tuple[int, TopoDS_Shape]]:
+    """Filled regions described by closed planar boundary curves.
+
+    A boundary inside another boundary is a hole.  A boundary inside that
+    hole is material again, following the usual even-odd profile rule.  The
+    source index keeps independently extruded regions in selection order.
+    """
+    faces = [_contour_face(shape) for shape in shapes]
+    areas = [surface_area(face) for face in faces]
+    boxes = [bbox(face) for face in faces]
+    containers = [[] for _ in faces]
+    gap = tol()
+
+    def apart(a, b):
+        return any(a[1][k] < b[0][k] - gap or b[1][k] < a[0][k] - gap
+                   for k in range(3))
+
+    # Only boundaries whose boxes meet can contain one another; testing
+    # every pair with a boolean made a line of text quadratic to fill.
+    for inner, inner_face in enumerate(faces):
+        for outer, outer_face in enumerate(faces):
+            if inner == outer or areas[outer] <= areas[inner] * (1.0 + 1e-9):
+                continue
+            if apart(boxes[inner], boxes[outer]):
+                continue
+            try:
+                common = boolean_intersection(inner_face, outer_face)
+            except GeometryError:
+                continue
+            if math.isclose(surface_area(common), areas[inner],
+                            rel_tol=1e-7, abs_tol=tol() ** 2):
+                containers[inner].append(outer)
+
+    parents = [min(cs, key=areas.__getitem__) if cs else None
+               for cs in containers]
+    regions = []
+    for index, face in enumerate(faces):
+        if len(containers[index]) % 2:
+            continue
+        region = face
+        for child, parent in enumerate(parents):
+            if parent == index:
+                region = boolean_difference(region, faces[child])
+        regions.append((index, region))
+    return regions
+
+
+def planar_regions(shapes: list) -> list[TopoDS_Shape]:
+    """Planar faces bounded by one or more closed curves, including holes."""
+    return [face for _index, face in _planar_region_items(shapes)]
+
+
+def extrude_profiles(shapes: list, direction: Point, distance: float,
+                     cap: bool = False) -> list[TopoDS_Shape]:
+    """Extrude several curves, treating nested capped curves as one profile."""
+    from .text_object import TextShape
+    from .dimension import DimensionShape
+    shapes = [curve for shape in shapes
+              for curve in (shape.to_curves()
+                            if isinstance(shape, (TextShape, DimensionShape))
+                            else [shape])]
+    if not cap:
+        return [extrude(shape, direction, distance, cap=False)
+                for shape in shapes]
+
+    closed = [(index, shape) for index, shape in enumerate(shapes)
+              if is_closed_curve(shape)]
+    outputs = [(index, extrude(shape, direction, distance, cap=False))
+               for index, shape in enumerate(shapes)
+               if not is_closed_curve(shape)]
+    if closed:
+        positions, closed_shapes = zip(*closed)
+        outputs.extend(
+            (positions[index], extrude(face, direction, distance, cap=False))
+            for index, face in _planar_region_items(list(closed_shapes)))
+    return [shape for _index, shape in sorted(outputs, key=lambda item: item[0])]
+
+
+def _loose_curves_of(shape):
+    """The separate curves inside a compound, or None if this is a single
+    curve that can answer for itself. A compound holding exactly one wire or
+    edge is that curve, so it answers directly rather than by recursion."""
+    if shape.ShapeType() != occ.COMPOUND:
+        return None
+    from OCP.TopoDS import TopoDS_Iterator
+    kids = []
+    it = TopoDS_Iterator(shape)
+    while it.More():
+        kids.append(it.Value())
+        it.Next()
+    if len(kids) == 1 and kids[0].ShapeType() in (occ.WIRE, occ.EDGE):
+        return None
+    return kids
+
+
+def sweep_adds_nothing(shape, direction: Point) -> bool:
+    """Would extruding this shape that way leave it as flat as it started?
+
+    A straight line swept along its own length is a longer line, and a flat
+    surface swept within its own plane is that surface again: the prism is
+    in the file but there is nothing of it to see, and nobody dragged for
+    it. The gumball asks this once per axis so it only offers to grow a
+    thing where growing it makes something.
+
+    Anything bent or curved has somewhere to go whichever way it is
+    pushed, so the answer for it is always no, and so it is for a solid,
+    which is not something a sweep can flatten.
+    """
+    d = [float(v) for v in direction]
+    reach = math.sqrt(sum(v * v for v in d))
+    if reach < 1e-9:
+        return True                       # no sweep at all
+    d = [v / reach for v in d]
+    kind = shape_kind(shape)
+    if kind == "curve":
+        # One object can hold many separate curves: make2d hands back a
+        # dozen loose edges in one, and so does exploding linework out of a
+        # DXF. `shape_kind` rightly calls that a curve, but there is no one
+        # pair of endpoints to measure, so ask each piece. Nothing is added
+        # only if nothing any of them does adds anything.
+        pieces = _loose_curves_of(shape)
+        if pieces is not None:
+            return all(sweep_adds_nothing(p, direction) for p in pieces)
+        a, b = curve_endpoints(shape)
+        span = [b[i] - a[i] for i in range(3)]
+        chord = math.sqrt(sum(v * v for v in span))
+        if chord < 1e-9:
+            return False                  # closed, or a point: not straight
+        if abs(curve_length(shape) - chord) > 1e-6 * chord:
+            return False                  # bent, so the sweep is a surface
+        u = [v / chord for v in span]
+        cross = (u[1] * d[2] - u[2] * d[1], u[2] * d[0] - u[0] * d[2],
+                 u[0] * d[1] - u[1] * d[0])
+        return math.sqrt(sum(v * v for v in cross)) < 1e-9
+    if kind == "surface":
+        faces = faces_of(shape)
+        if not faces:
+            return False
+        for f in faces:
+            try:
+                n = face_normal(f)
+            except GeometryError:
+                return False              # not planar: it has somewhere to go
+            if abs(sum(n[i] * d[i] for i in range(3))) > 1e-9:
+                return False
+        return True
+    return False
+
+
+def revolve(shape, axis_point: Point, axis_dir: Point,
+            angle_deg: float = 360.0) -> TopoDS_Shape:
+    ax = gp_Ax1(_pnt(axis_point), _dir(axis_dir))
+    result = BRepPrimAPI_MakeRevol(shape, ax, math.radians(float(angle_deg)))
+    if not result.IsDone():
+        raise GeometryError("Revolve failed")
+    return result.Shape()
+
+
+def loft(profiles: list, solid: bool = False, ruled: bool = False) -> TopoDS_Shape:
+    if len(profiles) < 2:
+        raise GeometryError("Loft needs at least 2 profile curves")
+    lofter = BRepOffsetAPI_ThruSections(solid, ruled, tol() * 0.01)
+    for p in profiles:
+        lofter.AddWire(occ.to_wire(to_wire(p)))
+    lofter.Build()
+    if not lofter.IsDone():
+        raise GeometryError("Loft failed")
+    return lofter.Shape()
+
+
+def sweep1(profile, rail) -> TopoDS_Shape:
+    result = BRepOffsetAPI_MakePipe(occ.to_wire(to_wire(rail)), to_wire(profile))
+    if not result.IsDone():
+        raise GeometryError("Sweep failed")
+    return result.Shape()
+
+
+def planar_face(shape) -> TopoDS_Shape:
+    """Planar surface from a closed planar curve."""
+    if not is_closed_curve(shape):
+        raise GeometryError("Curve must be closed to make a planar surface")
+    wire = occ.to_wire(to_wire(shape))
+    mk = BRepBuilderAPI_MakeFace(wire, True)
+    if not mk.IsDone():
+        raise GeometryError("Planar surface failed (curve may be non-planar)")
+    return mk.Face()
+
+
+def corner_surface(points) -> TopoDS_Shape:
+    """A surface spanned by 3 or 4 corners, taken in order round its edge.
+
+    Three make a flat triangle. Four make a bilinear patch, untrimmed, so
+    four corners that do not lie in one plane still give a surface and its
+    control points are the corners themselves.
+    """
+    pts = [_pnt(p) for p in points]
+    if len(pts) not in (3, 4):
+        raise GeometryError("A corner surface needs 3 or 4 points")
+    for i in range(len(pts)):
+        if pts[i].Distance(pts[i - 1]) < tight():
+            raise GeometryError("Two corners are in the same place")
+    span = gp_Vec(pts[0], pts[1]).Crossed(gp_Vec(pts[0], pts[2]))
+    if span.Magnitude() < tight() ** 2:
+        raise GeometryError("The corners lie on one line")
+    if len(pts) == 3:
+        return planar_face(make_polyline(
+            [(p.X(), p.Y(), p.Z()) for p in pts], closed=True))
+    from OCP.Geom import Geom_BezierSurface
+    from OCP.TColgp import TColgp_Array2OfPnt
+    poles = TColgp_Array2OfPnt(1, 2, 1, 2)
+    poles.SetValue(1, 1, pts[0])
+    poles.SetValue(2, 1, pts[1])
+    poles.SetValue(2, 2, pts[2])
+    poles.SetValue(1, 2, pts[3])
+    mk = BRepBuilderAPI_MakeFace(Geom_BezierSurface(poles), tight())
+    if not mk.IsDone():
+        raise GeometryError("Corner surface failed")
+    return mk.Face()
+
+
+def offset_curve(shape, distance: float) -> TopoDS_Shape:
+    """Offset a planar curve by a distance (sign picks the side).
+
+    Corners stay sharp: the segments are extended until they meet rather
+    than joined by an arc, so a rectangle offsets to a rectangle. Rounding
+    them is a fillet, done afterwards if wanted.
+
+    The sharp join gives up where a spline meets another segment at an
+    angle, or at a corner too sharp to extend, and still says it is done:
+    it hands back nothing, an open curve for a closed one, or a piece of
+    the curve. A sharp corner is never shorter than an arc round the same
+    corner, so the offset with arcs is the yardstick, and the one used when
+    the sharp one comes back short.
+    """
+    from .occ import GeomAbs_JoinType
+    wire = occ.to_wire(to_wire(shape))
+    closed = is_closed_curve(shape)
+    sharp = _offset_wire(wire, distance, GeomAbs_JoinType.GeomAbs_Intersection,
+                         closed)
+    rounded = _offset_wire(wire, distance, GeomAbs_JoinType.GeomAbs_Arc,
+                           closed)
+    if sharp is None and rounded is None:
+        raise GeometryError("Offset failed (curve must be planar)")
+    nothing = "Offset leaves nothing of the curve at that distance"
+    # Offset in past its middle, a curve is gone, though a sharp join can
+    # still leave a speck of a corner there.
+    if rounded is not None and rounded[1] == 0:
+        raise GeometryError(nothing)
+    usable = [made for made in (sharp, rounded) if made is not None and made[1]]
+    if not usable:
+        raise GeometryError(nothing)
+    if len(usable) == 2 and sharp[1] < rounded[1] * (1 - 1e-6):
+        return rounded[0]
+    return usable[0][0]
+
+
+def _offset_wire(wire, distance: float, join, closed: bool):
+    """The kernel's offset with corners joined by `join`, or None if it
+    failed. As (shape, length): the length is 0 when what came back is
+    nothing, and None when it isn't the same kind of curve, every piece
+    closed for a closed curve and open for an open one."""
+    from .occ import BRepOffsetAPI_MakeOffset
+    try:
+        mk = BRepOffsetAPI_MakeOffset(wire, join, not closed)
+        mk.Perform(float(distance))
+    except Exception:                     # noqa: BLE001 - the kernel's own
+        return None
+    if not mk.IsDone() or mk.Shape().IsNull():
+        return None
+    made = mk.Shape()
+    pieces = []
+    exp = TopExp_Explorer(made, occ.WIRE)
+    while exp.More():
+        pieces.append(exp.Current())
+        exp.Next()
+    if not pieces:
+        return made, 0.0
+    if any(is_closed_curve(p) != closed for p in pieces):
+        return made, None
+    return made, curve_length(made)
+
+
+def _curve_plane_normal(ea, eb) -> Point | None:
+    """Normal of the plane the two edges already live on, when the edges
+    say it themselves: two non-parallel lines span their own plane, and an
+    arc carries its circle's axis. None when the edges leave it open."""
+    import numpy as np
+    from OCP.GeomAbs import GeomAbs_CurveType
+
+    def line_dir(ad):
+        p, v = gp_Pnt(), gp_Vec()
+        ad.D1(ad.FirstParameter(), p, v)
+        arr = np.array([v.X(), v.Y(), v.Z()], float)
+        n = np.linalg.norm(arr)
+        return arr / n if n > 1e-12 else None
+
+    def plane_of_arc(edge):
+        ad = occ.edge_adaptor(edge)
+        if ad.GetType() != GeomAbs_CurveType.GeomAbs_Circle:
+            return None
+        circ = ad.Circle()
+        d = circ.Axis().Direction()
+        return np.array([d.X(), d.Y(), d.Z()], float)
+
+    ad_a, ad_b = occ.edge_adaptor(ea), occ.edge_adaptor(eb)
+    both_lines = (ad_a.GetType() == GeomAbs_CurveType.GeomAbs_Line
+                  and ad_b.GetType() == GeomAbs_CurveType.GeomAbs_Line)
+    if both_lines:
+        d1, d2 = line_dir(ad_a), line_dir(ad_b)
+        if d1 is not None and d2 is not None:
+            n = np.cross(d1, d2)
+            ln = np.linalg.norm(n)
+            if ln > 1e-9:
+                return tuple(n / ln)
+        return None
+    arc, other = ((ea, eb) if plane_of_arc(ea) is not None else (eb, ea))
+    n = plane_of_arc(arc)
+    if n is None:
+        return None
+    # the other edge must lie in the arc's plane: both endpoints and the
+    # line's direction perpendicular to the axis
+    ad_o = occ.edge_adaptor(other)
+    p, v = gp_Pnt(), gp_Vec()
+    ad_o.D1(ad_o.FirstParameter(), p, v)
+    d = np.array([v.X(), v.Y(), v.Z()], float)
+    nd = np.linalg.norm(d)
+    if nd < 1e-12 or abs(float(np.dot(d, n))) / nd > 1e-6:
+        return None
+    c0 = occ.edge_adaptor(arc).Circle().Location()
+    for t in (ad_o.FirstParameter(), ad_o.LastParameter()):
+        ad_o.D1(t, p, v)
+        off = np.array([p.X() - c0.X(), p.Y() - c0.Y(), p.Z() - c0.Z()])
+        if abs(float(np.dot(off, n))) > 1e-6:
+            return None
+    return tuple(n)
+
+
+def fillet_curves(edge_a, edge_b, radius: float, near: Point,
+                  plane=None, near_b: Point | None = None) -> tuple:
+    """Fillet two coplanar line/arc edges; returns (trimmed_a, arc, trimmed_b).
+
+    `near` chooses the corner when the curves cross more than once, and
+    `near_b` says where the second curve was clicked when that was
+    somewhere else, which is what keeps the clicked side of a crossing.
+
+    The curves are brought to their corner first (see corner_curves), so
+    two that stop short of each other are carried out to it: the kernel's
+    own fillet refuses a gap, and a drawing is full of lines that nearly
+    meet.
+
+    The fillet is built in the plane the curves live on, resolved in this
+    order: the plane the edges themselves define (two lines, or an arc
+    with the other edge lying in its plane), then `plane` — a normal
+    vector or anything with a `.normal`, such as a CPlane — and finally
+    world XY at the corner's height.
+    """
+    from .occ import ChFi2d_FilletAPI, gp_Pln
+    if radius <= 0:
+        raise GeometryError("Fillet radius must be positive")
+    # A polyline is a wire: the corner is made in the edge that was
+    # clicked, which is what `near` says.
+    here_b = near if near_b is None else near_b
+    clicked_a = occ.to_edge(edge_near(edge_a, near))
+    clicked_b = occ.to_edge(edge_near(edge_b, here_b))
+    ea, eb = clicked_a, clicked_b
+    normal = _curve_plane_normal(ea, eb)
+    if normal is None and plane is not None:
+        n = getattr(plane, "normal", plane)
+        normal = (float(n[0]), float(n[1]), float(n[2]))
+        if math.hypot(*normal) < 1e-12:
+            raise GeometryError("Fillet plane normal is degenerate")
+    if normal is None:
+        normal = (0.0, 0.0, 1.0)
+    at = near
+    whole_a, whole_b = edge_a, edge_b
+    try:
+        whole_a, whole_b = corner_curves(edge_a, edge_b, near, here_b)
+        at = _shared_end(whole_a, whole_b) or near
+        # The corner may have been reached by carrying a curve on, which
+        # leaves it in two pieces: the one that meets the corner is the
+        # one the arc is cut out of.
+        ea = occ.to_edge(edge_near(whole_a, at))
+        eb = occ.to_edge(edge_near(whole_b, at))
+    except GeometryError:
+        # Curves that already meet need no corner made. Ones that cannot
+        # be brought to one have no fillet in them either, and the corner
+        # step says that better than the kernel does.
+        if _shared_end(ea, eb) is None:
+            raise
+    # The corner, not the click: the kernel chooses its solution by the
+    # point it is given, and a click sits anywhere along the curve.
+    api = ChFi2d_FilletAPI(ea, eb, gp_Pln(_pnt(at), _dir(normal)))
+    if not api.Perform(float(radius)):
+        raise GeometryError("Fillet failed: the radius is too large for "
+                            "that corner, or the curves are not on one "
+                            "plane")
+    ea_out = occ.TopoDS_Edge()
+    eb_out = occ.TopoDS_Edge()
+    arc = api.Result(_pnt(at), ea_out, eb_out)
+    if arc.IsNull():
+        raise GeometryError("Fillet produced no result near that corner")
+    # Only the arc is taken from the kernel. What it leaves of the two
+    # curves is trimmed by its own reckoning, which keeps the stub beside
+    # the corner rather than the side that was clicked; each curve is cut
+    # back to the arc here instead, the way radius zero cuts them to the
+    # corner.
+    from OCP.BRep import BRep_Tool
+    for_a, for_b = _nearest_each(_curve_ends(arc), *_away_from(at, ea, eb))
+    ea_cut = _cut_to_corner(ea, BRep_Tool.Curve_s(ea, 0.0, 0.0), for_a,
+                            _far_end(ea, at))
+    eb_cut = _cut_to_corner(eb, BRep_Tool.Curve_s(eb, 0.0, 0.0), for_b,
+                            _far_end(eb, at))
+    return (_with_the_rest(whole_a, ea, ea_cut, for_a), arc,
+            _with_the_rest(whole_b, eb, eb_cut, for_b))
+
+
+def _with_the_rest(curve, clicked, cut, corner: Point):
+    """The cut piece, carrying whatever else the curve is made of.
+
+    Only one piece of a polyline makes the corner, and the others were
+    drawn by somebody: the fillet has no business throwing them away.
+    What lay the other side of the corner is gone, since that is the
+    part the corner cut off, so the rest is gathered by walking out from
+    the end the cut piece keeps.
+    """
+    rest = _edges_through(curve, clicked, _far_end(cut, corner))
+    if not rest:
+        return cut
+    try:
+        return join_curves([cut] + rest)
+    except GeometryError:
+        return cut
+
+
+def _edges_through(curve, clicked, at: Point) -> list:
+    """The edges of `curve`, bar `clicked`, that hang off the point `at`."""
+    import numpy as np
+
+    rest = [e for e in edges_of(curve) if not e.IsSame(clicked)]
+    found, front = [], [np.asarray(at, float)]
+    while front and rest:
+        here = front.pop()
+        for edge in list(rest):
+            ends = [np.asarray(q, float) for q in _curve_ends(edge)]
+            hit = next((i for i, q in enumerate(ends)
+                        if float(np.linalg.norm(q - here)) <= tol()), None)
+            if hit is not None:
+                rest.remove(edge)
+                found.append(edge)
+                front.append(ends[1 - hit])
+    return found
+
+
+def _far_end(edge, corner: Point) -> Point:
+    """The end of an edge that is not the corner.
+
+    Which side to keep is settled by then: the corner step already cut
+    each curve back to the side that was clicked, so what is left of it
+    runs from the corner out to one end. A click near the corner itself
+    sits in the piece the arc takes away, and would say the wrong thing.
+    """
+    import numpy as np
+    at = np.asarray(corner, float)
+    return max(_curve_ends(edge),
+               key=lambda p: float(np.linalg.norm(np.asarray(p) - at)))
+
+
+def _away_from(corner: Point, edge_a, edge_b) -> tuple:
+    return _far_end(edge_a, corner), _far_end(edge_b, corner)
+
+
+def _nearest_each(points, near_a: Point, near_b: Point) -> tuple:
+    """Which of two points belongs to which click."""
+    import numpy as np
+    first, second = (np.asarray(p, float) for p in points)
+    a, b = np.asarray(near_a, float), np.asarray(near_b, float)
+    straight = (np.linalg.norm(first - a) + np.linalg.norm(second - b))
+    crossed = (np.linalg.norm(second - a) + np.linalg.norm(first - b))
+    if straight <= crossed:
+        return tuple(first), tuple(second)
+    return tuple(second), tuple(first)
+
+
+def _shared_end(edge_a, edge_b):
+    """The point two edges meet at, or None if they do not."""
+    import numpy as np
+    for pa in _curve_ends(edge_a):
+        for pb in _curve_ends(edge_b):
+            if np.linalg.norm(np.asarray(pa) - np.asarray(pb)) <= tol():
+                return tuple(float(c) for c in pa)
+    return None
+
+
+def edge_near(curve, point: Point):
+    """The one edge of a curve that `point` lies nearest.
+
+    A polyline is a wire of several edges, and a corner is made in one
+    of them: the one that was clicked. A curve of a single edge answers
+    with itself, so a caller never has to ask which kind it has.
+    """
+    import numpy as np
+    edges = edges_of(curve)
+    if not edges:
+        raise GeometryError("That object has no curve in it")
+    if len(edges) == 1:
+        return edges[0]
+    want = np.asarray(point, float)
+
+    def _away(edge) -> float:
+        pts = np.asarray(sample_curve(edge, 24), float)
+        return float(np.linalg.norm(pts - want, axis=1).min())
+
+    return min(edges, key=_away)
+
+
+def nearest_ends(curve_a, curve_b) -> tuple:
+    """The ends of two curves that lie nearest each other, as points.
+
+    What a click would have said, for a pick that had no place on it:
+    typed, scripted, or chosen from a list. Two curves are filleted at
+    the corner they nearly make, and that is the corner their closest
+    ends stand at.
+    """
+    import numpy as np
+    ends_a = [np.asarray(p, float) for p in _curve_ends(curve_a)]
+    ends_b = [np.asarray(p, float) for p in _curve_ends(curve_b)]
+    pair = min(((a, b) for a in ends_a for b in ends_b),
+               key=lambda e: float(np.linalg.norm(e[0] - e[1])))
+    return tuple(float(c) for c in pair[0]), tuple(float(c) for c in pair[1])
+
+
+def _curve_ends(curve) -> list:
+    """A curve's two ends, or its middle where it has none (a circle)."""
+    pts = sample_curve(curve, 3)
+    return [tuple(pts[0]), tuple(pts[-1])]
+
+
+def corner_curves(edge_a, edge_b, near_a: Point, near_b: Point) -> tuple:
+    """Bring two curves to a sharp corner; returns (new_a, new_b).
+
+    What Rhino's Fillet does at radius zero: the curves meet at the point
+    their own geometry crosses at, each cut back to it or carried out to
+    it, and each keeping the side that was clicked. `near_a` and `near_b`
+    are those clicks, which say both which corner is meant, where two
+    curves cross twice, and which piece of each curve to keep.
+
+    Trimming and extending are the same act here, which is why there is
+    only one: a curve's carrier runs on past its ends, so the piece
+    between the crossing and the far end is simply taken from it, whether
+    that is shorter than the curve was or longer.
+    """
+    import numpy as np
+    from OCP.BRep import BRep_Tool
+
+    ea = occ.to_edge(edge_near(edge_a, near_a))
+    eb = occ.to_edge(edge_near(edge_b, near_b))
+    ca = BRep_Tool.Curve_s(ea, 0.0, 0.0)
+    cb = BRep_Tool.Curve_s(eb, 0.0, 0.0)
+    if ca is None or cb is None:
+        raise GeometryError("Those curves have no geometry to corner")
+
+    # Where they cross as drawn; failing that where their carriers would
+    # cross; failing that where they would if each ran on from its end.
+    crossings = (_crossings_in(ea, eb) or _crossings_extended(ca, cb)
+                 or _crossings_by_reaching_on(ea, eb))
+    if not crossings:
+        raise GeometryError("Those curves do not cross, even carried on "
+                            "from their ends")
+    want = (np.asarray(near_a, float) + np.asarray(near_b, float)) * 0.5
+    best = min(crossings, key=lambda p: float(np.linalg.norm(p - want)))
+    return (_with_the_rest(edge_a, ea, _cut_or_reach(ea, ca, best, near_a),
+                           best),
+            _with_the_rest(edge_b, eb, _cut_or_reach(eb, cb, best, near_b),
+                           best))
+
+
+def _crossings_in(edge_a, edge_b) -> list:
+    """Every point two edges cross at, from the kernel's intersector.
+
+    This is asked before the extrema below, because the extrema of the
+    distance between two curves do not reliably find a crossing: the
+    distance there is zero and a minimum, but the search is for points
+    where the shortest link stands square to both curves, and on a
+    spline it walks past the crossing often enough. A line or an arc has
+    too simple a distance function for that to show; a drawn curve does
+    not, which is why filleting one used to be refused.
+    """
+    import numpy as np
+    from OCP.IntTools import IntTools_EdgeEdge
+
+    inter = IntTools_EdgeEdge(edge_a, edge_b)
+    inter.Perform()
+    if not inter.IsDone():
+        return []
+    where = occ.edge_adaptor(edge_a)
+    parts = inter.CommonParts()
+    out = []
+    for i in range(1, parts.Length() + 1):
+        part = parts.Value(i)
+        if part.Type() != occ.VERTEX:
+            continue        # a stretch they run along: no one corner in it
+        p = where.Value(part.VertexParameter1())
+        out.append(np.array([p.X(), p.Y(), p.Z()]))
+    return out
+
+
+def _crossings_extended(curve_a, curve_b) -> list:
+    """Where two curves' carriers cross, past the ends that were drawn.
+
+    What makes a corner out of two lines that stop short of each other:
+    a line's carrier is endless, an arc's goes round, and the crossing
+    is read off those.
+    """
+    import numpy as np
+    from OCP.GeomAPI import GeomAPI_ExtremaCurveCurve
+
+    try:
+        extrema = GeomAPI_ExtremaCurveCurve(curve_a, curve_b)
+        count = extrema.NbExtrema()
+    except Exception:                                   # noqa: BLE001
+        return []           # curves running along each other: no crossing
+    out = []
+    for i in range(1, count + 1):
+        if extrema.Distance(i) > tol():
+            continue                      # they pass each other here
+        p1, p2 = gp_Pnt(), gp_Pnt()
+        extrema.Points(i, p1, p2)
+        out.append(np.array([(p1.X() + p2.X()) / 2, (p1.Y() + p2.Y()) / 2,
+                             (p1.Z() + p2.Z()) / 2]))
+    return out
+
+
+def _crossings_by_reaching_on(edge_a, edge_b) -> list:
+    """Where two curves meet if each runs on from the end facing the other.
+
+    A drawn curve stops where it stops. A line's carrier is endless and
+    an arc's goes round, so two of those are carried out to their corner
+    by geometry alone, but a spline has nothing further to read: two
+    that never touch would have no corner at all. Running on straight,
+    the way the curve was heading, is what the eye expects of them, and
+    the straight run becomes part of what the fillet hands back.
+    """
+    end_a, end_b = nearest_ends(edge_a, edge_b)
+    reach = _reach_for(edge_a, edge_b)
+    ray_a = _end_ray(edge_a, end_a, reach)
+    ray_b = _end_ray(edge_b, end_b, reach)
+    out = []
+    if ray_a is not None:
+        out += _crossings_in(ray_a, edge_b)
+    if ray_b is not None:
+        out += _crossings_in(ray_b, edge_a)
+    if ray_a is not None and ray_b is not None:
+        out += _crossings_in(ray_a, ray_b)
+    return out
+
+
+def _reach_for(edge_a, edge_b) -> float:
+    """How far a curve may be carried on: the size of what is being
+    filleted, so a corner is looked for about the drawing rather than
+    somewhere out of sight."""
+    import numpy as np
+    pts = np.asarray(list(sample_curve(edge_a, 12))
+                     + list(sample_curve(edge_b, 12)), float)
+    return float(np.linalg.norm(pts.max(axis=0) - pts.min(axis=0))) or 1.0
+
+
+def _end_ray(edge, at: Point, reach: float):
+    """A straight edge running on from `at`, the way the curve ends there."""
+    import numpy as np
+    from OCP.gp import gp_Vec
+
+    where = occ.edge_adaptor(edge)
+    u0, u1 = where.FirstParameter(), where.LastParameter()
+    here = np.asarray(at, float)
+    at_start = (np.linalg.norm(_xyz(where.Value(u0)) - here)
+                <= np.linalg.norm(_xyz(where.Value(u1)) - here))
+    p, v = gp_Pnt(), gp_Vec()
+    where.D1(u0 if at_start else u1, p, v)
+    along = np.array([v.X(), v.Y(), v.Z()])
+    length = float(np.linalg.norm(along))
+    if length < 1e-12:
+        return None
+    along = along / length * (-1.0 if at_start else 1.0)   # out, not back
+    return occ.to_edge(make_line(tuple(here), tuple(here + along * reach)))
+
+
+def _xyz(point):
+    """A kernel point as an array."""
+    import numpy as np
+    return np.array([point.X(), point.Y(), point.Z()])
+
+
+def _cut_or_reach(edge, carrier, corner, near: Point):
+    """What the corner leaves of a curve, carried on to it where needed.
+
+    A curve whose own geometry reaches the corner is simply cut there.
+    One whose does not keeps all of itself and gets a straight run to
+    the corner, which is tangent to it, since that is how the corner was
+    found in the first place.
+    """
+    from OCP.GeomAPI import GeomAPI_ProjectPointOnCurve
+
+    import numpy as np
+    proj = GeomAPI_ProjectPointOnCurve(_pnt(corner), carrier)
+    if proj.NbPoints() >= 1 and proj.LowerDistance() <= tol():
+        return _cut_to_corner(edge, carrier, corner, near)
+    at = np.asarray(corner, float)
+    tip = min(_curve_ends(edge),
+              key=lambda p: float(np.linalg.norm(np.asarray(p) - at)))
+    return join_curves([edge, make_line(tip, corner)])
+
+
+def _cut_to_corner(edge, carrier, corner, near: Point):
+    """The piece of `edge`'s carrier from `corner` out past `near`."""
+    from OCP.GeomAPI import GeomAPI_ProjectPointOnCurve
+
+    def _u(point) -> float:
+        proj = GeomAPI_ProjectPointOnCurve(_pnt(point), carrier)
+        if proj.NbPoints() < 1:
+            raise GeometryError("Could not place that point on the curve")
+        return float(proj.LowerDistanceParameter())
+
+    ad = occ.edge_adaptor(edge)
+    u0, u1 = ad.FirstParameter(), ad.LastParameter()
+    u_corner, u_near = _u(corner), _u(near)
+    if carrier.IsPeriodic():
+        # Angles: the piece runs from the corner the way round that the
+        # click lies, as far as the end it meets there.
+        period = carrier.Period()
+        if abs((u1 - u0) - period) < tight():
+            # A closed curve has no end to stop at: the corner is the one
+            # cut in it, and what is kept is everything from there round
+            # to there again. Its seam is not something anyone drew.
+            return BRepBuilderAPI_MakeEdge(carrier, u_corner,
+                                           u_corner + period).Edge()
+        ahead = (u1 - u_corner) % period        # to the end, going forward
+        behind = (u_corner - u0) % period       # to the start, going back
+        if (u_near - u_corner) % period <= ahead:
+            span, a, b = ahead, u_corner, u_corner + ahead
+        else:
+            span, a, b = behind, u_corner - behind, u_corner
+        if span < tight():
+            raise GeometryError("Nothing of that curve is left to keep")
+    else:
+        u_end = u1 if u_near > u_corner else u0
+        a, b = min(u_corner, u_end), max(u_corner, u_end)
+        if b - a < tight():
+            raise GeometryError("Nothing of that curve is left to keep")
+    return BRepBuilderAPI_MakeEdge(carrier, a, b).Edge()
+
+
+def _piece_end_tangent(edge, at_start: bool):
+    """Unit tangent at one end of an edge, pointing into the piece."""
+    import numpy as np
+    ad = occ.edge_adaptor(edge)
+    p = gp_Pnt()
+    v = gp_Vec()
+    u = ad.FirstParameter() if at_start else ad.LastParameter()
+    ad.D1(u, p, v)
+    t = np.array([v.X(), v.Y(), v.Z()], float)
+    n = np.linalg.norm(t)
+    if n < 1e-12:
+        return t
+    t /= n
+    return t if at_start else -t
+
+
+def _arc_parameter_at(edge, point: Point) -> float:
+    """The parameter of `point` (a point on the arc) in the edge's own
+    parameterization — the projector answers modulo the circle's period,
+    so it is brought into the arc's span first."""
+    from OCP.GeomAPI import GeomAPI_ProjectPointOnCurve
+    ad = occ.edge_adaptor(edge)
+    first = ad.FirstParameter()
+    proj = GeomAPI_ProjectPointOnCurve(_pnt(point), ad.Curve().Curve())
+    u = proj.LowerDistanceParameter()
+    while u < first - 1e-12:
+        u += 2 * math.pi
+    while u > first + 2 * math.pi + 1e-12:
+        u -= 2 * math.pi
+    return min(max(u, first), ad.LastParameter())
+
+
+def _trimmed_arc_piece(edge, p_from: Point, p_to: Point,
+                       piece: int, radius: float):
+    """The part of an arc edge running from p_from to p_to in the edge's
+    own direction. A radius that eats the piece backwards is the rounds
+    overlapping, refused with the piece's number."""
+    u_from = _arc_parameter_at(edge, p_from)
+    u_to = _arc_parameter_at(edge, p_to)
+    if u_to <= u_from + 1e-9:
+        raise GeometryError(
+            f"Fillet radius {radius:g} is too large: the rounds overlap "
+            f"on piece {piece + 1} of the polyline")
+    from OCP.Geom import Geom_TrimmedCurve
+    base = occ.edge_adaptor(edge).Curve().Curve()
+    trimmed = Geom_TrimmedCurve(base, u_from, u_to)
+    return BRepBuilderAPI_MakeEdge(trimmed).Edge()
+
+
+def fillet_corners(curve, radius: float) -> TopoDS_Shape:
+    """Round every corner of a polyline in one go — Rhino's
+    FilletCorners. Straight and arc pieces both round; a closed curve
+    comes back closed, an open one keeps its ends, joints that are
+    already smooth are left alone, and a radius that would make two
+    rounds overlap is refused with the piece's number."""
+    import numpy as np
+    from OCP.GeomAbs import GeomAbs_CurveType
+
+    if radius <= 0:
+        raise GeometryError("Fillet radius must be positive")
+    edges = edges_of(curve)
+    line_t = GeomAbs_CurveType.GeomAbs_Line
+    arc_t = GeomAbs_CurveType.GeomAbs_Circle
+    for k, e in enumerate(edges):
+        kind = occ.edge_adaptor(e).GetType()
+        if kind not in (line_t, arc_t):
+            raise GeometryError(
+                "filletcorners rounds straight and arc pieces — piece "
+                f"{k + 1} is neither")
+    closed = is_closed_curve(curve)
+    n = len(edges)
+    ends = [curve_endpoints(e) for e in edges]
+    corner_at = {}             # joint k (between k, k+1) -> (ta, arc, tb)
+
+    for k in range(n if closed else n - 1):
+        j2 = (k + 1) % n
+        a_start, a_end = ends[k]
+        b_start, b_end = ends[j2]
+        # the corner is whichever pairing of the pieces' ends sits closest;
+        # which end each pairing uses is carried, not compared — the joined
+        # ends can differ by a hair that == would call different
+        best = None
+        for a_at_start in (True, False):
+            p = a_start if a_at_start else a_end
+            for b_at_start in (True, False):
+                q = b_start if b_at_start else b_end
+                d2 = sum((x - y) ** 2 for x, y in zip(p, q))
+                if best is None or d2 < best[0]:
+                    best = (d2, p, a_at_start, b_at_start)
+        d2, near, a_at_start, b_at_start = best
+        if d2 > tol() ** 2:
+            continue                     # the pieces do not touch here
+        din = _piece_end_tangent(edges[k], at_start=a_at_start)
+        dout = _piece_end_tangent(edges[j2], at_start=b_at_start)
+        dot = float(np.dot(din, dout))
+        if dot < -1 + 1e-9 or dot > 1 - 1e-9:
+            continue                     # already smooth: nothing to round
+        theta = math.acos(max(-1.0, min(1.0, dot)))
+        if radius / math.tan(theta / 2) < tol():
+            continue                     # corner too shallow to notice
+        try:
+            corner_at[k] = fillet_curves(edges[k], edges[j2], radius, near)
+        except GeometryError as exc:
+            raise GeometryError(
+                f"Fillet radius {radius:g} is too large at the joint "
+                f"after piece {k + 1}: {exc}")
+
+    # each piece runs from the previous corner's exit to this corner's
+    # entry; a radius that eats a whole piece is refused, with its number
+    out = []
+    for j in range(n):
+        prev = (j - 1) % n
+        entry = corner_at[j][0] if j in corner_at else None
+        exit_ = (corner_at[prev][2]
+                 if (closed or j > 0) and prev in corner_at else None)
+        if entry is None and exit_ is None:
+            out.append(edges[j])         # untouched piece, kept as built
+        elif entry is not None and exit_ is None:
+            out.append(entry)            # already trimmed at its end
+        elif exit_ is not None and entry is None:
+            out.append(exit_)            # already trimmed at its start
+        else:
+            p_from = curve_endpoints(exit_)[0]
+            p_to = curve_endpoints(entry)[1]
+            if occ.edge_adaptor(edges[j]).GetType() == line_t:
+                run = np.array(p_to, float) - np.array(p_from, float)
+                old = np.array(ends[j][1], float) - np.array(ends[j][0], float)
+                if float(np.dot(run, old)) <= 0:
+                    raise GeometryError(
+                        f"Fillet radius {radius:g} is too large: the rounds "
+                        f"overlap on piece {j + 1} of the polyline")
+                out.append(make_line(tuple(p_from), tuple(p_to)))
+            else:
+                out.append(_trimmed_arc_piece(edges[j], tuple(p_from),
+                                              tuple(p_to), j, radius))
+        if j in corner_at:
+            out.append(corner_at[j][1])
+    return join_curves(out)
+
+
+def edge_chain(shape, edge_index: int, angle_tol_deg: float = 20.0) -> list:
+    """Indices of edges forming a tangent-continuous chain with the given
+    edge (shared vertices with aligned tangents)."""
+    import numpy as np
+    edges = edges_of(shape)
+    if not (0 <= edge_index < len(edges)):
+        raise GeometryError("Edge index out of range")
+
+    def end_data(edge):
+        ad = occ.edge_adaptor(edge)
+        out = []
+        for t in (ad.FirstParameter(), ad.LastParameter()):
+            p = gp_Pnt()
+            v = gp_Vec()
+            ad.D1(t, p, v)
+            tv = np.array([v.X(), v.Y(), v.Z()])
+            n = np.linalg.norm(tv)
+            out.append((np.array([p.X(), p.Y(), p.Z()]),
+                        tv / n if n > 1e-12 else tv))
+        return out
+
+    data = [end_data(e) for e in edges]
+    cos_tol = math.cos(math.radians(angle_tol_deg))
+    chain = {edge_index}
+    grew = True
+    while grew:
+        grew = False
+        for i in chain.copy():
+            for j in range(len(edges)):
+                if j in chain:
+                    continue
+                for (pi, ti) in data[i]:
+                    for (pj, tj) in data[j]:
+                        if (np.linalg.norm(pi - pj) < tol()
+                                and abs(float(np.dot(ti, tj))) > cos_tol):
+                            chain.add(j)
+                            grew = True
+    return sorted(chain)
+
+
+def _straight_law_points(law: list, steps: int = 8) -> list:
+    """A variable law's points redone as a dense polyline, so the
+    kernel's interpolation between them runs straight from radius to
+    radius instead of swinging through them."""
+    out = []
+    for (u1, r1), (u2, r2) in zip(law, law[1:]):
+        for k in range(steps):
+            t = k / steps
+            out.append((u1 + t * (u2 - u1), r1 + t * (r2 - r1)))
+    out.append(law[-1])
+    return out
+
+
+def fillet_edges(shape, radius=None, edges: list | None = None,
+                 chamfer: bool = False, radii: list | None = None,
+                 transition: str = "smooth") -> TopoDS_Shape:
+    """Fillet (or chamfer) edges of a solid. edges=None means all edges.
+
+    `radius` shapes the profile:
+
+    - a single value: constant fillet, or one chamfer distance;
+    - (r_start, r_end): a radius varying linearly along each tangent
+      chain the picked edges form;
+    - a list of (u, r) pairs with u running 0 to 1 along that chain: a
+      variable fillet interpolating the radii through the given points,
+      as many of them as the shape deserves.
+
+    `radii` instead gives one constant size per picked edge, matched to
+    `edges` in order — SolidWorks' constant fillets let neighbouring
+    edges take different sizes, and so does this. Where picked edges
+    merge into one tangent chain, the last of their radii rules it.
+
+    The kernel extends each picked edge along its tangent neighbours into
+    one contour, and a variable profile spans the whole contour — the way
+    SolidWorks sweeps a variable-radius fillet over a smooth chain.
+    `transition` says how such a profile runs between its points:
+    "smooth" (the kernel's own interpolation, the default) or "straight"
+    (radius to radius on a line) — SolidWorks' two transition types.
+    A law point may take a zero radius where it ends the law — that
+    reaches radii a constant fillet cannot fit, the way SolidWorks'
+    variable fillet tapers to nothing at a chain's end. Variable profiles
+    are fillet-only: a chamfer takes a single distance, or one per edge.
+
+    The blend refuses to hand back a solid that fails its own checks: if
+    the kernel builds but the result is broken, that is reported like any
+    other failure, never returned. An invalid input gets one repair pass
+    (ShapeFix) and the blend is retried on the repaired shape before the
+    failure is reported.
+    """
+    r_pair = None
+    law = None
+    if isinstance(radius, (tuple, list)) and not (
+            len(radius) > 0 and isinstance(radius[0], (tuple, list))):
+        if len(radius) != 2:
+            raise GeometryError(
+                "A linear variable fillet takes (r_start, r_end); a "
+                "multi-point one takes (u, r) pairs")
+        r_pair = (float(radius[0]), float(radius[1]))
+        if min(r_pair) <= 0:
+            raise GeometryError("Radii must be positive")
+    elif isinstance(radius, (tuple, list)):
+        law = [(float(u), float(r)) for u, r in radius]
+        if len(law) < 2:
+            raise GeometryError("A variable fillet needs at least two "
+                                "(u, radius) points")
+        if any(not 0.0 <= u <= 1.0 for u, _ in law):
+            raise GeometryError("Variable-fillet positions (u) run from "
+                                "0 to 1 along the chain")
+        if any(r < 0 for _, r in law):
+            raise GeometryError("Radii cannot be negative")
+        law.sort(key=lambda point: point[0])
+        if any(r <= 0 for _, r in law[1:-1]) or (law[0][1] <= 0
+                                                 and law[-1][1] <= 0):
+            raise GeometryError(
+                "A zero radius may end a variable law but not fill it — "
+                "interior points need a positive radius, and at least "
+                "one end must stay positive too")
+    elif radius is not None and radius <= 0:
+        raise GeometryError("Radius must be positive")
+    if radii is not None:
+        if edges is None or len(edges) != len(radii):
+            raise GeometryError(
+                "radii needs exactly one radius per picked edge")
+        if any(r is None or r <= 0 for r in radii):
+            raise GeometryError("Radii must be positive")
+        if radius is None:
+            radius = 0.0
+    elif radius is None:
+        raise GeometryError("A fillet needs a radius, or radii per edge")
+    if chamfer and (r_pair is not None or law is not None):
+        raise GeometryError("A chamfer takes a single distance — variable "
+                            "profiles are fillet-only")
+    if radii is not None and (r_pair is not None or law is not None):
+        raise GeometryError(
+            "Give either radii per edge, or a variable profile — not both")
+    transition = str(transition).lower()
+    if transition not in ("smooth", "straight"):
+        raise GeometryError(
+            "A variable fillet's transition is 'smooth' or 'straight'")
+    verb = "Chamfer" if chamfer else "Fillet"
+    try:
+        return _fillet_edges_build(shape, radius, radii, r_pair, law, edges,
+                                   chamfer, transition, verb)
+    except _FilletBuildError as err:
+        # an invalid input can make the blend fail or come out broken;
+        # one repair pass and a rebuild before the failure stands. The
+        # picked edges are handles into the ORIGINAL shape; a repair that
+        # rebuilt the topology renames them, so they are re-resolved onto
+        # the repaired solid — and when no honest stand-in exists, the
+        # retry is skipped rather than fed edges it does not own.
+        repaired = _repaired_input(shape)
+        if repaired is not None:
+            fixed_edges = (None if edges is None
+                           else _edges_on_repaired(repaired, edges))
+            if edges is None or fixed_edges is not None:
+                try:
+                    return _fillet_edges_build(repaired, radius, radii,
+                                               r_pair, law, fixed_edges,
+                                               chamfer, transition, verb)
+                except _FilletBuildError:
+                    pass  # the original failure is the honest one to report
+        raise err.as_geometry_error()
+
+
+def _repaired_input(shape):
+    """ShapeFix over `shape` when it fails its own checks, or None when
+    the input is fine (the common case — callers skip this cheaply) or
+    cannot be repaired."""
+    try:
+        if is_valid(shape):
+            return None
+        from OCP.ShapeFix import ShapeFix_Shape
+        sf = ShapeFix_Shape(shape)
+        sf.Perform()
+        fixed = sf.Shape()
+    except Exception:
+        return None
+    return fixed if is_valid(fixed) else None
+
+
+def _edges_on_repaired(repaired, edges):
+    """The repaired shape's edges standing in for picked edges of the
+    original — matched by endpoints (either way round) within tol(), the
+    closest length breaking a tie — or None when the repair rebuilt the
+    wire layout and some edge has no honest stand-in."""
+    candidates = edges_of(repaired)
+    out = []
+    used = set()
+    for e in edges:
+        p, q = curve_endpoints(e)
+        want = curve_length(e)
+        best = None
+        for k, c in enumerate(candidates):
+            if k in used:
+                continue
+            c0, c1 = curve_endpoints(c)
+            same = ((sum((a - b) ** 2 for a, b in zip(c0, p)) <= tol() ** 2
+                     and sum((a - b) ** 2 for a, b in zip(c1, q)) <= tol() ** 2)
+                    or (sum((a - b) ** 2 for a, b in zip(c0, q)) <= tol() ** 2
+                        and sum((a - b) ** 2 for a, b in zip(c1, p)) <= tol() ** 2))
+            if not same:
+                continue
+            gap = abs(curve_length(c) - want)
+            if best is None or gap < best[0]:
+                best = (gap, k)
+        if best is None:
+            return None
+        k = best[1]
+        used.add(k)
+        out.append(candidates[k])
+    return out
+
+
+class _FilletBuildError(Exception):
+    """A failed or broken blend build, carrying the kernel's blame."""
+
+    def __init__(self, text, blamed):
+        super().__init__(text)
+        self.text = text
+        self.blamed = blamed
+
+    def as_geometry_error(self):
+        err = GeometryError(self.text)
+        err.blamed = self.blamed
+        return err
+
+
+def _fillet_edges_build(shape, radius, radii, r_pair, law, edges, chamfer,
+                        transition, verb):
+    """One blend attempt with the requested profile, validated before it
+    is returned. Raises _FilletBuildError when the kernel fails or the
+    built shape would not pass its own checks."""
+    if chamfer:
+        from OCP.BRepFilletAPI import BRepFilletAPI_MakeChamfer
+        mk = BRepFilletAPI_MakeChamfer(shape)
+    else:
+        from OCP.BRepFilletAPI import BRepFilletAPI_MakeFillet
+        mk = BRepFilletAPI_MakeFillet(shape)
+    targets = edges if edges is not None else edges_of(shape)
+    if not targets:
+        raise GeometryError("No edges to fillet")
+    from OCP.Standard import Standard_Failure
+    failure = (f"{verb} failed — the radius or distance may be too large "
+               "for the smallest edges; try a smaller value")
+    try:
+        if r_pair is None and law is None:
+            if radii is not None:
+                for e, r in zip(targets, radii):
+                    mk.Add(float(r), e)
+            else:
+                for e in targets:
+                    mk.Add(float(radius), e)
+        else:
+            # add bare, then give every contour the profile: the law spans
+            # the chain rather than each piece of it
+            for e in targets:
+                mk.Add(e)
+            from OCP.TColgp import TColgp_Array1OfPnt2d
+            from OCP.gp import gp_Pnt2d
+            if r_pair is not None:
+                for ic in range(1, mk.NbContours() + 1):
+                    mk.SetRadius(r_pair[0], r_pair[1], ic, 1)
+            else:
+                points = (_straight_law_points(law) if transition == "straight"
+                          else law)
+                arr = TColgp_Array1OfPnt2d(1, len(points))
+                for i, (u, r) in enumerate(points, start=1):
+                    arr.SetValue(i, gp_Pnt2d(u, r))
+                for ic in range(1, mk.NbContours() + 1):
+                    mk.SetRadius(arr, ic, 1)
+        if mk.NbContours() == 0:
+            raise GeometryError(
+                f"No sharp edges to {verb.lower()} — pick an edge where "
+                "faces meet at a corner. Existing rounded edges cannot "
+                "be resized with this tool.")
+        mk.Build()
+    except Standard_Failure as exc:
+        text, blamed = _fillet_failure(verb, failure, mk, targets)
+        raise _FilletBuildError(text, blamed) from exc
+    if not mk.IsDone() or mk.Shape().IsNull():
+        text, blamed = _fillet_failure(verb, failure, mk, targets)
+        raise _FilletBuildError(text, blamed)
+    result = unwrap_compound(mk.Shape())
+    if not is_valid(result):
+        raise _FilletBuildError(
+            f"{verb} built a shape that fails its own solid checks — the "
+            "radius collapses the narrow faces it runs against; try a "
+            "smaller value", [])
+    return result
+
+
+def _blamed_targets(mk, targets) -> tuple[int, str | None, list[int]]:
+    """(count, verdict, blamed indexes into targets): what the kernel
+    blamed after a failed fillet build. StartsolFailure is the kernel's
+    own verdict that a chain cannot even begin — the radius is too big
+    for it; TwistedSurface and WalkingFailure name the other two ways a
+    blend can die partway."""
+    from OCP.ChFiDS import ChFiDS_ErrorStatus
+    try:
+        n = mk.NbFaultyContours()
+    except Exception:
+        return 0, None, []
+    if n <= 0:
+        return 0, None, []
+    statuses = []
+    blamed = set()
+    for i in range(1, n + 1):
+        try:
+            ic = mk.FaultyContour(i)
+            statuses.append(mk.StripeStatus(ic))
+            for j in range(1, mk.NbEdges(ic) + 1):
+                e = mk.Edge(ic, j)
+                for k, t in enumerate(targets):
+                    if t.IsSame(e):
+                        blamed.add(k)
+        except Exception:
+            continue
+    verdict = None
+    if statuses and all(s == ChFiDS_ErrorStatus.ChFiDS_StartsolFailure
+                        for s in statuses):
+        verdict = "start"
+    elif statuses and all(s == ChFiDS_ErrorStatus.ChFiDS_TwistedSurface
+                          for s in statuses):
+        verdict = "twisted"
+    elif statuses and all(s == ChFiDS_ErrorStatus.ChFiDS_WalkingFailure
+                          for s in statuses):
+        verdict = "walking"
+    return n, verdict, sorted(blamed)
+
+
+def _fillet_failure(verb: str, failure: str, mk,
+                    targets) -> tuple[str, list[int]]:
+    """The generic failure line sharpened by what the kernel blamed, with
+    the blamed edges' indexes for the caller to highlight."""
+    n, verdict, blamed = _blamed_targets(mk, targets)
+    if n and verdict == "start":
+        text = (f"{verb} failed — the radius is too big for {n} of the "
+                "picked chains, none of them could even start; try a "
+                "smaller value")
+    elif n and verdict == "twisted":
+        text = (f"{verb} failed — the blend's surface twists along {n} of "
+                "the picked chains, usually where the faces meet at a "
+                "shallow angle; try a slightly different radius")
+    elif n and verdict == "walking":
+        text = (f"{verb} failed — the blend could not walk along {n} of "
+                "the picked chains; the radius is likely too large for "
+                "the faces it must cross")
+    elif n:
+        text = f"{verb} failed — {n} of the picked chains failed the blend"
+    else:
+        text = failure
+    return text, blamed
+
+
+def largest_fillet_radius(shape, radius, edges: list | None = None,
+                          chamfer: bool = False, tries: int = 9):
+    """The largest radius not greater than the requested one that the
+    kernel actually builds, or None when even a hair-thin one fails.
+
+    Bisects fillet_edges, so it costs a build per step: call it where a
+    fillet already failed, never speculatively."""
+    hi = float(radius)
+
+    def builds(r):
+        try:
+            fillet_edges(shape, r, edges=edges, chamfer=chamfer)
+            return True
+        except GeometryError:
+            return False
+
+    if builds(hi):
+        return hi
+    lo = 0.0
+    for _ in range(tries):
+        mid = 0.5 * (lo + hi)
+        if mid <= 0:
+            break
+        if builds(mid):
+            lo = mid
+        else:
+            hi = mid
+        if hi - lo <= max(1e-5, hi * 1e-3):
+            break
+    return lo if lo > 0 else None
+
+
+def face_normal(face) -> Point:
+    """Outward normal of a (near-)planar face, respecting orientation."""
+    from OCP.BRepAdaptor import BRepAdaptor_Surface
+    from OCP.GeomAbs import GeomAbs_SurfaceType
+    from OCP.TopAbs import TopAbs_Orientation
+    surf = BRepAdaptor_Surface(face)
+    if surf.GetType() != GeomAbs_SurfaceType.GeomAbs_Plane:
+        raise GeometryError("Face is not planar")
+    d = surf.Plane().Axis().Direction()
+    n = (d.X(), d.Y(), d.Z())
+    if face.Orientation() == TopAbs_Orientation.TopAbs_REVERSED:
+        n = (-n[0], -n[1], -n[2])
+    return n
+
+
+def flat_normal(shape) -> Point | None:
+    """The one normal all faces of `shape` share if they lie in one plane,
+    whatever kind of surface carries them, else None."""
+    from OCP.BRep import BRep_Tool
+    from OCP.GeomLib import GeomLib_IsPlanarSurface
+    from OCP.TopAbs import TopAbs_Orientation
+    normal = None
+    for face in faces_of(shape):
+        check = GeomLib_IsPlanarSurface(BRep_Tool.Surface_s(face), tol())
+        if not check.IsPlanar():
+            return None
+        d = check.Plan().Axis().Direction()
+        n = (d.X(), d.Y(), d.Z())
+        if face.Orientation() == TopAbs_Orientation.TopAbs_REVERSED:
+            n = (-n[0], -n[1], -n[2])
+        if normal is None:
+            normal = n
+        elif abs(abs(sum(a * b for a, b in zip(n, normal))) - 1.0) > 1e-9:
+            return None
+    return normal
+
+
+def face_point_normal(face):
+    """A representative surface point and outward unit normal on `face`,
+    sampled at its mid-parameter — works for curved faces too (where the
+    area centroid can fall off the surface, e.g. a full cylinder wall).
+    Returns (point, normal) as 3-tuples; normal follows the face
+    orientation (outward on a solid)."""
+    from OCP.BRepAdaptor import BRepAdaptor_Surface
+    from OCP.BRepLProp import BRepLProp_SLProps
+    from OCP.TopAbs import TopAbs_Orientation
+    surf = BRepAdaptor_Surface(face)
+    u = 0.5 * (surf.FirstUParameter() + surf.LastUParameter())
+    v = 0.5 * (surf.FirstVParameter() + surf.LastVParameter())
+    props = BRepLProp_SLProps(surf, u, v, 1, 1e-7)
+    if not props.IsNormalDefined():
+        raise GeometryError("No surface normal at the sample point")
+    p, n = props.Value(), props.Normal()
+    normal = (n.X(), n.Y(), n.Z())
+    if face.Orientation() == TopAbs_Orientation.TopAbs_REVERSED:
+        normal = (-normal[0], -normal[1], -normal[2])
+    return (p.X(), p.Y(), p.Z()), normal
+
+
+def push_pull(shape, face_index: int, distance: float) -> TopoDS_Shape:
+    """SketchUp-style push/pull: extrude a planar face of a solid outward
+    (positive) or carve it inward (negative)."""
+    faces = faces_of(shape)
+    if not (0 <= face_index < len(faces)):
+        raise GeometryError("Face index out of range")
+    face = faces[face_index]
+    n = face_normal(face)
+    if abs(distance) < tight():
+        raise GeometryError("Distance is zero")
+    d = float(distance)
+    vec = gp_Vec(n[0], n[1], n[2]).Multiplied(abs(d))
+    if d < 0:
+        vec = gp_Vec(-n[0], -n[1], -n[2]).Multiplied(abs(d))
+    prism = BRepPrimAPI_MakePrism(face, vec).Shape()
+    if d > 0:
+        result = boolean_union(shape, prism)
+    else:
+        result = boolean_difference(shape, prism)
+    return unwrap_compound(result)
+
+
+def offset_faces(shape, offsets: dict) -> TopoDS_Shape:
+    """Offset one or more faces of a solid at once, each along its own
+    surface normal by its own distance (positive grows the solid). Adjacent
+    faces extend (sharp) to meet the moved faces; planar and curved faces,
+    and any mix, are handled together. `offsets` maps face_index ->
+    distance — e.g. push a cylinder wall to change its radius, or grow a
+    slab from both faces at once."""
+    from OCP.BRepCheck import BRepCheck_Analyzer
+    from OCP.BRepOffset import BRepOffset_MakeOffset, BRepOffset_Mode
+    from OCP.GeomAbs import GeomAbs_JoinType
+    # A boolean hands its solid back in a compound, which the kernel takes
+    # for loose faces and offsets into a shell (#160).
+    shape = unwrap_compound(shape)
+    faces = faces_of(shape)
+    if not offsets:
+        raise GeometryError("No faces to offset")
+    for idx, dist in offsets.items():
+        if not (0 <= idx < len(faces)):
+            raise GeometryError("Face index out of range")
+        if abs(float(dist)) < tight():
+            raise GeometryError("Distance is zero")
+    # The kernel faults on these rather than failing, and a fault takes
+    # the whole app with it (#160), so they never reach it.
+    if any(_closes_to_a_point(f) for f in faces):
+        raise GeometryError("A face here closes to a point, where it has no "
+                            "normal, so it cannot be offset")
+    mko = BRepOffset_MakeOffset()
+    mko.Initialize(shape, 0.0, tol(), BRepOffset_Mode.BRepOffset_Skin,
+                   True, False, GeomAbs_JoinType.GeomAbs_Intersection,
+                   False, False)
+    for idx, dist in offsets.items():
+        mko.SetOffsetOnFace(faces[idx], float(dist))
+    try:
+        mko.MakeOffsetShape()
+    except Exception as exc:                 # noqa: BLE001
+        raise GeometryError("Face offset failed") from exc
+    out = mko.Shape()
+    if not mko.IsDone() or out is None or out.IsNull():
+        raise GeometryError("Face offset failed — a distance is probably too "
+                            "large for its face")
+    out = unwrap_compound(out)
+    if abs(volume(out)) < tight() or not BRepCheck_Analyzer(out).IsValid():
+        raise GeometryError("Face offset produced an invalid solid")
+    # One piece in, pieces out: the faces beside ran past each other and
+    # the kernel kept what it could, scattered far beyond the shape (#160).
+    if out.ShapeType() == occ.COMPOUND and shape.ShapeType() != occ.COMPOUND:
+        raise GeometryError("Face offset broke the shape apart, so the "
+                            "distance is probably too large")
+    return out
+
+
+def _closes_to_a_point(face) -> bool:
+    """A freeform face with one side shrunk to a point, the way EdgeSrf
+    makes a triangle. It has no normal at that point, and the offset
+    kernel faults there instead of failing."""
+    from OCP.BRep import BRep_Tool
+    from OCP.BRepAdaptor import BRepAdaptor_Surface
+    from OCP.GeomAbs import GeomAbs_SurfaceType
+    if BRepAdaptor_Surface(face).GetType() not in (
+            GeomAbs_SurfaceType.GeomAbs_BSplineSurface,
+            GeomAbs_SurfaceType.GeomAbs_BezierSurface):
+        return False
+    return any(BRep_Tool.Degenerated_s(e) for e in edges_of(face))
+
+
+def _walls_stand_square(shape, face, normal) -> bool:
+    """Whether every face beside a planar `face` stands square to it all
+    along their shared edge, so that moving the face along `normal` only
+    lengthens or shortens them."""
+    from OCP.BRepAdaptor import BRepAdaptor_Curve2d, BRepAdaptor_Surface
+    from OCP.BRepLProp import BRepLProp_SLProps
+    from OCP.TopExp import TopExp
+    from OCP.TopTools import TopTools_IndexedDataMapOfShapeListOfShape
+    amap = TopTools_IndexedDataMapOfShapeListOfShape()
+    TopExp.MapShapesAndAncestors_s(shape, occ.EDGE, occ.FACE, amap)
+    for edge in edges_of(face):
+        beside = [f for f in amap.FindFromKey(edge) if not f.IsSame(face)]
+        if len(beside) != 1:
+            return False
+        other = occ.to_face(beside[0])
+        on_other = BRepAdaptor_Curve2d(edge, other)
+        surface = BRepAdaptor_Surface(other)
+        t0, t1 = on_other.FirstParameter(), on_other.LastParameter()
+        for s in (0.1, 0.5, 0.9):
+            uv = on_other.Value(t0 + s * (t1 - t0))
+            props = BRepLProp_SLProps(surface, uv.X(), uv.Y(), 1, tight())
+            if not props.IsNormalDefined():
+                return False
+            n = props.Normal()
+            if abs(n.X() * normal[0] + n.Y() * normal[1]
+                   + n.Z() * normal[2]) > 1e-6:
+                return False
+    return True
+
+
+def offset_face(shape, face_index: int, distance: float) -> TopoDS_Shape:
+    """Move one face along its surface normal.
+
+    A planar face is carried rigidly while its neighbours lean to keep hold
+    of its translated outline.  Curved faces retain the surface-offset
+    behaviour used to grow, for example, a cylinder's wall.
+    """
+    faces = faces_of(shape)
+    if not (0 <= face_index < len(faces)):
+        raise GeometryError("Face index out of range")
+    d = float(distance)
+    if abs(d) < tight():
+        raise GeometryError("Distance is zero")
+    try:
+        normal, point = _planar_frame(faces[face_index])
+    except GeometryError:
+        return offset_faces(shape, {face_index: d})
+
+    delta = tuple(v * d for v in normal)
+    try:
+        adapted = _refit_outline(
+            shape, face_index,
+            lambda p: tuple(p[k] + delta[k] for k in range(3)))
+    except GeometryError:
+        # An outline with a curve in it, a hole say, among walls that all
+        # stand square: they need only lengthen or shorten, which is a push
+        # or a pull. The kernel's offset can fault on these (#160).
+        from OCP.GeomAbs import GeomAbs_CurveType
+        if (any(occ.edge_adaptor(occ.to_edge(e)).GetType()
+                != GeomAbs_CurveType.GeomAbs_Line
+                for e in edges_of(faces[face_index]))
+                and _walls_stand_square(shape, faces[face_index], normal)):
+            return push_pull(shape, face_index, d)
+        return offset_faces(shape, {face_index: d})
+    held = _face_on_plane(adapted, normal, point, near=point)
+    adapted_faces = faces_of(adapted)
+    held_index = next((i for i, face in enumerate(adapted_faces)
+                       if face.IsSame(held)), None)
+    if held_index is None:
+        raise GeometryError("The moved face has gone")
+    return offset_faces(adapted, {held_index: d})
+
+
+def _planar_frame(face):
+    """(unit normal, a point on the face) for a planar face, oriented
+    outward; GeometryError for anything curved."""
+    n = face_normal(face)
+    length = math.sqrt(n[0] ** 2 + n[1] ** 2 + n[2] ** 2)
+    if length < tight():
+        raise GeometryError("Face has no normal")
+    n = (n[0] / length, n[1] / length, n[2] / length)
+    return n, centroid(face)
+
+
+def _draft(shape, face, hinge_point, hinge_dir, new_normal):
+    """`face` turned about the line (hinge_point, hinge_dir), which lies in
+    it, until its normal is `new_normal`; the faces beside it extend or
+    trim to meet it. The kernel's draft-angle operation, which is exactly
+    this with the words changed: the neutral plane is the one through the
+    hinge that stands square to the face, and the draft direction is the
+    way the normal leans.
+
+    Returns (result, the face's new index)."""
+    from OCP.BRepCheck import BRepCheck_Analyzer
+    from OCP.BRepOffsetAPI import BRepOffsetAPI_DraftAngle
+    from OCP.gp import gp_Pln
+    n, _ = _planar_frame(face)
+    n2 = tuple(float(v) for v in new_normal)
+    cosang = max(-1.0, min(1.0, sum(a * b for a, b in zip(n, n2))))
+    angle = math.acos(cosang)
+    if angle < 1e-9:
+        raise GeometryError("Distance is zero")
+    # which way the normal leans, within the face's own plane
+    lean = tuple(n2[k] - cosang * n[k] for k in range(3))
+    ll = math.sqrt(sum(v * v for v in lean))
+    if ll < tight():
+        raise GeometryError("The face would be turned right over")
+    lean = tuple(v / ll for v in lean)
+    a = hinge_dir
+    neutral_n = (n[1] * a[2] - n[2] * a[1], n[2] * a[0] - n[0] * a[2],
+                 n[0] * a[1] - n[1] * a[0])
+    da = BRepOffsetAPI_DraftAngle(shape)
+    try:
+        da.Add(face, _dir(lean), angle, gp_Pln(_pnt(hinge_point),
+                                              _dir(neutral_n)))
+        da.Build()
+    except Exception as exc:                 # noqa: BLE001
+        raise GeometryError("The face cannot be turned that way") from exc
+    if not da.IsDone() or da.Shape().IsNull():
+        raise GeometryError("Turning the face that far breaks the solid")
+    out = unwrap_compound(da.Shape())
+    if abs(volume(out)) < tight() or not BRepCheck_Analyzer(out).IsValid():
+        raise GeometryError("Turning the face that far breaks the solid")
+    moved = da.ModifiedShape(face)
+    idx = next((i for i, f in enumerate(faces_of(out)) if f.IsSame(moved)),
+               None)
+    return out, idx
+
+
+def _rotated(v, axis, degrees):
+    """`v` turned about `axis` (unit) by `degrees`: Rodrigues, in tuples."""
+    k = axis
+    c, s = math.cos(math.radians(degrees)), math.sin(math.radians(degrees))
+    kv = (k[1] * v[2] - k[2] * v[1], k[2] * v[0] - k[0] * v[2],
+          k[0] * v[1] - k[1] * v[0])
+    kd = k[0] * v[0] + k[1] * v[1] + k[2] * v[2]
+    return tuple(v[i] * c + kv[i] * s + k[i] * kd * (1 - c) for i in range(3))
+
+
+def _rotate_face_rigidly(shape, face_index, pivot, axis, degrees):
+    """Rotate one polygonal face and carry its incident vertices with it.
+
+    Faces touching the held face are rebuilt from their updated boundary;
+    this lets a side become a single ruled patch when its fixed far edge and
+    rotated near edge are skew.  Faces outside that one-ring stay intact.
+    """
+    from OCP.BRepCheck import (
+        BRepCheck_Analyzer, BRepCheck_Shell, BRepCheck_Status,
+    )
+    from OCP.BRepTools import BRepTools, BRepTools_WireExplorer
+    from OCP.GeomAbs import GeomAbs_CurveType
+    from .occ import BRepBuilderAPI_MakeSolid, BRepBuilderAPI_Sewing
+
+    faces = faces_of(shape)
+    held = faces[face_index]
+    held_vertices = []
+    exp = TopExp_Explorer(held, occ.VERTEX)
+    while exp.More():
+        vertex = occ.to_vertex(exp.Current())
+        if not any(vertex.IsSame(other) for other in held_vertices):
+            held_vertices.append(vertex)
+        exp.Next()
+
+    def is_held(vertex):
+        return any(vertex.IsSame(other) for other in held_vertices)
+
+    def turned_point(value):
+        relative = tuple(value[k] - pivot[k] for k in range(3))
+        turned = _rotated(relative, axis, degrees)
+        return tuple(pivot[k] + turned[k] for k in range(3))
+
+    rebuilt = []
+    for face in faces:
+        if face.IsSame(held):
+            rebuilt.append(rotate(face, pivot, axis, degrees))
+            continue
+        outer = BRepTools.OuterWire_s(face)
+        walk = BRepTools_WireExplorer(outer)
+        points, edges, touches = [], [], False
+        while walk.More():
+            edge = occ.to_edge(walk.Current())
+            vertex = occ.to_vertex(walk.CurrentVertex())
+            point = pnt_tuple(occ.point_of_vertex(vertex))
+            on_held = is_held(vertex)
+            points.append(turned_point(point) if on_held else point)
+            edges.append(edge)
+            touches = touches or on_held
+            walk.Next()
+        if not touches:
+            rebuilt.append(face)
+            continue
+        wires = []
+        wire_exp = TopExp_Explorer(face, occ.WIRE)
+        while wire_exp.More():
+            wires.append(occ.to_wire(wire_exp.Current()))
+            wire_exp.Next()
+        if len(wires) != 1 or len(points) < 3:
+            raise GeometryError("A face beside this one cannot be rebuilt")
+        if any(occ.edge_adaptor(edge).GetType()
+               != GeomAbs_CurveType.GeomAbs_Line for edge in edges):
+            raise GeometryError("A curved face beside this one cannot adapt")
+        boundary = make_polyline(points, closed=True)
+        try:
+            new_face = planar_face(boundary)
+        except GeometryError:
+            if len(points) != 4:
+                new_face = patch_surface([boundary])
+            else:
+                from OCP.Geom import Geom_BezierSurface
+                from OCP.TColgp import TColgp_Array2OfPnt
+                poles = TColgp_Array2OfPnt(1, 2, 1, 2)
+                poles.SetValue(1, 1, _pnt(points[0]))
+                poles.SetValue(2, 1, _pnt(points[1]))
+                poles.SetValue(2, 2, _pnt(points[2]))
+                poles.SetValue(1, 2, _pnt(points[3]))
+                new_face = BRepBuilderAPI_MakeFace(
+                    Geom_BezierSurface(poles), tight()).Face()
+        new_face = occ.to_face(new_face)
+        before_n = face_point_normal(face)[1]
+        after_n = face_point_normal(new_face)[1]
+        if sum(a * b for a, b in zip(before_n, after_n)) < 0:
+            new_face = occ.to_face(new_face.Reversed())
+        rebuilt.append(new_face)
+
+    sew = BRepBuilderAPI_Sewing(tight())
+    for face in rebuilt:
+        sew.Add(face)
+    sew.Perform()
+    sewn = sew.SewedShape()
+    if sewn is None or sewn.IsNull() or sewn.ShapeType() != occ.SHELL:
+        raise GeometryError("Rotating the face did not leave one shell")
+    shell = occ.to_shell(sewn)
+    if BRepCheck_Shell(shell).Closed() \
+            != BRepCheck_Status.BRepCheck_NoError:
+        raise GeometryError("Rotating the face left an open shell")
+    solid_mk = BRepBuilderAPI_MakeSolid(shell)
+    if not solid_mk.IsDone():
+        raise GeometryError("The rotated shell could not become a solid")
+    out = solid_mk.Solid()
+    if (shape_kind(out) != "solid" or len(faces_of(out)) != len(faces)
+            or not BRepCheck_Analyzer(out).IsValid()):
+        raise GeometryError("Rotating the face did not leave a closed solid")
+    return out
+
+
+def tilt_face(shape, face_index: int, point: Point, axis: Point,
+              degrees: float) -> TopoDS_Shape:
+    """Turn a planar face of a solid about the line through `point` along
+    `axis`, which must lie in the face.  Its outline turns rigidly and the
+    faces beside it adapt to keep hold of those edges.  A draft angle, a lid
+    propped open, a wall leaned back: all this."""
+    faces = faces_of(shape)
+    if not (0 <= face_index < len(faces)):
+        raise GeometryError("Face index out of range")
+    face = faces[face_index]
+    n, _ = _planar_frame(face)                # raises for a curved face
+    a = tuple(float(v) for v in axis)
+    la = math.sqrt(sum(v * v for v in a))
+    if la < tight():
+        raise GeometryError("No axis to turn about")
+    a = (a[0] / la, a[1] / la, a[2] / la)
+    if abs(sum(x * y for x, y in zip(a, n))) > 1.0 - 1e-6:
+        raise GeometryError("Turning a face about its own normal changes "
+                            "nothing")
+    if abs(float(degrees)) < 1e-9:
+        raise GeometryError("Distance is zero")
+    return _rotate_face_rigidly(shape, face_index,
+                                tuple(float(v) for v in point), a,
+                                float(degrees))
+
+
+def edge_faces(shape, edge_index: int) -> list:
+    """Indices of the faces an edge sits between."""
+    from OCP.TopExp import TopExp
+    from OCP.TopTools import TopTools_IndexedDataMapOfShapeListOfShape
+    edges = edges_of(shape)
+    if not (0 <= edge_index < len(edges)):
+        raise GeometryError("Edge index out of range")
+    amap = TopTools_IndexedDataMapOfShapeListOfShape()
+    TopExp.MapShapesAndAncestors_s(shape, occ.EDGE, occ.FACE, amap)
+    beside = list(amap.FindFromKey(edges[edge_index]))
+    return [i for i, f in enumerate(faces_of(shape))
+            if any(f.IsSame(b) for b in beside)]
+
+
+def edge_line(edge):
+    """(midpoint, unit direction) of a straight edge; GeometryError for a
+    curve."""
+    from OCP.GeomAbs import GeomAbs_CurveType
+    if occ.edge_adaptor(occ.to_edge(edge)).GetType() \
+            != GeomAbs_CurveType.GeomAbs_Line:
+        raise GeometryError("Only a straight edge can be moved")
+    p0, p1 = curve_endpoints(edge)
+    d = tuple(b - a for a, b in zip(p0, p1))
+    ld = math.sqrt(sum(v * v for v in d))
+    if ld < tight():
+        raise GeometryError("Edge has no length")
+    return (tuple((a + b) / 2 for a, b in zip(p0, p1)),
+            (d[0] / ld, d[1] / ld, d[2] / ld))
+
+
+def _face_hinge(face, mid, edge_dir):
+    """Where a face turns when an edge of it is moved: the line parallel to
+    the edge through the corner of the face farthest from it, so the far
+    side of the face stays put and the near side follows the edge."""
+    best, best_d = None, -1.0
+    exp = TopExp_Explorer(face, occ.VERTEX)
+    while exp.More():
+        p = pnt_tuple(occ.point_of_vertex(occ.to_vertex(exp.Current())))
+        exp.Next()
+        v = tuple(a - b for a, b in zip(p, mid))
+        along = sum(a * b for a, b in zip(v, edge_dir))
+        perp = tuple(v[k] - along * edge_dir[k] for k in range(3))
+        d = math.sqrt(sum(x * x for x in perp))
+        if d > best_d:
+            best, best_d = p, d
+    if best is None or best_d < tight():
+        raise GeometryError("The face has no far side to turn about")
+    return best
+
+
+def move_edge(shape, edge_index: int, delta: Point) -> TopoDS_Shape:
+    """Move a straight edge of a solid by `delta`. Each of the two planar
+    faces it sits between turns about its own far side until it holds the
+    edge's new line, so the faces beside them stretch or trim to suit.
+    Lift the top-front edge of a box and the top tilts while the front just
+    gets taller; push it outward and it is the front that leans.
+
+    A move along the edge's own line is refused: the line is the same line
+    and nothing would change."""
+    edges = edges_of(shape)
+    if not (0 <= edge_index < len(edges)):
+        raise GeometryError("Edge index out of range")
+    mid, e = edge_line(edges[edge_index])
+    d = tuple(float(v) for v in delta)
+    along = sum(a * b for a, b in zip(d, e))
+    across = tuple(d[k] - along * e[k] for k in range(3))
+    if math.sqrt(sum(v * v for v in across)) < tight():
+        raise GeometryError("Distance is zero")
+    target = tuple(mid[k] + d[k] for k in range(3))
+    beside = edge_faces(shape, edge_index)
+    if len(beside) != 2:
+        raise GeometryError("The edge does not sit between two faces")
+    faces = faces_of(shape)
+    plan = []                                 # (normal, hinge, new normal)
+    for fi in beside:
+        n, _ = _planar_frame(faces[fi])       # raises for a curved face
+        hinge = _face_hinge(faces[fi], mid, e)
+        span = tuple(target[k] - hinge[k] for k in range(3))
+        n2 = (span[1] * e[2] - span[2] * e[1], span[2] * e[0] - span[0] * e[2],
+              span[0] * e[1] - span[1] * e[0])
+        ln = math.sqrt(sum(v * v for v in n2))
+        if ln < tight():
+            raise GeometryError("The edge cannot be moved into its own face")
+        n2 = tuple(v / ln for v in n2)
+        if sum(a * b for a, b in zip(n2, n)) < 0:
+            n2 = tuple(-v for v in n2)
+        plan.append((n, hinge, n2))
+    out = shape
+    for n, hinge, n2 in plan:
+        if abs(sum(a * b for a, b in zip(n, n2))) > 1.0 - 1e-12:
+            continue                      # this face already holds the line
+        face = _face_on_plane(out, n, hinge, near=target)
+        out, _ = _draft(out, face, hinge, e, n2)
+    return out
+
+
+def move_parts(shape, faces, edges, delta: Point,
+               vertices=()) -> TopoDS_Shape:
+    """Move a set of faces, edges and corners of a solid together by
+    `delta`.
+
+    Moving the parts one after another double counts: moving one tilts
+    the faces beside it, which carries the next held part some of the way
+    before it is moved its full distance again, so four rim edges moved up
+    5 made a box 20 high. The question is which corners move, not where
+    each part goes in turn. Every corner of a held face or edge moves by
+    `delta`. A face all of whose corners move is carried whole, which is
+    an offset along its normal; a face none of whose corners move stays;
+    a face in between leans to the one plane through its moved and unmoved
+    corners, or the move is refused if there is no such plane. The leans
+    are done first, each face once, and then the offsets in one operation,
+    so the neighbours extend along their new planes rather than being
+    pushed straight and left with a kink.
+
+    With one face or one edge held this is what push, slide and move_edge
+    already did; with every face held it is a translation.
+    """
+    from OCP.BRep import BRep_Tool
+    d = tuple(float(v) for v in delta)
+    _unit(d)                                  # "Distance is zero"
+    flist = faces_of(shape)
+    elist = edges_of(shape)
+    corners_at = vertex_points(shape)
+    held_f = {int(i) for i in faces}
+    held_e = {int(i) for i in edges}
+    held_v = {int(i) for i in vertices}
+    if any(not (0 <= i < len(flist)) for i in held_f):
+        raise GeometryError("Face index out of range")
+    if any(not (0 <= i < len(elist)) for i in held_e):
+        raise GeometryError("Edge index out of range")
+    if any(not (0 <= i < len(corners_at)) for i in held_v):
+        raise GeometryError("Point index out of range")
+    if not held_f and not held_e and not held_v:
+        raise GeometryError("Nothing held to move")
+    if len(held_f) == len(flist):
+        return translate(shape, d)
+
+    def key(p):
+        return (round(p[0], 6), round(p[1], 6), round(p[2], 6))
+
+    def corners(sub):
+        out = []
+        exp = TopExp_Explorer(sub, occ.VERTEX)
+        while exp.More():
+            p = BRep_Tool.Pnt_s(occ.to_vertex(exp.Current()))
+            out.append((p.X(), p.Y(), p.Z()))
+            exp.Next()
+        return out
+
+    moving = set()
+    for i in held_f:
+        moving.update(key(p) for p in corners(flist[i]))
+    for i in held_e:
+        moving.update(key(p) for p in corners(elist[i]))
+    for i in held_v:
+        moving.add(key(corners_at[i]))
+
+    drafts = []                               # (n, hinge, axis, n2, near)
+    offsets = {}                              # face index -> distance
+    for fi, face in enumerate(flist):
+        pts = corners(face)
+        mine = [key(p) in moving for p in pts]
+        if not any(mine):
+            continue
+        n, _ = _planar_frame(face)            # raises for a curved face
+        if all(mine):
+            along = sum(a * b for a, b in zip(d, n))
+            if abs(along) > tight():
+                offsets[fi] = along
+            continue
+        # a leaning face: the one plane through where its corners will be
+        import numpy as np
+        target = np.array([[p[k] + (d[k] if m else 0.0) for k in range(3)]
+                           for p, m in zip(pts, mine)], float)
+        centre = target.mean(axis=0)
+        _, sv, vt = np.linalg.svd(target - centre)
+        n2 = vt[-1]
+        if len(pts) > 3 and sv[-1] > tol() * 10:
+            raise GeometryError(
+                "Moving those together would bend a face beside them")
+        n2 = tuple(float(v) for v in n2)
+        if sum(a * b for a, b in zip(n2, n)) < 0:
+            n2 = tuple(-v for v in n2)
+        if sum(a * b for a, b in zip(n2, n)) > 1.0 - 1e-10:
+            continue                          # the plane already holds them
+        fixed = [p for p, m in zip(pts, mine) if not m]
+        near = tuple(float(v) for v in
+                     target[[m for m in mine]].mean(axis=0))
+        hinge = max(fixed, key=lambda p: math.dist(p, near))
+        axis = _unit((n[1] * n2[2] - n[2] * n2[1], n[2] * n2[0] - n[0] * n2[2],
+                      n[0] * n2[1] - n[1] * n2[0]))
+        drafts.append((n, hinge, axis, n2, near))
+    if not drafts and not offsets:
+        raise GeometryError("Distance is zero")
+
+    out = shape
+    for n, hinge, axis, n2, near in drafts:
+        face = _face_on_plane(out, n, hinge, near=near)
+        out, _ = _draft(out, face, hinge, axis, n2)
+    if offsets:
+        # the held faces' planes are untouched by the leans, so each is
+        # found again by its plane on whatever the leans left behind
+        again = {}
+        now = faces_of(out)
+        for fi, along in offsets.items():
+            n, c = _planar_frame(flist[fi])
+            face = _face_on_plane(out, n, c, near=c)
+            again[next(i for i, f in enumerate(now) if f.IsSame(face))] = along
+        out = offset_faces(out, again)
+    return out
+
+
+def _face_on_plane(shape, normal, point, near):
+    """The planar face of `shape` lying in the plane (point, normal), the
+    one nearest `near` if the plane carries more than one."""
+    best, best_d = None, math.inf
+    for f in faces_of(shape):
+        try:
+            n, c = _planar_frame(f)
+        except GeometryError:
+            continue
+        if sum(a * b for a, b in zip(n, normal)) < 1.0 - 1e-6:
+            continue
+        off = sum((c[k] - point[k]) * normal[k] for k in range(3))
+        if abs(off) > tol() * 10:
+            continue
+        d = math.dist(c, near)
+        if d < best_d:
+            best, best_d = f, d
+    if best is None:
+        raise GeometryError("The face beside the edge has gone")
+    return best
+
+
+def _unit(v):
+    length = math.sqrt(sum(x * x for x in v))
+    if length < tight():
+        raise GeometryError("Distance is zero")
+    return tuple(x / length for x in v)
+
+
+def _refit_outline(shape, face_index: int, moved) -> TopoDS_Shape:
+    """Carry every edge of a planar face to `moved(point)` of itself, and
+    turn each face beside it until it holds the edge's new line.
+
+    `moved` must keep straight edges straight (a translation or a scale
+    does). A neighbour keeps the corner of itself farthest from the edge
+    where it is, so its far side stays put and its near side follows: the
+    mesh modeller's rule, where the faces beside a dragged face lean to
+    keep hold of it. Two neighbours cannot share one draft, so they are
+    turned one after the other, each found again on the solid the last
+    one left behind by the plane it is still in.
+    """
+    from OCP.TopExp import TopExp
+    from OCP.TopTools import TopTools_IndexedDataMapOfShapeListOfShape
+    faces = faces_of(shape)
+    if not (0 <= face_index < len(faces)):
+        raise GeometryError("Face index out of range")
+    face = faces[face_index]
+    _planar_frame(face)                       # raises for a curved face
+    amap = TopTools_IndexedDataMapOfShapeListOfShape()
+    TopExp.MapShapesAndAncestors_s(shape, occ.EDGE, occ.FACE, amap)
+    plan, seen = [], []
+    for edge in edges_of(face):
+        mid, direction = edge_line(edge)      # raises for a curved edge
+        p0, p1 = curve_endpoints(edge)
+        q0, q1 = moved(p0), moved(p1)
+        new_dir = _unit(tuple(b - a for a, b in zip(q0, q1)))
+        beside = [f for f in amap.FindFromKey(edge) if not f.IsSame(face)]
+        if len(beside) != 1:
+            raise GeometryError("The face is not part of a closed solid")
+        other = occ.to_face(beside[0])      # the map hands back plain shapes
+        if any(other.IsSame(s) for s in seen):
+            raise GeometryError("A face beside this one touches it twice")
+        seen.append(other)
+        n, _ = _planar_frame(other)           # raises for a curved neighbour
+        hinge = _face_hinge(other, mid, direction)
+        span = tuple(h - q for h, q in zip(hinge, q0))
+        n2 = (new_dir[1] * span[2] - new_dir[2] * span[1],
+              new_dir[2] * span[0] - new_dir[0] * span[2],
+              new_dir[0] * span[1] - new_dir[1] * span[0])
+        try:
+            n2 = _unit(n2)
+        except GeometryError:
+            raise GeometryError("The edge would land on the far side of the "
+                                "face beside it") from None
+        if sum(a * b for a, b in zip(n2, n)) < 0:
+            n2 = tuple(-v for v in n2)
+        if sum(a * b for a, b in zip(n2, n)) > 1.0 - 1e-10:
+            continue                          # already holds the new line
+        axis = _unit((n[1] * n2[2] - n[2] * n2[1], n[2] * n2[0] - n[0] * n2[2],
+                      n[0] * n2[1] - n[1] * n2[0]))
+        near = tuple((a + b) / 2 for a, b in zip(q0, q1))
+        plan.append((n, hinge, axis, n2, near))
+    if not plan:
+        raise GeometryError("Distance is zero")
+    out = shape
+    for n, hinge, axis, n2, near in plan:
+        other = _face_on_plane(out, n, hinge, near=near)
+        out, _ = _draft(out, other, hinge, axis, n2)
+    return out
+
+
+def slide_face(shape, face_index: int, delta: Point) -> TopoDS_Shape:
+    """Slide a planar face of a solid within its own plane by `delta`; the
+    faces beside it lean to keep hold of its edges, so a box shears. The
+    part of `delta` along the normal is refused rather than dropped: that
+    is a move, and the arrow along the normal does it."""
+    faces = faces_of(shape)
+    if not (0 <= face_index < len(faces)):
+        raise GeometryError("Face index out of range")
+    n, _ = _planar_frame(faces[face_index])
+    d = tuple(float(v) for v in delta)
+    out_of_plane = sum(a * b for a, b in zip(d, n))
+    if abs(out_of_plane) > tight():
+        raise GeometryError("A face slides within its own plane; the arrow "
+                            "along the normal moves it out of it")
+    _unit(d)                                  # "Distance is zero" for nothing
+    return _refit_outline(shape, face_index,
+                          lambda p: tuple(a + b for a, b in zip(p, d)))
+
+
+def scale_face(shape, face_index: int, factor: float,
+               axis: Point | None = None) -> TopoDS_Shape:
+    """Scale a planar face of a solid about its own centre, within its own
+    plane, every way or along `axis` only; the faces beside it lean to keep
+    hold of its edges, so a box tapers to a frustum or flares."""
+    faces = faces_of(shape)
+    if not (0 <= face_index < len(faces)):
+        raise GeometryError("Face index out of range")
+    face = faces[face_index]
+    n, c = _planar_frame(face)
+    k = float(factor)
+    if k <= tight():
+        raise GeometryError("Factor must be positive")
+    if abs(k - 1.0) < 1e-9:
+        raise GeometryError("Distance is zero")
+    if axis is None:
+        def moved(p):
+            return tuple(c[i] + (p[i] - c[i]) * k for i in range(3))
+    else:
+        a = tuple(float(v) for v in axis)
+        along = sum(x * y for x, y in zip(a, n))
+        try:
+            a = _unit(tuple(a[i] - along * n[i] for i in range(3)))
+        except GeometryError:
+            raise GeometryError("Scaling a face along its own normal changes "
+                                "nothing") from None
+
+        def moved(p):
+            t = sum((p[i] - c[i]) * a[i] for i in range(3)) * (k - 1.0)
+            return tuple(p[i] + a[i] * t for i in range(3))
+    return _refit_outline(shape, face_index, moved)
+
+
+def face_long_direction(face) -> Point | None:
+    """Unit direction of the longest straight edge of a face, or None when
+    it has no straight edges."""
+    from OCP.GeomAbs import GeomAbs_CurveType
+    best, best_len = None, 0.0
+    for e in edges_of(face):
+        if occ.edge_adaptor(occ.to_edge(e)).GetType() \
+                != GeomAbs_CurveType.GeomAbs_Line:
+            continue
+        p0, p1 = curve_endpoints(e)
+        d = tuple(b - a for a, b in zip(p0, p1))
+        ld = math.sqrt(sum(v * v for v in d))
+        if ld > best_len:
+            best, best_len = (d[0] / ld, d[1] / ld, d[2] / ld), ld
+    return best
+
+
+def cap_holes(shape) -> TopoDS_Shape:
+    """Close planar openings of a surface/shell and solidify if possible."""
+    from OCP.ShapeAnalysis import ShapeAnalysis_FreeBounds
+
+    fb = ShapeAnalysis_FreeBounds(shape)
+    closed = fb.GetClosedWires()
+    caps = []
+    existing = faces_of(shape)
+    if closed is not None and not closed.IsNull():
+        exp = TopExp_Explorer(closed, occ.WIRE)
+        while exp.More():
+            wire = occ.to_wire(exp.Current())
+            exp.Next()
+            mk = BRepBuilderAPI_MakeFace(wire, True)
+            if not mk.IsDone():
+                continue
+            face = mk.Face()
+            # A flat wall's outside boundary is also a closed planar wire,
+            # but filling it again only doubles the wall. An opening has no
+            # area already covered by any of the existing faces.
+            covered = False
+            for original in existing:
+                common = BRepAlgoAPI_Common(face, original)
+                if not common.IsDone():
+                    raise GeometryError("Could not check planar opening")
+                if surface_area(common.Shape()) > max(tol() ** 2,
+                                                      surface_area(face) * 1e-9):
+                    covered = True
+                    break
+            if not covered:
+                caps.append(face)
+    if not caps:
+        raise GeometryError("No closable planar openings found")
+    # Keep every component and only promote shells that are actually closed.
+    sewn = join_surfaces([shape, *caps])
+    pieces = [join_surfaces([piece]) for piece in joined_pieces(sewn)]
+    from OCP.BRepLib import BRepLib
+    for piece in pieces:
+        if piece.ShapeType() == occ.SOLID:
+            BRepLib.OrientClosedSolid_s(occ.to_solid(piece))
+    return pieces[0] if len(pieces) == 1 else make_compound(pieces)
+
+
+def intersect_shapes(a, b) -> list:
+    """Intersection curves between two shapes (surface/solid)."""
+    from OCP.BRepAlgoAPI import BRepAlgoAPI_Section
+    sec = BRepAlgoAPI_Section(a, b)
+    sec.Build()
+    if not sec.IsDone():
+        raise GeometryError("Intersection failed")
+    edges = edges_of(sec.Shape())
+    if not edges:
+        raise GeometryError("The objects do not intersect")
+    return _curve_pieces(edges, [])
+
+
+def _plane_extent(shape, point: Point) -> float:
+    """How far a cutting plane must reach to pass right through a shape.
+
+    Measured from the plane's own point, because a plane placed off to
+    one side still has to span back across the object.
+    """
+    (mn, mx) = bbox(shape)
+    far = max(math.dist((x, y, z), point)
+              for x in (mn[0], mx[0])
+              for y in (mn[1], mx[1])
+              for z in (mn[2], mx[2]))
+    return far * 1.5 or 1.0
+
+
+def section_curves(shape, point: Point, normal: Point) -> list:
+    """The curves where an unbounded plane crosses a shape.
+
+    A plane that misses comes back empty rather than raising. A section
+    is normally asked of several objects at once, and the ones the plane
+    sails past are not an error: only the caller knows whether missing
+    everything is worth complaining about.
+    """
+    from OCP.BRepAlgoAPI import BRepAlgoAPI_Section
+    from .occ import gp_Pln
+    sec = BRepAlgoAPI_Section(shape, gp_Pln(_pnt(point), _dir(normal)))
+    sec.Build()
+    if not sec.IsDone():
+        raise GeometryError("Section failed")
+    edges = edges_of(sec.Shape())
+    return _curve_pieces(edges, []) if edges else []
+
+
+def section_regions(shape, point: Point, normal: Point) -> list:
+    """The filled faces a plane cuts out of a solid.
+
+    The cut itself rather than its outline, which is what a section
+    drawing shows and what a hatch needs. An outline cannot say which
+    side of it is material, so a pipe cut across reads as two unrelated
+    circles instead of a ring of wall with a bore down the middle.
+
+    A surface has no inside and so gives back nothing here. Ask
+    `section_curves` for that, and for a plane that misses.
+    """
+    from .occ import gp_Pln
+    reach = _plane_extent(shape, point)
+    mk = BRepBuilderAPI_MakeFace(gp_Pln(_pnt(point), _dir(normal)),
+                                 -reach, reach, -reach, reach)
+    if not mk.IsDone():
+        raise GeometryError("Section failed")
+    try:
+        common = boolean_intersection(shape, mk.Face())
+    except GeometryError:
+        return []
+    return faces_of(common)
+
+
+def face_loops(face, count: int = 96) -> list:
+    """A face's rings as point loops, the ring around the outside first.
+
+    Everything that draws or fills a cut face wants the same two things
+    from it: which ring to run a line around, and which rings to leave
+    empty.
+
+    Walked edge by edge, so every corner is a point of the loop: a ring
+    sampled evenly along its length cut each corner off, and a section's
+    cut line drew the chamfer. A straight edge is its two ends; a curved
+    one is followed to within a hundred-thousandth of the face's size, or
+    `count` points round a whole circle where that is finer.
+    """
+    import math
+    import numpy as np
+    from OCP.BRepAdaptor import BRepAdaptor_Curve
+    from OCP.BRepTools import BRepTools, BRepTools_WireExplorer
+    from OCP.GCPnts import GCPnts_QuasiUniformDeflection
+    from OCP.GeomAbs import GeomAbs_Circle, GeomAbs_Line
+    from OCP.TopAbs import TopAbs_REVERSED
+    f = occ.to_face(face)
+    outer = BRepTools.OuterWire_s(f)
+    lo, hi = bbox(f)
+    size = float(np.linalg.norm(np.subtract(hi, lo))) or 1.0
+    rings, holes = [], []
+    exp = TopExp_Explorer(f, occ.WIRE)
+    while exp.More():
+        wire = occ.to_wire(exp.Current())
+        exp.Next()
+        pts = []
+        walk = BRepTools_WireExplorer(wire, f)
+        while walk.More():
+            edge = walk.Current()
+            walk.Next()
+            ad = BRepAdaptor_Curve(edge)
+            a, b = ad.FirstParameter(), ad.LastParameter()
+            if ad.GetType() == GeomAbs_Line:
+                seq = [ad.Value(a), ad.Value(b)]
+            else:
+                deflection = max(size * 1e-5, 1e-9)
+                try:
+                    radius = ad.Circle().Radius() \
+                        if ad.GetType() == GeomAbs_Circle else None
+                except Exception:                          # noqa: BLE001
+                    radius = None
+                if radius:
+                    deflection = min(deflection, radius * (
+                        1 - math.cos(math.pi / max(count, 8))))
+                sample = GCPnts_QuasiUniformDeflection(ad, deflection, a, b)
+                seq = ([sample.Value(i)
+                        for i in range(1, sample.NbPoints() + 1)]
+                       if sample.IsDone() and sample.NbPoints() >= 2
+                       else [ad.Value(a), ad.Value(b)])
+            if edge.Orientation() == TopAbs_REVERSED:
+                seq.reverse()
+            for p in seq:
+                q = (p.X(), p.Y(), p.Z())
+                if not pts or math.dist(pts[-1], q) > size * 1e-9:
+                    pts.append(q)
+        if len(pts) > 1 and math.dist(pts[0], pts[-1]) <= size * 1e-9:
+            pts.pop()
+        if len(pts) < 3:
+            pts = sample_curve(wire, count)
+        (rings if wire.IsSame(outer) else holes).append(pts)
+    return rings + holes
+
+
+def contour(shape, direction: Point = (0, 0, 1),
+            spacing: float = 10.0) -> list[tuple[float, list]]:
+    """Slice a shape into section curves at regular intervals.
+
+    Returns [(offset_along_direction, [curves]), ...]."""
+    import numpy as np
+    if spacing <= 0:
+        raise GeometryError("Spacing must be positive")
+    d = np.asarray(direction, float)
+    d = d / np.linalg.norm(d)
+    (mn, mx) = bbox(shape)
+    corners = [np.array([x, y, z]) for x in (mn[0], mx[0])
+               for y in (mn[1], mx[1]) for z in (mn[2], mx[2])]
+    lo = min(float(np.dot(c, d)) for c in corners)
+    hi = max(float(np.dot(c, d)) for c in corners)
+    out = []
+    level = lo + spacing
+    while level < hi - 1e-6:
+        try:
+            curves = section_curves(shape, tuple(d * level), tuple(d))
+        except GeometryError:
+            curves = []      # one sour level must not lose the others
+        if curves:
+            out.append((level - lo, curves))
+        level += spacing
+    if not out:
+        raise GeometryError("No contours produced (check the spacing)")
+    return out
+
+
+def offset_surface(shape, distance: float) -> TopoDS_Shape:
+    """Offset a surface/shell by a distance along its normals.
+
+    Corners stay sharp: the faces are extended until they meet rather than
+    rounded off (the kernel's default), so a box offsets to a bigger box.
+    Rounding them is a fillet, done afterwards if wanted. Where the kernel
+    can't carry the faces on until they meet, as where an arc closed by a
+    flat side was extruded, it gives up, and the edges are rounded as they
+    were before rather than the offset failing.
+    """
+    from OCP.GeomAbs import GeomAbs_JoinType
+    for join in (GeomAbs_JoinType.GeomAbs_Intersection,
+                 GeomAbs_JoinType.GeomAbs_Arc):
+        made = _offset_shape(shape, distance, join)
+        if made is not None:
+            return made
+    raise GeometryError("Offset surface failed")
+
+
+def _offset_shape(shape, distance: float, join):
+    """The kernel's offset of a surface or solid with edges joined by
+    `join`, or None where it gave up."""
+    from OCP.BRepOffset import BRepOffset_Mode
+    from OCP.BRepOffsetAPI import BRepOffsetAPI_MakeOffsetShape
+    from OCP.GeomAbs import GeomAbs_JoinType
+    mk = BRepOffsetAPI_MakeOffsetShape()
+    try:
+        mk.PerformByJoin(shape, float(distance), tol(),
+                         BRepOffset_Mode.BRepOffset_Skin, False, False, join)
+    except Exception:                     # noqa: BLE001 - the kernel's own
+        return None
+    if not mk.IsDone() or mk.Shape().IsNull():
+        return None
+    made = mk.Shape()
+    # the round join is what this did before, unchecked; a sharp one that
+    # comes back broken is no better than none
+    if join == GeomAbs_JoinType.GeomAbs_Intersection and not is_valid(made):
+        return None
+    return made
+
+
+def face_index_near(shape, point: Point) -> int:
+    """Index into faces_of(shape) of the face closest to a point — the face
+    a click on the solid landed on."""
+    from OCP.BRepExtrema import BRepExtrema_DistShapeShape
+    v = BRepBuilderAPI_MakeVertex(_pnt(point)).Vertex()
+    best = None
+    for i, face in enumerate(faces_of(shape)):
+        dist = BRepExtrema_DistShapeShape(v, face)
+        if dist.IsDone() and (best is None or dist.Value() < best[0]):
+            best = (dist.Value(), i)
+    if best is None:
+        raise GeometryError("No face there")
+    return best[1]
+
+
+def shell_solid(shape, thickness: float,
+                open_faces=()) -> TopoDS_Shape:
+    """Hollow a solid with a uniform wall thickness, grown inward.
+
+    `open_faces` are indices into faces_of(shape): those faces are taken
+    away, so the shell is open there — a box with its top picked becomes a
+    tray. With none, the solid stays closed around a sealed void, which
+    looks no different from outside.
+
+    Corners stay sharp: the walls are extended until they meet rather than
+    rounded off (the kernel's default), so a star shells to a star. Rounding
+    them is a fillet, done afterwards if wanted.
+
+    The kernel can report success and hand the solid back unhollowed: every
+    face of an arc closed by a flat edge, the inner walls of a U, a flat
+    running tangent into a curve. Whatever it returns is therefore measured,
+    and when nothing was taken away the cavity is cut out instead.
+
+    With no face to open it is no use at all: it hands back the solid moved
+    in by the wall, which is the inside of the shell and not the shell, and
+    measures as hollowed, so a closed shell is always cut out (#121).
+    """
+    if shape_kind(shape) != "solid":
+        raise GeometryError("Shell needs a closed solid")
+    t = abs(float(thickness))
+    faces = faces_of(shape)
+    picked = []
+    for idx in sorted(set(open_faces)):
+        if not 0 <= idx < len(faces):
+            raise GeometryError("That face is not on the solid")
+        picked.append(faces[idx])
+    if picked:
+        result = _thick_solid(shape, picked, t)
+        if result is not None and _is_hollowed(shape, result):
+            return result
+    return _carved_shell(shape, picked, t)
+
+
+def _is_hollowed(shape, result) -> bool:
+    """Whether a shell really took material away and is a sound solid."""
+    return (is_valid(result)
+            and 0 < volume(result) < volume(shape) * (1 - 1e-6))
+
+
+def _thick_solid(shape, picked: list, thickness: float):
+    """The kernel's own shell, or None when it could not make one."""
+    from OCP.BRepOffset import BRepOffset_Mode
+    from OCP.BRepOffsetAPI import BRepOffsetAPI_MakeThickSolid
+    from OCP.GeomAbs import GeomAbs_JoinType
+    from OCP.TopTools import TopTools_ListOfShape
+    removed = TopTools_ListOfShape()
+    for face in picked:
+        removed.Append(face)
+    mk = BRepOffsetAPI_MakeThickSolid()
+    try:
+        mk.MakeThickSolidByJoin(shape, removed, -thickness, tol(),
+                                BRepOffset_Mode.BRepOffset_Skin, False, False,
+                                GeomAbs_JoinType.GeomAbs_Intersection)
+    except Exception:
+        return None
+    # a null shape must stop here: measuring one kills the process
+    if not mk.IsDone() or mk.Shape().IsNull():
+        return None
+    return mk.Shape()
+
+
+def _inward_offset(shape, thickness: float):
+    """The solid shrunk by a distance, and the builder that made it.
+
+    Intersection keeps inside corners sharp but gives up on most curved
+    faces; arcs only round the corners that point into the solid, so a
+    profile with none loses nothing by falling back to them.
+    """
+    from OCP.BRepOffset import BRepOffset_Mode
+    from OCP.BRepOffsetAPI import BRepOffsetAPI_MakeOffsetShape
+    from OCP.GeomAbs import GeomAbs_JoinType
+    for join, inter in ((GeomAbs_JoinType.GeomAbs_Intersection, False),
+                        (GeomAbs_JoinType.GeomAbs_Arc, False),
+                        (GeomAbs_JoinType.GeomAbs_Arc, True)):
+        mk = BRepOffsetAPI_MakeOffsetShape()
+        try:
+            mk.PerformByJoin(shape, -thickness, tol(),
+                             BRepOffset_Mode.BRepOffset_Skin, inter, False,
+                             join)
+        except Exception:
+            continue
+        if not mk.IsDone() or mk.Shape().IsNull():
+            continue
+        if _is_hollowed(shape, mk.Shape()):
+            return mk.Shape(), mk
+    raise GeometryError("Shell failed (thickness may exceed the solid's "
+                        "smallest feature)")
+
+
+def _thicken_face(face, distance: float) -> TopoDS_Shape:
+    """A solid swept from a face along its own normals."""
+    from OCP.BRepOffset import BRepOffset_MakeOffset, BRepOffset_Mode
+    from OCP.GeomAbs import GeomAbs_JoinType
+    mk = BRepOffset_MakeOffset()
+    try:
+        mk.Initialize(face, distance, tol(), BRepOffset_Mode.BRepOffset_Skin,
+                      False, False, GeomAbs_JoinType.GeomAbs_Intersection,
+                      True)
+        mk.MakeOffsetShape()
+    except Exception as exc:
+        raise GeometryError("Shell failed at the opening") from exc
+    if not mk.IsDone() or mk.Shape().IsNull():
+        raise GeometryError("Shell failed at the opening")
+    return mk.Shape()
+
+
+def _carved_shell(shape, picked: list, thickness: float) -> TopoDS_Shape:
+    """Shell by subtraction: take away the solid shrunk by the wall, then a
+    plug through the wall at each open face.
+
+    The plug is what lies both under the open face and over its image on
+    the shrunken solid, so the opening stops at the walls either side, and
+    a wall meeting it at an inside corner keeps its full thickness.
+    """
+    inner, offset = _inward_offset(shape, thickness)
+    past = thickness * 1.01
+    result = boolean_difference(shape, inner)
+    for face in picked:
+        images = list(offset.Modified(face)) or list(offset.Generated(face))
+        if not images:
+            raise GeometryError("Shell failed (thickness may exceed the "
+                                "solid's smallest feature)")
+        under = _thicken_face(face, -past)
+        for image in images:
+            plug = boolean_intersection(under, _thicken_face(image, past))
+            result = boolean_difference(result, plug)
+    result = merge_coplanar_faces(result)
+    if not _is_hollowed(shape, result):
+        raise GeometryError("Shell failed (thickness may exceed the "
+                            "solid's smallest feature)")
+    return result
+
+
+def patch_surface(curves: list, continuity: int = 0) -> TopoDS_Shape:
+    """Patch/network surface filling the given boundary curves."""
+    from OCP.BRepOffsetAPI import BRepOffsetAPI_MakeFilling
+    from OCP.GeomAbs import GeomAbs_Shape
+    cont = (GeomAbs_Shape.GeomAbs_C0 if continuity == 0
+            else GeomAbs_Shape.GeomAbs_C1)
+    mk = BRepOffsetAPI_MakeFilling()
+    n = 0
+    for c in curves:
+        for e in edges_of(c):
+            mk.Add(e, cont, True)
+            n += 1
+    if n < 2:
+        raise GeometryError("Patch needs at least 2 boundary edges")
+    try:
+        mk.Build()
+    except Exception as exc:
+        raise GeometryError(f"Patch failed: {exc}") from exc
+    if not mk.IsDone():
+        raise GeometryError("Patch failed — check that the curves form "
+                            "a reasonable boundary")
+    return unwrap_compound(mk.Shape())
+
+
+def blend_curves(a, b, continuity: str = "tangent") -> TopoDS_Shape:
+    """Blend curve between the nearest ends of two curves."""
+    import numpy as np
+    ends = []
+    for shape in (a, b):
+        edges = edges_of(shape)
+        if not edges:
+            raise GeometryError("Blend needs curves")
+        ad0 = occ.edge_adaptor(edges[0])
+        adN = occ.edge_adaptor(edges[-1])
+        for ad, t in ((ad0, ad0.FirstParameter()),
+                      (adN, adN.LastParameter())):
+            p = ad.Value(t)
+            v = gp_Vec()
+            pnt = gp_Pnt()
+            ad.D1(t, pnt, v)
+            ends.append((np.array([p.X(), p.Y(), p.Z()]),
+                         np.array([v.X(), v.Y(), v.Z()]),
+                         t == ad.FirstParameter()))
+    best = None
+    for ea in ends[:2]:
+        for eb in ends[2:]:
+            d = float(np.linalg.norm(ea[0] - eb[0]))
+            if best is None or d < best[0]:
+                best = (d, ea, eb)
+    _, (pa, ta, a_start), (pb, tb, b_start) = best
+    # outgoing tangents: leaving curve a, entering curve b
+    ta = -ta if a_start else ta
+    tb = tb if b_start else -tb
+    dist = float(np.linalg.norm(pb - pa))
+    if dist < 1e-9:
+        raise GeometryError("Curve ends coincide — nothing to blend")
+    from OCP.Geom import Geom_BezierCurve
+    if continuity == "position":
+        return make_line(tuple(pa), tuple(pb))
+    na = ta / (np.linalg.norm(ta) or 1.0)
+    nb = tb / (np.linalg.norm(tb) or 1.0)
+    poles = TColgp_Array1OfPnt(1, 4)
+    poles.SetValue(1, _pnt(tuple(pa)))
+    poles.SetValue(2, _pnt(tuple(pa + na * dist / 3)))
+    poles.SetValue(3, _pnt(tuple(pb - nb * dist / 3)))
+    poles.SetValue(4, _pnt(tuple(pb)))
+    return BRepBuilderAPI_MakeEdge(Geom_BezierCurve(poles)).Edge()
+
+
+def project_curve(curve, target, direction: Point) -> list:
+    """Project a curve onto a surface along a direction."""
+    from OCP.BRepProj import BRepProj_Projection
+    wire = occ.to_wire(to_wire(curve))
+    proj = BRepProj_Projection(wire, target, _dir(direction))
+    out = []
+    while proj.More():
+        out.append(proj.Current())
+        proj.Next()
+    if not out:
+        raise GeometryError("Projection missed the surface")
+    return out
+
+
+def pull_curve(curve, target) -> list:
+    """Pull a curve onto a surface along the surface normals."""
+    from OCP.BRepOffsetAPI import BRepOffsetAPI_NormalProjection
+    proj = BRepOffsetAPI_NormalProjection(target)
+    proj.Add(occ.to_wire(to_wire(curve)))
+    proj.Build()
+    if not proj.IsDone():
+        raise GeometryError("Pull failed")
+    edges = edges_of(proj.Projection())
+    if not edges:
+        raise GeometryError("Pull produced nothing (curve may not face "
+                            "the surface)")
+    return _curve_pieces(edges, [])
+
+
+def make_helix(center: Point, radius: float, pitch: float, turns: float,
+               ccw: bool = True, axis: Point = (0, 0, 1)) -> TopoDS_Shape:
+    """Helical curve winding up `axis` through `center`."""
+    if radius <= 0 or pitch <= 0 or turns <= 0:
+        raise GeometryError("Helix needs positive radius, pitch and turns")
+    from OCP.Geom import Geom_CylindricalSurface
+    from OCP.Geom2d import Geom2d_Line
+    from OCP.gp import gp_Ax3, gp_Dir2d, gp_Pnt2d
+    from OCP.BRepLib import BRepLib
+    ax = gp_Ax3(_pnt(center), _dir(axis))
+    surf = Geom_CylindricalSurface(ax, float(radius))
+    sign = 1.0 if ccw else -1.0
+    line2d = Geom2d_Line(gp_Pnt2d(0, 0), gp_Dir2d(sign * 2 * math.pi,
+                                                  float(pitch)))
+    length = math.hypot(2 * math.pi, pitch) * turns
+    edge = BRepBuilderAPI_MakeEdge(line2d, surf, 0.0, length).Edge()
+    BRepLib.BuildCurves3d_s(edge)
+    return edge
+
+
+def unroll_face(face) -> list:
+    """Develop a planar/cylindrical/conical face flat onto world XY.
+
+    Returns the developed boundary as curves (arc-length preserving)."""
+    import numpy as np
+    from OCP.BRepAdaptor import BRepAdaptor_Curve2d, BRepAdaptor_Surface
+    from OCP.GeomAbs import GeomAbs_SurfaceType
+
+    faces = faces_of(face)
+    if len(faces) != 1:
+        raise GeometryError("Unroll one face at a time (explode first)")
+    f = faces[0]
+    surf = BRepAdaptor_Surface(f)
+    kind = surf.GetType()
+
+    if kind == GeomAbs_SurfaceType.GeomAbs_Plane:
+        def dev(u, v):
+            return (u, v)
+    elif kind == GeomAbs_SurfaceType.GeomAbs_Cylinder:
+        r = surf.Cylinder().Radius()
+
+        def dev(u, v):
+            return (u * r, v)
+    elif kind == GeomAbs_SurfaceType.GeomAbs_Cone:
+        cone = surf.Cone()
+        half = cone.SemiAngle()
+        r_ref = cone.RefRadius()
+        sin_h = math.sin(half)
+        if abs(sin_h) < 1e-12:
+            raise GeometryError("Degenerate cone")
+
+        def dev(u, v):
+            # slant distance from apex; flat angle compresses by sin(half)
+            s = r_ref / sin_h + v
+            theta = u * sin_h
+            return (s * math.sin(theta), -s * math.cos(theta))
+    else:
+        raise GeometryError(
+            "Only planar, cylindrical and conical faces can be unrolled "
+            "exactly (this face is freeform)")
+
+    out = []
+    for edge in edges_of(f):
+        try:
+            c2d = BRepAdaptor_Curve2d(occ.to_edge(edge), f)
+        except Exception:
+            continue
+        t0, t1 = c2d.FirstParameter(), c2d.LastParameter()
+        pts = []
+        for i in range(65):
+            t = t0 + (t1 - t0) * i / 64
+            uv = c2d.Value(t)
+            x, y = dev(uv.X(), uv.Y())
+            pts.append((x, y, 0.0))
+        # drop duplicate consecutive points
+        clean = [pts[0]]
+        for p in pts[1:]:
+            if math.dist(p, clean[-1]) > 1e-9:
+                clean.append(p)
+        if len(clean) >= 2:
+            out.append(make_polyline(clean))
+    if not out:
+        raise GeometryError("Unroll produced no boundary curves")
+    return out
+
+
+def extend_curve(shape, length: float, end: str = "end") -> TopoDS_Shape:
+    """Extend a curve tangentially past its start or end (line extension)."""
+    import numpy as np
+    if length <= 0:
+        raise GeometryError("Extension length must be positive")
+    edges = edges_of(shape)
+    if not edges:
+        raise GeometryError("Not a curve")
+    edge = edges[-1] if end != "start" else edges[0]
+    ad = occ.edge_adaptor(edge)
+    t = ad.LastParameter() if end != "start" else ad.FirstParameter()
+    p = gp_Pnt()
+    v = gp_Vec()
+    ad.D1(t, p, v)
+    tangent = np.array([v.X(), v.Y(), v.Z()])
+    n = np.linalg.norm(tangent)
+    if n < 1e-12:
+        raise GeometryError("Degenerate tangent at the curve end")
+    tangent = tangent / n * float(length)
+    if end == "start":
+        tangent = -tangent
+    start_pt = (p.X(), p.Y(), p.Z())
+    tip = (p.X() + tangent[0], p.Y() + tangent[1], p.Z() + tangent[2])
+    ext = make_line(start_pt, tip)
+    return join_curves([shape, ext])
+
+
+def match_curve(a, b, continuity: str = "tangent") -> TopoDS_Shape:
+    """Move the end of curve `a` to meet the nearest end of curve `b`
+    with position (G0) or tangent (G1) continuity. Returns the new a."""
+    import numpy as np
+    bs = _edge_bspline(a)
+    ends_a = []
+    for t, is_start in ((bs.FirstParameter(), True),
+                        (bs.LastParameter(), False)):
+        p = gp_Pnt()
+        v = gp_Vec()
+        bs.D1(t, p, v)
+        ends_a.append((np.array([p.X(), p.Y(), p.Z()]), is_start))
+    bsb = _edge_bspline(b)
+    ends_b = []
+    for t, is_start in ((bsb.FirstParameter(), True),
+                        (bsb.LastParameter(), False)):
+        p = gp_Pnt()
+        v = gp_Vec()
+        bsb.D1(t, p, v)
+        ends_b.append((np.array([p.X(), p.Y(), p.Z()]),
+                       np.array([v.X(), v.Y(), v.Z()]), is_start))
+    best = None
+    for (pa, a_start) in ends_a:
+        for (pb, tb, b_start) in ends_b:
+            d = float(np.linalg.norm(pa - pb))
+            if best is None or d < best[0]:
+                best = (d, a_start, pb, tb, b_start)
+    _, a_start, pb, tb, b_start = best
+    n = bs.NbPoles()
+    if n < 2:
+        raise GeometryError("Curve has too few control points")
+    end_i = 1 if a_start else n
+    next_i = 2 if a_start else n - 1
+    bs.SetPole(end_i, _pnt(tuple(pb)))
+    if continuity == "tangent":
+        # direction of travel continuing out of b through the joint
+        t_join = tb / (np.linalg.norm(tb) or 1.0)
+        if b_start:
+            t_join = -t_join
+        cur = bs.Pole(next_i)
+        dist = float(np.linalg.norm(
+            np.array([cur.X(), cur.Y(), cur.Z()]) - pb)) or 1.0
+        if a_start:      # a leaves the joint along t_join
+            bs.SetPole(next_i, _pnt(tuple(pb + t_join * dist)))
+        else:            # a arrives at the joint along t_join
+            bs.SetPole(next_i, _pnt(tuple(pb - t_join * dist)))
+    return BRepBuilderAPI_MakeEdge(bs).Edge()
+
+
+def sweep2(profile, rail1, rail2) -> TopoDS_Shape:
+    """Sweep a profile along rail1, scaled/guided by rail2 (two-rail sweep)."""
+    from .occ import BRepOffsetAPI_MakePipeShell
+    spine = occ.to_wire(to_wire(rail1))
+    aux = occ.to_wire(to_wire(rail2))
+    ps = BRepOffsetAPI_MakePipeShell(spine)
+    ps.SetMode(aux, True)          # curvilinear equivalence with aux rail
+    ps.Add(occ.to_wire(to_wire(profile)))
+    ps.Build()
+    if not ps.IsDone():
+        raise GeometryError("Two-rail sweep failed (check that rails run "
+                            "the same direction and the profile touches "
+                            "the first rail)")
+    return ps.Shape()
+
+
+def _curve_pieces(edges: list, cutters: list) -> list:
+    """Group split edges into pieces, breaking chains at cut vertices."""
+    from OCP.BRepExtrema import BRepExtrema_DistShapeShape
+
+    def on_cutter(p: gp_Pnt) -> bool:
+        v = BRepBuilderAPI_MakeVertex(p).Vertex()
+        for c in cutters:
+            if BRepExtrema_DistShapeShape(v, c).Value() < tol():
+                return True
+        return False
+
+    # vertex key -> list of edge indices, skipping vertices on a cutter
+    def vkey(p: gp_Pnt):
+        return (round(p.X(), 6), round(p.Y(), 6), round(p.Z(), 6))
+
+    links: dict = {}
+    ends: list[list] = []
+    for i, e in enumerate(edges):
+        ad = occ.edge_adaptor(e)
+        pts = [ad.Value(ad.FirstParameter()), ad.Value(ad.LastParameter())]
+        ends.append(pts)
+        for p in pts:
+            if not on_cutter(p):
+                links.setdefault(vkey(p), []).append(i)
+
+    # union-find over edges connected through non-cut vertices
+    parent = list(range(len(edges)))
+
+    def find(a):
+        while parent[a] != a:
+            parent[a] = parent[parent[a]]
+            a = parent[a]
+        return a
+
+    for idxs in links.values():
+        for other in idxs[1:]:
+            ra, rb = find(idxs[0]), find(other)
+            if ra != rb:
+                parent[rb] = ra
+
+    groups: dict = {}
+    for i in range(len(edges)):
+        groups.setdefault(find(i), []).append(edges[i])
+    out = []
+    for group in groups.values():
+        out.append(group[0] if len(group) == 1 else join_curves(group))
+    return out
+
+
+def _reach_along(shape, direction) -> tuple:
+    """How far a shape stretches along a direction: (nearest, furthest).
+
+    The bounding box is read rather than the geometry, so this is generous
+    on anything at an angle to the world axes. A cutter only has to reach
+    clear through what it is cutting, so generous is the safe way to be
+    wrong.
+    """
+    (mn, mx) = bbox(shape)
+    reach = [x * direction[0] + y * direction[1] + z * direction[2]
+             for x in (mn[0], mx[0])
+             for y in (mn[1], mx[1])
+             for z in (mn[2], mx[2])]
+    return min(reach), max(reach)
+
+
+def _reaching_cutter(curve, target):
+    """The cutter stretched a little past both ends before it is swept.
+
+    A curve snapped so its ends sit on the surface's edges lands a micron
+    to a fraction of a millimetre inside them, and the splitter then finds
+    no crossing at all: only a cutter that overlapped the edges would work
+    (issue #22). Rhino counts a curve that gets to the edge within tolerance
+    as reaching it, and stretching the tool is harmless: past the edge there
+    is nothing left to cut, and a cutter that stops well short still fails
+    the way it should.
+    """
+    if is_closed_curve(curve):
+        return curve
+    lo, hi = bbox(target)
+    reach = max(100.0 * tol(), 1e-3 * math.dist(lo, hi))
+    try:
+        runs = _wire_bsplines(to_wire(curve))
+    except Exception:            # OCCT raises its own types for a bad wire
+        return curve
+    if not runs:
+        return curve
+    pieces = [curve]
+    for bs, t, sign in ((runs[0], runs[0].FirstParameter(), -1.0),
+                        (runs[-1], runs[-1].LastParameter(), 1.0)):
+        p = gp_Pnt()
+        v = gp_Vec()
+        bs.D1(t, p, v)
+        n = v.Magnitude()
+        if n < 1e-12:
+            continue
+        tip = (p.X() + sign * reach * v.X() / n,
+               p.Y() + sign * reach * v.Y() / n,
+               p.Z() + sign * reach * v.Z() / n)
+        pieces.append(make_line((p.X(), p.Y(), p.Z()), tip))
+    try:
+        return join_curves(pieces)
+    except GeometryError:
+        return curve
+
+
+def split_shape(target, cutters: list, direction=(0.0, 0.0, 1.0)) -> list:
+    """Split a curve or surface by cutting objects; returns the pieces.
+
+    Curves are cut by anything they intersect. Surfaces and solids cut by
+    an open curve use the curve swept into a surface as the cutting tool,
+    and `direction` is the way it sweeps: the normal of the plane the
+    command is drawing on, so that a line drawn across a box in a Front
+    pane cuts it the way it looked like it would. World Z, the plane a Top
+    pane draws on, is what you get if nobody says otherwise.
+    """
+    from .picture import PictureShape
+    if isinstance(target, PictureShape):
+        return [target.with_region(face) for face in
+                split_shape(target.face(), cutters, direction)]
+    from .hatch import HatchShape
+    if isinstance(target, HatchShape):
+        # Cut the region it fills, not the compound: the pattern's lines
+        # are drawn from the region and would otherwise be cut as loose
+        # linework, leaving a heap of segments where a hatch was (#45).
+        return [target.with_region(face) for face in
+                split_shape(target.region, cutters, direction)]
+    from .occ import BRepAlgoAPI_Splitter, TopTools_ListOfShape
+    kind = shape_kind(target)
+    length = math.sqrt(sum(float(v) ** 2 for v in direction))
+    d = ((0.0, 0.0, 1.0) if length < 1e-9
+         else tuple(float(v) / length for v in direction))
+
+    tools = TopTools_ListOfShape()
+    reaching = []               # the cutters as the splitter is shown them
+    for c in cutters:
+        if isinstance(c, PictureShape):
+            c = c.face()
+        elif shape_kind(c) in ("mesh", "pointcloud"):
+            raise GeometryError("Use curves, surfaces or pictures as cutting objects")
+        tool = c
+        if kind in ("surface", "solid") and shape_kind(c) == "curve":
+            # sweep the cutter clear through the target, starting a little
+            # behind whichever of the two comes first along the sweep
+            c = _reaching_cutter(c, target)
+            tmn, tmx = _reach_along(target, d)
+            cmn, cmx = _reach_along(c, d)
+            t0, t1 = min(tmn, cmn) - 1.0, max(tmx, cmx) + 1.0
+            moved = translate(c, tuple((t0 - cmn) * v for v in d))
+            tool = extrude(moved, d, (t1 - t0) + (cmx - cmn))
+        elif kind == "curve" and shape_kind(c) == "curve":
+            # a cutter stopping a whisker short of the curve is reaching it
+            # too, and the stretch is the whole fix here (issue #32)
+            tool = c = _reaching_cutter(c, target)
+        reaching.append(c)
+        tools.Append(tool)
+
+    args = TopTools_ListOfShape()
+    args.Append(target)
+    splitter = BRepAlgoAPI_Splitter()
+    splitter.SetArguments(args)
+    splitter.SetTools(tools)
+    splitter.Build()
+    if not splitter.IsDone():
+        raise GeometryError("Split failed")
+    result = splitter.Shape()
+
+    if kind == "curve":
+        # the stretched cutters, or a cut vertex sitting in the gap would
+        # measure as off the cutter and be threaded back into a join
+        pieces = _curve_pieces(edges_of(result), reaching)
+    elif kind in ("surface", "solid"):
+        if kind == "solid":
+            pieces = []
+            exp = TopExp_Explorer(result, occ.SOLID)
+            while exp.More():
+                pieces.append(exp.Current())
+                exp.Next()
+            if not pieces:
+                pieces = faces_of(result)
+        else:
+            pieces = faces_of(result)
+    else:
+        raise GeometryError("Can only split curves and surfaces")
+    if len(pieces) < 2:
+        raise GeometryError("Objects do not intersect — nothing to split")
+    return pieces
+
+
+# --- control points ---------------------------------------------------------
+
+def _adaptor_with_a_3d_curve(edge):
+    """An adaptor whose Curve() is safe to read.
+
+    Make2D leaves its curves as pcurves on the projection plane with no 3D
+    curve of their own, and OCCT answers `Curve()` on one of those with a
+    null handle that segfaults the moment anything trims or copies it.
+    BuildCurve3d computes the missing curve from the pcurve, in place.
+    """
+    from OCP.BRepLib import BRepLib
+    from OCP.GeomAbs import GeomAbs_CurveType
+    ad = occ.edge_adaptor(edge)
+    if ad.GetType() == GeomAbs_CurveType.GeomAbs_BSplineCurve:
+        return ad
+    if ad.Curve().Curve() is None:
+        BRepLib.BuildCurve3d_s(edge)
+        ad = occ.edge_adaptor(edge)
+        if (ad.GetType() != GeomAbs_CurveType.GeomAbs_BSplineCurve
+                and ad.Curve().Curve() is None):
+            raise GeometryError("This curve has no 3D geometry to read.")
+    return ad
+
+
+def _edge_bspline(shape):
+    """The (single) edge's curve as a fresh Geom_BSplineCurve in world frame."""
+    edges = edges_of(shape)
+    if shape_kind(shape) != "curve" or len(edges) != 1:
+        raise GeometryError("This works on single curves "
+                            "(explode polylines first)")
+    return _bspline_of_edge(edges[0])
+
+
+def _bspline_of_edge(edge):
+    """One edge's curve as a fresh Geom_BSplineCurve in the world frame."""
+    from .occ import GeomConvert
+    from OCP.Geom import Geom_TrimmedCurve
+    from OCP.GeomAbs import GeomAbs_CurveType
+    ad = _adaptor_with_a_3d_curve(edge)
+    if ad.GetType() == GeomAbs_CurveType.GeomAbs_BSplineCurve:
+        bs = ad.BSpline().Copy()      # OCP returns the derived type directly
+    else:
+        base = ad.Curve().Curve()
+        trimmed = Geom_TrimmedCurve(base, ad.FirstParameter(),
+                                    ad.LastParameter())
+        bs = GeomConvert.CurveToBSplineCurve_s(trimmed)
+        loc = edge.Location()
+        if not loc.IsIdentity():
+            bs.Transform(loc.Transformation())
+    return bs
+
+
+def _wire_runs(shape) -> list:
+    """The wire's edges, each with its curve as a b-spline, in the order
+    and the direction you walk the wire. An edge stored back to front is
+    reversed, so every one of them starts where the one before it finished
+    and the poles read along the curve rather than in whatever order the
+    file happened to hold."""
+    from OCP.BRepTools import BRepTools_WireExplorer
+    out = []
+    exp = BRepTools_WireExplorer(occ.to_wire(shape))
+    while exp.More():
+        edge = occ.to_edge(exp.Current())
+        bs = _bspline_of_edge(edge)
+        here = pnt_tuple(occ.point_of_vertex(exp.CurrentVertex()))
+        if (_d3(pnt_tuple(bs.StartPoint()), here)
+                > _d3(pnt_tuple(bs.EndPoint()), here)):
+            bs.Reverse()
+        out.append((edge, bs))
+        exp.Next()
+    if not out:
+        raise GeometryError("Not a curve")
+    return out
+
+
+def _wire_bsplines(shape) -> list:
+    """The wire's edges as b-splines, in walking order (see _wire_runs)."""
+    return [bs for _edge, bs in _wire_runs(shape)]
+
+
+def transform_segments(shape, indices, fn, vertices=()) -> TopoDS_Shape:
+    """The curve with the segments at `indices` (in edges_of order) and the
+    corners at `vertices` (in vertices_of order) put through the point map
+    `fn`, and the segments beside them stretched so the curve stays in one
+    piece. A held corner takes the ends of both segments meeting there and
+    nothing else of them.
+
+    Rhino's sub-object gumball on a polycurve: drag one side of a rectangle
+    and the rectangle resizes, because the two sides it meets follow their
+    shared corners. A neighbour that is not held keeps every pole but the
+    one at the corner it shares, so a straight neighbour stays straight
+    and an arc keeps its far end and its shape. A curve of one segment is
+    simply moved whole.
+    """
+    import numpy as np
+    edges = edges_of(shape)
+    held = sorted(set(int(i) for i in indices))
+    corners = curve_points(shape)
+    held_v = sorted(set(int(i) for i in vertices))
+    if not held and not held_v:
+        raise GeometryError("Nothing held to move")
+    if any(not (0 <= i < len(edges)) for i in held):
+        raise GeometryError("Segment index out of range")
+    if any(not (0 <= i < len(corners)) for i in held_v):
+        raise GeometryError("Point index out of range")
+    runs = _wire_runs(to_wire(shape))
+    n = len(runs)
+    at = []                                    # walking position of each held edge
+    for i in held:
+        pos = next((k for k, (e, _bs) in enumerate(runs)
+                    if e.IsSame(edges[i])), None)
+        if pos is None:
+            raise GeometryError("Segment is not part of the curve")
+        at.append(pos)
+    held_pos = set(at)
+
+    def moved(p):
+        q = fn(np.array([p.X(), p.Y(), p.Z()], float))
+        return gp_Pnt(float(q[0]), float(q[1]), float(q[2]))
+
+    splines = [bs for _e, bs in runs]
+    ends = [(pnt_tuple(bs.StartPoint()), pnt_tuple(bs.EndPoint()))
+            for bs in splines]
+    for k in held_pos:
+        bs = splines[k]
+        for j in range(1, bs.NbPoles() + 1):
+            bs.SetPole(j, moved(bs.Pole(j)))
+    if n > 1:
+        closed = is_closed_curve(shape)
+        for k in held_pos:
+            before = k - 1 if k > 0 else (n - 1 if closed else None)
+            after = k + 1 if k < n - 1 else (0 if closed else None)
+            if before is not None and before not in held_pos:
+                nb = splines[before]
+                nb.SetPole(nb.NbPoles(), splines[k].StartPoint())
+            if after is not None and after not in held_pos:
+                nb = splines[after]
+                nb.SetPole(1, splines[k].EndPoint())
+    targets = [corners[i] for i in held_v]
+    for k, bs in enumerate(splines):
+        if k in held_pos:
+            continue                      # moved whole, its ends with it
+        start, end = ends[k]
+        if any(_d3(start, t) <= tol() for t in targets):
+            bs.SetPole(1, moved(gp_Pnt(*start)))
+        if any(_d3(end, t) <= tol() for t in targets):
+            bs.SetPole(bs.NbPoles(), moved(gp_Pnt(*end)))
+        if bs.Degree() == 1:
+            for j in range(2, bs.NbPoles()):
+                p = pnt_tuple(bs.Pole(j))
+                if any(_d3(p, t) <= tol() for t in targets):
+                    bs.SetPole(j, moved(gp_Pnt(*p)))
+    return _curve_from_splines(splines)
+
+
+def move_segments(shape, indices, delta: Point) -> TopoDS_Shape:
+    """`transform_segments` by a plain shift."""
+    import numpy as np
+    d = np.asarray(delta, float)
+    return transform_segments(shape, indices, lambda p: p + d)
+
+
+def remove_segments(shape, indices) -> list:
+    """What is left of the curve without the segments at `indices`.
+
+    Taking a side out of a closed curve opens it, and taking a middle
+    segment out of an open one leaves the runs either side with nothing
+    between them, so they come back as separate curves. An empty list
+    means every segment went and there is no curve left.
+    """
+    edges = edges_of(shape)
+    drop = set(int(i) for i in indices)
+    if any(not (0 <= i < len(edges)) for i in drop):
+        raise GeometryError("Segment index out of range")
+    if not drop:
+        return [copy_shape(shape)]
+    runs = _wire_runs(to_wire(shape))
+    n = len(runs)
+    gone = set()
+    for i in drop:
+        pos = next((k for k, (e, _bs) in enumerate(runs)
+                    if e.IsSame(edges[i])), None)
+        if pos is None:
+            raise GeometryError("Segment is not part of the curve")
+        gone.add(pos)
+    kept = [k for k in range(n) if k not in gone]
+    if not kept:
+        return []
+    groups = [[kept[0]]]
+    for k in kept[1:]:
+        if k == groups[-1][-1] + 1:
+            groups[-1].append(k)
+        else:
+            groups.append([k])
+    if (len(groups) > 1 and is_closed_curve(shape)
+            and groups[0][0] == 0 and groups[-1][-1] == n - 1):
+        # the curve ran on round the loop, so the last run and the first
+        # are one run with the join in the middle of it
+        groups[0] = groups.pop() + groups[0]
+    return [_curve_from_splines([runs[k][1] for k in group])
+            for group in groups]
+
+
+def curve_degree(shape) -> int:
+    """The degree of a curve. A wire of mixed degree reports its highest,
+    which is the one that decides what the whole thing can represent."""
+    if len(edges_of(shape)) == 1:
+        return _bspline_of_edge(edges_of(shape)[0]).Degree()
+    return max(bs.Degree() for bs in _wire_bsplines(shape))
+
+
+def closest_point_on(shape, point: Point) -> Point:
+    """The point of `shape` nearest to `point`."""
+    from OCP.BRepExtrema import BRepExtrema_DistShapeShape
+    v = BRepBuilderAPI_MakeVertex(_pnt(point)).Vertex()
+    dist = BRepExtrema_DistShapeShape(v, shape)
+    if not dist.IsDone() or dist.NbSolution() == 0:
+        raise GeometryError("Could not measure to that shape")
+    p = dist.PointOnShape2(1)
+    return (p.X(), p.Y(), p.Z())
+
+
+def split_curve_at_points(curve, points: list) -> list:
+    """Split a curve at the points of it nearest to `points`."""
+    if shape_kind(curve) != "curve":
+        raise GeometryError("Only curves can be split at points")
+    on = [make_point(closest_point_on(curve, p)) for p in points]
+    if not on:
+        raise GeometryError("No points to split at")
+    return split_shape(curve, on)
+
+
+def shapes_touch(a, b) -> bool:
+    """Whether the two shapes meet anywhere, within tolerance."""
+    from OCP.BRepExtrema import BRepExtrema_DistShapeShape
+    dist = BRepExtrema_DistShapeShape(a, b)
+    return dist.IsDone() and dist.Value() <= tol()
+
+
+def distance_point_to_shape(shape, point: Point) -> float:
+    """Shortest distance from a point to anything with an edge or a face."""
+    from OCP.BRepExtrema import BRepExtrema_DistShapeShape
+    v = BRepBuilderAPI_MakeVertex(_pnt(point)).Vertex()
+    dist = BRepExtrema_DistShapeShape(v, shape)
+    if not dist.IsDone():
+        raise GeometryError("Could not measure to that shape")
+    return dist.Value()
+
+
+def _control_point_map(shape) -> tuple:
+    """(splines, points, owners) — every control point on the curve, and the
+    (spline, pole) places each one lives in.
+
+    A polyline is a segment per corner, so the corner between two of them is
+    one point to the eye and to the hand but two poles underneath. It is
+    listed once and owns both, because dragging half a corner would pull the
+    curve apart at the seam.
+    """
+    if shape_kind(shape) != "curve":
+        raise GeometryError("Not a curve")
+    edges = edges_of(shape)
+    if len(edges) == 1:
+        bs = _bspline_of_edge(edges[0])
+        pts = [pnt_tuple(bs.Pole(i)) for i in range(1, bs.NbPoles() + 1)]
+        return [bs], pts, [[(0, i)] for i in range(1, len(pts) + 1)]
+    splines = _wire_bsplines(shape)
+    pts: list = []
+    owners: list = []
+    for k, bs in enumerate(splines):
+        for i in range(1, bs.NbPoles() + 1):
+            p = pnt_tuple(bs.Pole(i))
+            if i == 1 and pts and _d3(p, pts[-1]) < 1e-7:
+                owners[-1].append((k, i))           # the joint, shared
+            else:
+                pts.append(p)
+                owners.append([(k, i)])
+    if len(pts) > 1 and _d3(pts[0], pts[-1]) < 1e-7:
+        owners[0].extend(owners.pop())              # closed: one start point
+        pts.pop()
+    return splines, pts, owners
+
+
+def _require_curve_points(shape):
+    """Refuse, as a GeometryError, a shape whose points are not a curve's
+    to delete or add to: OCCT's own error was not one, and took the click
+    or the command down with it."""
+    if not has_control_points(shape):
+        raise GeometryError("This object's points cannot be edited that way")
+
+
+def has_control_points(shape) -> bool:
+    """Whether a shape has control points of the curve kind, the ones a
+    click on a curve shows and knots can be put in among. False for what is
+    drawn rather than modelled: text or a hatch, and a dimension, whose
+    three points F10 shows (DimensionShape.control_points) but a click
+    does not."""
+    from .dimension import DimensionShape
+    from .hatch import HatchShape
+    from .text_object import TextShape
+    return not isinstance(shape, (DimensionShape, HatchShape, TextShape))
+
+
+def get_control_points(shape) -> list[Point]:
+    from .mesh import MeshShape
+    if isinstance(shape, MeshShape):
+        # a mesh's are its corners, each place counted once
+        return [tuple(float(c) for c in p) for p in shape.points()]
+    from .dimension import DimensionShape
+    if isinstance(shape, DimensionShape):
+        return shape.control_points()
+    if not has_control_points(shape):
+        raise GeometryError("This object has no control points")
+    try:
+        return _control_point_map(shape)[1]
+    except GeometryError:
+        raise
+    except Exception as exc:          # noqa: BLE001 - OCCT's own failures
+        raise GeometryError(f"No control points: {exc}") from exc
+
+
+def _face_bspline_surface(shape):
+    """The (single) face's surface as Geom_BSplineSurface in world frame."""
+    from .occ import BRep_Tool, GeomConvert
+    faces = faces_of(shape)
+    if len(faces) != 1:
+        raise GeometryError("Control points work on single-face surfaces "
+                            "(explode polysurfaces first)")
+    face = faces[0]
+    surf = BRep_Tool.Surface_s(face)
+    from OCP.Geom import Geom_BSplineSurface
+    if isinstance(surf, Geom_BSplineSurface):
+        return surf.Copy(), face
+    try:
+        return GeomConvert.SurfaceToBSplineSurface_s(surf), face
+    except Exception:
+        # infinite analytic surfaces (planes...) need bounding first
+        try:
+            from OCP.BRepAdaptor import BRepAdaptor_Surface
+            from OCP.Geom import Geom_RectangularTrimmedSurface
+            ba = BRepAdaptor_Surface(face)
+            trimmed = Geom_RectangularTrimmedSurface(
+                surf, ba.FirstUParameter(), ba.LastUParameter(),
+                ba.FirstVParameter(), ba.LastVParameter())
+            return GeomConvert.SurfaceToBSplineSurface_s(trimmed), face
+        except Exception as exc:
+            raise GeometryError(
+                f"Surface cannot be converted to NURBS: {exc}") from exc
+
+
+def _trimmed_corners(shape):
+    """For a single face cut out of a bigger surface (a trim, or holes):
+    its corners in the order its boundary runs, outer loop first, and how
+    many of them make the outer loop. None for a face that is its whole
+    surface, whose control points are the ones to show."""
+    from OCP.BRep import BRep_Tool
+    from OCP.BRepTools import BRepTools, BRepTools_WireExplorer
+    faces = faces_of(shape)
+    if len(faces) != 1:
+        return None
+    face = faces[0]
+    wires = []
+    exp = TopExp_Explorer(face, occ.WIRE)
+    while exp.More():
+        wires.append(occ.to_wire(exp.Current()))
+        exp.Next()
+    if len(wires) == 1:
+        if BRep_Tool.NaturalRestriction_s(face):
+            return None
+        try:
+            bs, _ = _face_bspline_surface(shape)
+            whole = BRepBuilderAPI_MakeFace(bs, tol()).Face()
+            u0, u1, v0, v1 = bs.Bounds()
+            ends = [pnt_tuple(bs.Value(u, v)) for u in (u0, u1)
+                    for v in (v0, v1)]
+            at_ends = all(min(math.dist(pnt_tuple(occ.point_of_vertex(v)), e)
+                              for e in ends) <= tol()
+                          for v in vertices_of(face))
+            if at_ends and abs(surface_area(whole) - abs(surface_area(face)))                     <= max(tol() ** 2, 1e-6 * surface_area(whole)):
+                # the whole surface: corners only where the surface's are
+                return None
+        except GeometryError:
+            return None
+    outer = BRepTools.OuterWire_s(face)
+    loops = [outer] + [w for w in wires if not w.IsSame(outer)]
+    corners, seen, outer_count = [], set(), 0
+    for n, wire in enumerate(loops):
+        walk = BRepTools_WireExplorer(wire, face)
+        while walk.More():
+            v = walk.CurrentVertex()
+            if hash(v) not in seen:
+                seen.add(hash(v))
+                corners.append(v)
+            walk.Next()
+        if n == 0:
+            outer_count = len(corners)
+    return corners, outer_count
+
+
+def surface_control_points(shape) -> tuple[list[Point], tuple]:
+    """Control points of a single-face surface, row-major (u, then v).
+
+    A face cut out of a bigger surface shows its corners instead, in the
+    order its boundary runs, with ("ring", n) for the n of them that make
+    the outer loop: the four points of the plane it was cut from say
+    nothing about its shape, and moving one would lose the cut."""
+    trimmed = _trimmed_corners(shape)
+    if trimmed is not None:
+        corners, outer = trimmed
+        return ([pnt_tuple(occ.point_of_vertex(v)) for v in corners],
+                ("ring", outer))
+    bs, _ = _face_bspline_surface(shape)
+    nu, nv = bs.NbUPoles(), bs.NbVPoles()
+    pts = []
+    for i in range(1, nu + 1):
+        for j in range(1, nv + 1):
+            pts.append(pnt_tuple(bs.Pole(i, j)))
+    return pts, (nu, nv)
+
+
+def move_surface_control_point(shape, flat_index: int,
+                               new_point: Point) -> TopoDS_Shape:
+    """New surface with control point `flat_index` (u-major) moved.
+
+    On a face cut out of a bigger surface the points are its corners
+    (surface_control_points), and the corner moves with the face keeping
+    its cut, the edges either side following."""
+    trimmed = _trimmed_corners(shape)
+    if trimmed is not None:
+        import numpy as np
+        corners, _outer = trimmed
+        if not 0 <= flat_index < len(corners):
+            raise GeometryError("Control point index out of range")
+        vertex = corners[flat_index]
+        every = vertices_of(shape)
+        index = next(i for i, v in enumerate(every) if v.IsSame(vertex))
+        shift = np.subtract(new_point, pnt_tuple(occ.point_of_vertex(vertex)))
+        matrix = np.column_stack((np.eye(3), shift))
+        return deform_parts(shape, [], [], [index], matrix)
+    bs, _ = _face_bspline_surface(shape)
+    nu, nv = bs.NbUPoles(), bs.NbVPoles()
+    if not (0 <= flat_index < nu * nv):
+        raise GeometryError("Control point index out of range")
+    i, j = divmod(flat_index, nv)
+    bs.SetPole(i + 1, j + 1, _pnt(new_point))
+    mk = BRepBuilderAPI_MakeFace(bs, tol())
+    if not mk.IsDone():
+        raise GeometryError("Surface rebuild failed")
+    return mk.Face()
+
+
+def _splines_of(shape) -> list:
+    """A curve's pieces as b-splines, in the order you walk the curve."""
+    if shape_kind(shape) != "curve":
+        raise GeometryError("Not a curve")
+    edges = edges_of(shape)
+    if len(edges) == 1:
+        return [_bspline_of_edge(edges[0])]
+    return _wire_bsplines(shape)
+
+
+def _curve_from_splines(splines) -> TopoDS_Shape:
+    """The edge one spline makes, or the wire several make in order."""
+    if len(splines) == 1:
+        return BRepBuilderAPI_MakeEdge(splines[0]).Edge()
+    mk = BRepBuilderAPI_MakeWire()
+    for bs in splines:
+        mk.Add(BRepBuilderAPI_MakeEdge(bs).Edge())
+    if not mk.IsDone():
+        raise GeometryError("Could not put the curve back together")
+    return mk.Wire()
+
+
+def move_control_point(shape, index: int, new_point: Point) -> TopoDS_Shape:
+    """Return a new curve with control point `index` (0-based) moved; a
+    mesh with that corner moved."""
+    from .mesh import MeshShape
+    if isinstance(shape, MeshShape):
+        if not 0 <= index < len(shape.points()):
+            raise GeometryError(f"Control point index {index} out of range")
+        return shape.points_moved([index], lambda _p: new_point)
+    from .dimension import DimensionShape
+    if isinstance(shape, DimensionShape):
+        return shape.with_control_point(index, new_point)
+    _require_curve_points(shape)
+    splines, pts, owners = _control_point_map(shape)
+    if not (0 <= index < len(pts)):
+        raise GeometryError(f"Control point index {index} out of range")
+    for k, i in owners[index]:
+        splines[k].SetPole(i, _pnt(new_point))
+    return _curve_from_splines(splines)
+
+
+def delete_control_points(shape, indices: list[int]):
+    """What is left of a curve once the given control points (0-based) go.
+
+    A polyline closes over the gap with a straight segment; a NURBS curve
+    is rebuilt from its remaining poles at the same degree. Below that the
+    curve gives up one piece of structure at a time rather than refusing
+    the delete: a loop down to two points straightens out, a single point
+    is returned as a point object, and nothing left returns None — the
+    caller's cue to take the object out of the scene. Joined wires of
+    mixed degree still have no one honest answer for a shared corner,
+    while enough curve survives to need one.
+    """
+    _require_curve_points(shape)
+    splines, pts, _owners = _control_point_map(shape)
+    drop = set(indices)
+    bad = [i for i in drop if not (0 <= i < len(pts))]
+    if bad:
+        raise GeometryError(f"Control point index {bad[0]} out of range")
+    keep = [p for i, p in enumerate(pts) if i not in drop]
+    if not keep:
+        return None
+    if len(keep) == 1:
+        return make_point(keep[0])
+    # two points cannot bound an area, so the loop opens instead
+    closed = is_closed_curve(shape) and len(keep) >= 3
+    degrees = {bs.Degree() for bs in splines}
+    if degrees == {1}:
+        return make_polyline(keep, closed=closed)
+    if len(splines) == 1:
+        return make_control_curve(keep, degree=splines[0].Degree(),
+                                  closed=closed)
+    raise GeometryError("Control points of joined curves cannot be "
+                        "deleted — explode the curve first")
+
+
+# --- knots ------------------------------------------------------------------
+
+def _nearest_place_on(splines, point) -> tuple[int, float]:
+    """(which spline, at what parameter) is closest to `point`.
+
+    You aim a click at a curve rather than hitting it, so every pick has to
+    come back down onto the curve before it means anything.
+    """
+    from OCP.GeomAPI import GeomAPI_ProjectPointOnCurve
+    p = _pnt(point)
+    best = None
+    for k, bs in enumerate(splines):
+        params = [bs.FirstParameter(), bs.LastParameter()]
+        proj = GeomAPI_ProjectPointOnCurve(p, bs)
+        if proj.NbPoints() > 0:
+            params.append(proj.LowerDistanceParameter())
+        for u in params:
+            d = p.Distance(bs.Value(u))
+            if best is None or d < best[0]:
+                best = (d, k, u)
+    if best is None:
+        raise GeometryError("Not a curve")
+    return best[1], best[2]
+
+
+def _removable_knots(bs) -> list[int]:
+    """The knot indices worth offering. The first and last are left out:
+    they are what holds a curve onto its end poles, and pulling one is not
+    an edit to the curve so much as an end to it."""
+    return list(range(2, bs.NbKnots()))
+
+
+def curve_knot_points(shape) -> list[Point]:
+    """Where the curve's spans meet, in order along it — the knots you can
+    take out. A curve of a single span has none."""
+    out: list[Point] = []
+    for bs in _splines_of(shape):
+        for i in _removable_knots(bs):
+            out.append(pnt_tuple(bs.Value(bs.Knot(i))))
+    return out
+
+
+def insert_knot(shape, point) -> TopoDS_Shape:
+    """A copy of the curve with a knot added where `point` falls on it.
+
+    The curve does not move by so much as a tolerance: this is the one edit
+    that hands you a control point for free, which is why it is how you get
+    a handle where you want to pull from rather than making do with the
+    ones the curve was built with.
+    """
+    _require_curve_points(shape)
+    splines = _splines_of(shape)
+    k, u = _nearest_place_on(splines, point)
+    bs = splines[k]
+    span = bs.LastParameter() - bs.FirstParameter()
+    eps = max(abs(span), 1.0) * 1e-9
+    if min(abs(u - bs.FirstParameter()), abs(u - bs.LastParameter())) < eps:
+        raise GeometryError("That is the end of the curve — pick a point "
+                            "along it")
+    try:
+        bs.InsertKnot(u)
+    except Exception as exc:                                   # noqa: BLE001
+        raise GeometryError(f"Could not add a knot there: {exc}") from exc
+    return _curve_from_splines(splines)
+
+
+def insert_knots_at_spans(shape) -> TopoDS_Shape:
+    """A knot in the middle of every span, the way Rhino's Automatic does.
+    Doubles what you have to pull on and still leaves the curve alone."""
+    _require_curve_points(shape)
+    splines = _splines_of(shape)
+    for bs in splines:
+        knots = [bs.Knot(i) for i in range(1, bs.NbKnots() + 1)]
+        for a, b in zip(knots[:-1], knots[1:]):
+            bs.InsertKnot((a + b) / 2.0)
+    return _curve_from_splines(splines)
+
+
+def remove_knot(shape, point) -> TopoDS_Shape:
+    """A copy of the curve with the knot nearest `point` taken out.
+
+    Unlike putting one in, this changes the shape: with a span fewer the
+    curve has to give up whatever that knot was holding. OCCT asks first
+    how far the curve may move, and asking for the knot out is the answer,
+    so there is no limit here. What it actually cost is worth measuring
+    afterwards (`max_deviation`) rather than forbidding in advance.
+    """
+    from OCP.Precision import Precision
+    splines = _splines_of(shape)
+    k, u = _nearest_place_on(splines, point)
+    bs = splines[k]
+    candidates = _removable_knots(bs)
+    if not candidates:
+        raise GeometryError("This curve has no knots to remove — it is a "
+                            "single span already")
+    i = min(candidates, key=lambda j: abs(bs.Knot(j) - u))
+    if not bs.RemoveKnot(i, bs.Multiplicity(i) - 1, Precision.Infinite_s()):
+        raise GeometryError("That knot cannot come out without tearing the "
+                            "curve")
+    return _curve_from_splines(splines)
+
+
+def max_deviation(a, b, count: int = 64) -> float:
+    """How far apart two curves run, sampled along both by arc length.
+
+    Point n of one against point n of the other, which is not quite the
+    distance between the curves but is the number that answers "did that
+    edit move anything I care about".
+    """
+    return max(_d3(x, y) for x, y in
+               zip(sample_curve(a, count), sample_curve(b, count)))
+
+
+# --- direction ---
+
+def _ordered_edges(shape) -> list:
+    """A curve's edges in the order and the direction you walk them."""
+    st = shape.ShapeType()
+    if st == occ.EDGE:
+        return [occ.to_edge(shape)]
+    if st != occ.WIRE:
+        raise GeometryError("Not a curve")
+    from OCP.BRepTools import BRepTools_WireExplorer
+    out = []
+    exp = BRepTools_WireExplorer(occ.to_wire(shape))
+    while exp.More():
+        out.append(occ.to_edge(exp.Current()))
+        exp.Next()
+    if not out:
+        raise GeometryError("Not a curve")
+    return out
+
+
+def _reversed_edge(edge):
+    """One edge running the other way, still the curve it was.
+
+    Reversing the topology alone would not do: an edge marked REVERSED is
+    read forwards by everything that asks it for a point, and only a wire
+    walking it takes the mark into account. This turns the geometry round
+    instead, so a circle stays a circle rather than becoming the b-spline
+    a conversion would leave.
+    """
+    from OCP.BRep import BRep_Tool
+    from OCP.BRepAdaptor import BRepAdaptor_Curve
+    curve = BRep_Tool.Curve_s(edge, 0.0, 0.0)
+    if curve is None:
+        raise GeometryError("That curve has no 3D geometry to reverse")
+    ad = BRepAdaptor_Curve(edge)
+    first, last = ad.FirstParameter(), ad.LastParameter()
+    mk = BRepBuilderAPI_MakeEdge(curve.Reversed(),
+                                 curve.ReversedParameter(last),
+                                 curve.ReversedParameter(first))
+    if not mk.IsDone():
+        raise GeometryError("Could not reverse that curve")
+    return mk.Edge()
+
+
+def reverse_curve(shape) -> TopoDS_Shape:
+    """The same curve, running the other way.
+
+    Which way a curve runs decides which end an offset comes out on, which
+    way a sweep travels along its rail and which side a shell thickens, so
+    it is worth being able to turn round without redrawing.
+    """
+    if shape_kind(shape) != "curve":
+        raise GeometryError("Not a curve")
+    edges = [_reversed_edge(e) for e in reversed(_ordered_edges(shape))]
+    if len(edges) == 1:
+        return edges[0]
+    mk = BRepBuilderAPI_MakeWire()
+    for e in edges:
+        mk.Add(e)
+    if not mk.IsDone():
+        raise GeometryError("Could not put the curve back together")
+    return mk.Wire()
+
+
+def flip_surface(shape) -> TopoDS_Shape:
+    """The same surface with its normal pointing the other way.
+
+    Nothing about the shape changes, only which side of it is the outside.
+    That is a topological mark rather than new geometry, which is why it is
+    exact and why doing it twice leaves no trace.
+    """
+    if not faces_of(shape):
+        raise GeometryError("Not a surface")
+    return shape.Reversed()
+
+
+def direction_arrows(shape, count: int = 8) -> list:
+    """Where to stand an arrow on a shape and which way it should point.
+
+    A curve's arrows run along it the way it is parameterised. A surface's
+    stand off each face along its normal, kept off the trimmed-away parts
+    where an arrow would float beside the surface rather than on it. Both
+    come back as (point, unit direction) pairs for the viewport to draw.
+    """
+    if shape_kind(shape) == "curve":
+        return _curve_arrows(shape, count)
+    if faces_of(shape):
+        return _surface_arrows(shape, count)
+    raise GeometryError("Nothing here has a direction to show")
+
+
+def _curve_arrows(shape, count: int) -> list:
+    from OCP.BRepAdaptor import BRepAdaptor_CompCurve
+    from OCP.GCPnts import GCPnts_UniformAbscissa
+    from OCP.gp import gp_Pnt, gp_Vec
+    st = shape.ShapeType()
+    if st == occ.WIRE:
+        ad = BRepAdaptor_CompCurve(occ.to_wire(shape))
+    elif st == occ.EDGE:
+        ad = occ.edge_adaptor(occ.to_edge(shape))
+    else:
+        raise GeometryError("Not a curve")
+    n = max(int(count), 1)
+    # n + 2 samples and the two ends dropped: an arrow standing on the last
+    # point of the curve has its head off the end of it.
+    ua = GCPnts_UniformAbscissa(ad, n + 2)
+    if not ua.IsDone():
+        raise GeometryError("Could not sample curve")
+    out = []
+    for i in range(2, ua.NbPoints()):
+        p, v = gp_Pnt(), gp_Vec()
+        ad.D1(ua.Parameter(i), p, v)
+        if v.Magnitude() < 1e-12:
+            continue
+        v.Normalize()
+        out.append(((p.X(), p.Y(), p.Z()), (v.X(), v.Y(), v.Z())))
+    return out
+
+
+def _surface_arrows(shape, count: int) -> list:
+    import math
+    from OCP.BRepAdaptor import BRepAdaptor_Surface
+    from OCP.BRepLProp import BRepLProp_SLProps
+    from OCP.BRepTopAdaptor import BRepTopAdaptor_FClass2d
+    from OCP.gp import gp_Pnt2d
+    from OCP.TopAbs import TopAbs_Orientation, TopAbs_State
+    faces = faces_of(shape)
+    k = max(1, int(round(math.sqrt(max(int(count), 1)))))
+    out = []
+    for face in faces:
+        surf = BRepAdaptor_Surface(face)
+        u0, u1 = surf.FirstUParameter(), surf.LastUParameter()
+        v0, v1 = surf.FirstVParameter(), surf.LastVParameter()
+        inside = BRepTopAdaptor_FClass2d(face, 1e-6)
+        flipped = face.Orientation() == TopAbs_Orientation.TopAbs_REVERSED
+        for i in range(k):
+            for j in range(k):
+                u = u0 + (u1 - u0) * (i + 0.5) / k
+                v = v0 + (v1 - v0) * (j + 0.5) / k
+                if inside.Perform(gp_Pnt2d(u, v)) == TopAbs_State.TopAbs_OUT:
+                    continue
+                props = BRepLProp_SLProps(surf, u, v, 1, 1e-7)
+                if not props.IsNormalDefined():
+                    continue
+                p, n = props.Value(), props.Normal()
+                d = (n.X(), n.Y(), n.Z())
+                if flipped:
+                    d = (-d[0], -d[1], -d[2])
+                out.append(((p.X(), p.Y(), p.Z()), d))
+    if not out:
+        # every sample fell in a trimmed-away part, so fall back to the one
+        # point each face is sure to have: a surface with no arrow at all
+        # looks like a surface with no direction.
+        out = [face_point_normal(f) for f in faces]
+    return out
+
+
+def sample_curve(shape, count: int) -> list[Point]:
+    """`count` points spaced uniformly by arc length along a curve/wire."""
+    from OCP.BRepAdaptor import BRepAdaptor_CompCurve
+    from OCP.GCPnts import GCPnts_UniformAbscissa
+    if count < 2:
+        raise GeometryError("Need at least 2 sample points")
+    st = shape.ShapeType()
+    if st == occ.WIRE:
+        adaptor = BRepAdaptor_CompCurve(occ.to_wire(shape))
+    elif st == occ.EDGE:
+        adaptor = occ.edge_adaptor(occ.to_edge(shape))
+    else:
+        raise GeometryError("Not a curve")
+    ua = GCPnts_UniformAbscissa(adaptor, int(count))
+    if not ua.IsDone():
+        raise GeometryError("Could not sample curve")
+    pts = []
+    for i in range(1, ua.NbPoints() + 1):
+        p = adaptor.Value(ua.Parameter(i))
+        pts.append((p.X(), p.Y(), p.Z()))
+    return pts
+
+
+def sample_curve_frames(shape, count: int) -> list[tuple]:
+    """`count` frames spaced uniformly by arc length: (origin, tangent, up).
+
+    The obvious frame to hand back is the Frenet one, and it is the wrong
+    one. Frenet's normal points wherever the curve is bending, so on a
+    straight stretch it is undefined and at an inflection it flips end over
+    end; anything carried along the curve somersaults at that point. This is
+    a rotation-minimising frame instead (Wang's double reflection): each
+    frame is the previous one carried forward by the smallest rotation that
+    lines up the tangents, so it only ever turns as much as the curve does.
+
+    `up` is perpendicular to `tangent`, and the third axis is their cross
+    product. Where the curve is flat the seed is chosen to be world up, so a
+    path drawn on the ground gives frames a person would have drawn.
+    """
+    import numpy as np
+    from OCP.BRepAdaptor import BRepAdaptor_CompCurve
+    from OCP.GCPnts import GCPnts_UniformAbscissa
+    from OCP.gp import gp_Pnt, gp_Vec
+    if count < 2:
+        raise GeometryError("Need at least 2 sample points")
+    st = shape.ShapeType()
+    if st == occ.WIRE:
+        adaptor = BRepAdaptor_CompCurve(occ.to_wire(shape))
+    elif st == occ.EDGE:
+        adaptor = occ.edge_adaptor(occ.to_edge(shape))
+    else:
+        raise GeometryError("Not a curve")
+    ua = GCPnts_UniformAbscissa(adaptor, int(count))
+    if not ua.IsDone():
+        raise GeometryError("Could not sample curve")
+
+    origins, tangents = [], []
+    for i in range(1, ua.NbPoints() + 1):
+        p, d = gp_Pnt(), gp_Vec()
+        adaptor.D1(ua.Parameter(i), p, d)
+        t = np.array([d.X(), d.Y(), d.Z()], float)
+        n = np.linalg.norm(t)
+        # A zero derivative happens at a cusp or a degenerate segment. The
+        # direction to the next sample is the honest answer there.
+        if n < 1e-12:
+            t = np.array([1.0, 0.0, 0.0]) if not tangents else tangents[-1]
+        else:
+            t = t / n
+        origins.append(np.array([p.X(), p.Y(), p.Z()], float))
+        tangents.append(t)
+
+    up = _seed_up(tangents[0])
+    ups = [up]
+    for i in range(len(origins) - 1):
+        ups.append(_carry_up(origins[i], tangents[i], ups[i],
+                             origins[i + 1], tangents[i + 1]))
+    return [(tuple(o), tuple(t), tuple(u))
+            for o, t, u in zip(origins, tangents, ups)]
+
+
+def _seed_up(tangent):
+    """World up, leaned off the tangent so it is perpendicular to it. If the
+    curve starts pointing straight up there is no such lean, so use world X
+    instead — any perpendicular will do, and the frame carries on from
+    whichever one it is given."""
+    import numpy as np
+    for world in ([0.0, 0.0, 1.0], [1.0, 0.0, 0.0]):
+        u = np.asarray(world) - float(np.dot(world, tangent)) * tangent
+        n = np.linalg.norm(u)
+        if n > 1e-9:
+            return u / n
+    return np.array([0.0, 1.0, 0.0])
+
+
+def _carry_up(p0, t0, u0, p1, t1):
+    """One step of the double reflection: reflect the frame through the plane
+    between the two points, then through the plane between the two tangents.
+    Two reflections make a rotation, and this is the one that carries t0 onto
+    t1 without spinning anything about it."""
+    import numpy as np
+    v1 = p1 - p0
+    c1 = float(np.dot(v1, v1))
+    u, t = u0, t0
+    if c1 > 1e-24:                       # coincident samples: nothing to do
+        u = u - (2.0 / c1) * float(np.dot(v1, u)) * v1
+        t = t - (2.0 / c1) * float(np.dot(v1, t)) * v1
+    v2 = t1 - t
+    c2 = float(np.dot(v2, v2))
+    if c2 > 1e-24:
+        u = u - (2.0 / c2) * float(np.dot(v2, u)) * v2
+    # Rounding drifts it off the tangent over a long curve; put it back.
+    u = u - float(np.dot(u, t1)) * t1
+    n = np.linalg.norm(u)
+    return _seed_up(t1) if n < 1e-9 else u / n
+
+
+def rebuild_curve(shape, point_count: int = 10,
+                  degree: int = 3) -> TopoDS_Shape:
+    """Rebuild a curve through `point_count` arc-length samples.
+
+    Degree 3 interpolates through the samples; other degrees fit a
+    least-squares approximation of that degree.
+    """
+    closed = is_closed_curve(shape)
+    n = max(int(point_count), 3 if closed else 2)
+    pts = sample_curve(shape, n + 1 if closed else n)
+    if closed:
+        pts = pts[:-1]
+        return make_interp_curve(pts, closed=True)
+    if degree == 3:
+        return make_interp_curve(pts)
+    from OCP.GeomAPI import GeomAPI_PointsToBSpline
+    from OCP.GeomAbs import GeomAbs_Shape
+    arr = TColgp_Array1OfPnt(1, len(pts))
+    for i, p in enumerate(pts, start=1):
+        arr.SetValue(i, _pnt(p))
+    cont = (GeomAbs_Shape.GeomAbs_C0 if degree < 2
+            else GeomAbs_Shape.GeomAbs_C1)
+    fit = GeomAPI_PointsToBSpline(arr, degree, degree, cont, 1e-4)
+    if not fit.IsDone():
+        raise GeometryError("Rebuild failed")
+    return BRepBuilderAPI_MakeEdge(fit.Curve()).Edge()
+
+
+def curvature_at(shape, near_point: Point) -> dict:
+    """Curvature of a curve at the point closest to `near_point`."""
+    from OCP.BRepLProp import BRepLProp_CLProps
+    from OCP.BRepExtrema import BRepExtrema_DistShapeShape
+    edges = edges_of(shape)
+    if not edges:
+        raise GeometryError("Not a curve")
+    v = BRepBuilderAPI_MakeVertex(_pnt(near_point)).Vertex()
+    best = None
+    for edge in edges:
+        dist = BRepExtrema_DistShapeShape(v, edge)
+        if dist.IsDone() and (best is None or dist.Value() < best[0]):
+            best = (dist.Value(), edge, dist.PointOnShape2(1))
+    _, edge, pt = best
+    ad = occ.edge_adaptor(edge)
+    # locate the parameter of the closest point by dense sampling refinement
+    t0, t1 = ad.FirstParameter(), ad.LastParameter()
+    samples = 256
+    best_t, best_d = t0, float("inf")
+    for i in range(samples + 1):
+        t = t0 + (t1 - t0) * i / samples
+        d = ad.Value(t).Distance(pt)
+        if d < best_d:
+            best_d, best_t = d, t
+    props = BRepLProp_CLProps(ad, best_t, 2, 1e-9)
+    k = props.Curvature()
+    return {
+        "point": pnt_tuple(ad.Value(best_t)),
+        "curvature": k,
+        "radius": (1.0 / k) if k > 1e-12 else float("inf"),
+    }
+
+
+def explode(shape) -> list:
+    """Decompose: wires -> edges, shells/solids -> faces, compounds -> parts.
+
+    Compounds are asked what they hold before anything else asks what they
+    are. shape_kind() classifies a compound by its contents, so a compound
+    of solids reports "solid", and going by that gave the faces of every
+    lump at once: a bar cut in half exploded into twelve faces rather than
+    the two bars. A compound holding one thing has nothing to come apart
+    at, so the thing itself is what gets exploded.
+    """
+    if shape.ShapeType() == occ.COMPOUND:
+        from .occ import TopoDS_Iterator
+        out = []
+        it = TopoDS_Iterator(shape)
+        while it.More():
+            out.append(it.Value())
+            it.Next()
+        if len(out) > 1:
+            return out
+        return explode(out[0]) if out else []
+    kind = shape_kind(shape)
+    if kind == "curve" and shape.ShapeType() == occ.WIRE:
+        return [e for e in edges_of(shape)]
+    if kind in ("surface", "solid"):
+        parts = faces_of(shape)
+        if len(parts) > 1:
+            return parts
+        return []
+    return []
+
+
+def remove_faces(shape, indices) -> TopoDS_Shape | None:
+    """Everything but those faces, sewn back up. None if nothing is left.
+
+    Taking a face off a solid opens it, so what comes back is a shell,
+    not a solid: the hole is the point. Sewing is what keeps the rest
+    one object rather than a loose pile, and a single survivor is
+    handed back on its own because there is nothing to sew it to.
+    """
+    from .occ import BRepBuilderAPI_Sewing
+    drop = set(int(i) for i in indices)
+    keep = [f for i, f in enumerate(faces_of(shape)) if i not in drop]
+    if not keep:
+        return None
+    if len(keep) == 1:
+        return copy_shape(keep[0])
+    sew = BRepBuilderAPI_Sewing(tol())
+    for f in keep:
+        sew.Add(f)
+    sew.Perform()
+    sewn = sew.SewedShape()
+    if sewn is None or sewn.IsNull():
+        raise GeometryError("Could not rejoin the remaining faces")
+    return unwrap_compound(sewn)
+
+
+# --- solids -----------------------------------------------------------------
+
+def make_box(corner: Point, dx: float, dy: float, dz: float) -> TopoDS_Shape:
+    if min(abs(dx), abs(dy), abs(dz)) < 1e-9:
+        raise GeometryError("Degenerate box")
+    x, y, z = corner
+    x, dx = (x + dx, -dx) if dx < 0 else (x, dx)
+    y, dy = (y + dy, -dy) if dy < 0 else (y, dy)
+    z, dz = (z + dz, -dz) if dz < 0 else (z, dz)
+    return BRepPrimAPI_MakeBox(_pnt((x, y, z)), dx, dy, dz).Shape()
+
+
+def make_sphere(center: Point, radius: float) -> TopoDS_Shape:
+    if radius <= 0:
+        raise GeometryError("Sphere radius must be positive")
+    return BRepPrimAPI_MakeSphere(_pnt(center), float(radius)).Shape()
+
+
+def make_cylinder(base: Point, radius: float, height: float,
+                  axis: Point = (0, 0, 1)) -> TopoDS_Shape:
+    if radius <= 0 or height == 0:
+        raise GeometryError("Cylinder needs positive radius and height")
+    ax = gp_Ax2(_pnt(base), _dir(axis))
+    return BRepPrimAPI_MakeCylinder(ax, float(radius), abs(float(height))).Shape()
+
+
+def make_cone(base: Point, radius1: float, radius2: float, height: float,
+              axis: Point = (0, 0, 1)) -> TopoDS_Shape:
+    ax = gp_Ax2(_pnt(base), _dir(axis))
+    return BRepPrimAPI_MakeCone(ax, float(radius1), float(radius2),
+                                abs(float(height))).Shape()
+
+
+def make_torus(center: Point, major_radius: float, minor_radius: float,
+               axis: Point = (0, 0, 1)) -> TopoDS_Shape:
+    ax = gp_Ax2(_pnt(center), _dir(axis))
+    return BRepPrimAPI_MakeTorus(ax, float(major_radius),
+                                 float(minor_radius)).Shape()
+
+
+# --- booleans ---------------------------------------------------------------
+
+def _boolean(op_cls, a, b, name: str) -> TopoDS_Shape:
+    op = op_cls(a, b)
+    op.Build()
+    if not op.IsDone():
+        raise GeometryError(f"Boolean {name} failed")
+    result = op.Shape()
+    if result.IsNull():
+        raise GeometryError(f"Boolean {name} produced no geometry")
+    return result
+
+
+def boolean_union(a, b) -> TopoDS_Shape:
+    return _boolean(BRepAlgoAPI_Fuse, a, b, "union")
+
+
+def boolean_difference(a, b) -> TopoDS_Shape:
+    return _boolean(BRepAlgoAPI_Cut, a, b, "difference")
+
+
+def boolean_intersection(a, b) -> TopoDS_Shape:
+    return _boolean(BRepAlgoAPI_Common, a, b, "intersection")
+
+
+def curve_regions(curves: list) -> list:
+    """The atomic regions a set of planar closed curves divides the plane into.
+
+    Every curve bounds a face, and every face is cut at the places the
+    others cross it, so what comes back is a set of faces that tile the
+    area the curves cover: no two interiors overlap, and the edge of one
+    is exactly the edge of its neighbour. That is what makes each face a
+    thing a CurveBoolean user can point at — a click lands in one region
+    and in no other.
+
+    Booleans between faces that merely touch along an edge can fail, so
+    every operation is attempted and its failure read as "no common
+    material" rather than as an error.
+    """
+    faces = []
+    for shape in curves:
+        face = planar_face(shape)
+        area = surface_area(face)
+        c = centroid(face)
+        # A curve drawn over another describes the same region twice, and a
+        # doubled region would come back doubled.
+        if any(math.isclose(surface_area(f), area, rel_tol=1e-7)
+               and math.dist(centroid(f), c) < tol() for f in faces):
+            continue
+        faces.append(face)
+    if not faces:
+        return []
+    regions = [faces[0]]
+    for face in faces[1:]:
+        pieces = []
+        for region in regions:
+            for op in (boolean_difference, boolean_intersection):
+                try:
+                    pieces.extend(faces_of(op(region, face)))
+                except GeometryError:
+                    pass
+        # The part of the new face no region placed earlier already covers.
+        outside = face
+        for region in regions:
+            try:
+                outside = boolean_difference(outside, region)
+            except GeometryError:
+                outside = None
+                break
+        if outside is not None:
+            pieces.extend(faces_of(outside))
+        regions = [f for f in pieces if surface_area(f) > tol() ** 2]
+    # Reconciliation: the regions must tile exactly the area the curves
+    # cover. A shortfall means a cut silently lost material, and the pick
+    # would be lying about what a click keeps.
+    try:
+        total = faces[0]
+        for f in faces[1:]:
+            total = boolean_union(total, f)
+        union_area = surface_area(total)
+        covered = sum(surface_area(r) for r in regions)
+    except GeometryError:
+        union_area = covered = None
+    if (union_area is not None and covered is not None
+            and covered < union_area - max(10 * tol() ** 2,
+                                           1e-6 * union_area)):
+        warnings.warn(
+            "CurveBoolean: some regions could not be computed — "
+            "the result may be incomplete.", stacklevel=2)
+    return regions
+
+
+def region_containing(regions, point: Point, plane_point: Point,
+                      plane_normal: Point) -> tuple[int | None, str]:
+    """Where a picked point falls: the region it is in, or why it is not.
+
+    Returns ``(index, "in")`` when the click is inside a region, and
+    ``(None, "on")`` / ``(None, "out")`` when it lands on a boundary
+    curve or outside everything. The click comes from the CPlane, which
+    is not always the plane the curves lie in, so it is dropped onto the
+    curves' plane first. The classifier reads the trimmed face itself, so
+    a hole is outside and a boundary curve is "on" — a click on a curve
+    is never read as being inside the region the curve bounds. Being
+    inside beats being on a boundary: a boundary is shared, so "on" is
+    only the answer when no region claims the point.
+    """
+    from OCP.TopAbs import TopAbs_State
+
+    along = sum((a - b) * n for a, b, n in
+                zip(point, plane_point, plane_normal))
+    p = tuple(a - along * n for a, n in zip(point, plane_normal))
+    for index, region in enumerate(regions):
+        if _region_state(region, p) == TopAbs_State.TopAbs_IN:
+            return index, "in"
+    for region in regions:
+        if _region_state(region, p) == TopAbs_State.TopAbs_ON:
+            return None, "on"
+    return None, "out"
+
+
+def _region_state(face, p: Point):
+    """IN/ON/OUT for a point already lying in the face's plane.
+
+    A failed classification is read as "outside" — the pick loop treats
+    it as a miss and asks again, which is the safe answer.
+    """
+    from OCP.BRepClass import BRepClass_FaceClassifier
+    from OCP.TopAbs import TopAbs_State
+
+    try:
+        cls = BRepClass_FaceClassifier()
+        cls.Perform(face, _pnt(p), tol())
+        return cls.State()
+    except Exception:                       # noqa: BLE001
+        return TopAbs_State.TopAbs_OUT
+
+
+def merge_planar_regions(faces: list) -> TopoDS_Shape:
+    """One shape from coplanar region faces, their shared edges fused.
+
+    Kept regions that share an edge belong to one outline, the way Rhino's
+    CurveBoolean combines regions: sewing stitches the faces and unifying
+    same-domain faces lifts the seams, so the boundaries read as a single
+    loop. The area has to survive the merge — if neither path hands back
+    the full area it was given, the untouched faces are returned instead,
+    and their boundaries still come back as separate loops.
+    """
+    if len(faces) == 1:
+        return faces[0]
+    total = sum(surface_area(f) for f in faces)
+
+    def _intact(shape):
+        return (shape is not None and not shape.IsNull()
+                and math.isclose(surface_area(shape), total,
+                                 rel_tol=1e-3, abs_tol=tol() ** 2))
+
+    try:
+        joined = join_surfaces(faces)
+        merged = merge_coplanar_faces(joined)
+        if _intact(merged):
+            return merged
+    except GeometryError:
+        pass
+    # Sewing cannot stitch faces that only touch at a vertex; a union
+    # fold can still succeed there.
+    try:
+        fused = faces[0]
+        for f in faces[1:]:
+            fused = boolean_union(fused, f)
+        if _intact(fused):
+            return fused
+    except GeometryError:
+        pass
+    return make_compound(faces)
+
+
+# --- transforms -------------------------------------------------------------
+
+def _apply_trsf(shape, trsf: gp_Trsf, copy: bool = True) -> TopoDS_Shape:
+    from .text_object import TextShape
+    from .hatch import HatchShape
+    from .dimension import DimensionShape
+    if isinstance(shape, (TextShape, HatchShape, DimensionShape)):
+        return shape.transformed(_transform_matrix(trsf))
+    return BRepBuilderAPI_Transform(shape, trsf, copy).Shape()
+
+
+def _transform_matrix(trsf):
+    return [[trsf.Value(row, col) for col in range(1, 5)]
+            for row in range(1, 4)] + [[0., 0., 0., 1.]]
+
+
+def translate(shape, offset: Point) -> TopoDS_Shape:
+    from .mesh import MeshShape
+    from .pointcloud import PointCloudShape
+    if isinstance(shape, (MeshShape, PointCloudShape)):
+        return shape.translated(offset)
+    t = gp_Trsf()
+    t.SetTranslation(_vec(offset))
+    return _apply_trsf(shape, t)
+
+
+def rotate(shape, axis_point: Point, axis_dir: Point,
+           angle_deg: float) -> TopoDS_Shape:
+    from .mesh import MeshShape
+    from .pointcloud import PointCloudShape
+    if isinstance(shape, (MeshShape, PointCloudShape)):
+        import numpy as np
+        a = np.asarray(axis_dir, float)
+        a = a / np.linalg.norm(a)
+        ang = math.radians(float(angle_deg))
+        K = np.array([[0, -a[2], a[1]], [a[2], 0, -a[0]],
+                      [-a[1], a[0], 0]])
+        R = np.eye(3) + math.sin(ang) * K + (1 - math.cos(ang)) * (K @ K)
+        o = np.asarray(axis_point, float)
+        m = np.eye(4)
+        m[:3, :3] = R
+        m[:3, 3] = o - R @ o
+        return shape.transformed(m)
+    t = gp_Trsf()
+    t.SetRotation(gp_Ax1(_pnt(axis_point), _dir(axis_dir)),
+                  math.radians(float(angle_deg)))
+    return _apply_trsf(shape, t)
+
+
+def _gtransform(shape, gtrsf) -> TopoDS_Shape:
+    """Non-uniform (gp_GTrsf) transform, made safe against a known OCCT
+    crash: BRepBuilderAPI_GTransform on a shape that already carries a
+    triangulation (from a prior tessellation) silently produces faces
+    with NULL surfaces, and any later OCCT call on them segfaults.
+    Strip the triangulation first, then reject a degenerate result."""
+    from .text_object import TextShape
+    from .hatch import HatchShape
+    from .dimension import DimensionShape
+    if isinstance(shape, (TextShape, HatchShape, DimensionShape)):
+        return shape.transformed(_transform_matrix(gtrsf))
+    from OCP.BRepTools import BRepTools
+    BRepTools.Clean_s(shape)
+    flat = _gtransform_flat_face(shape, gtrsf)
+    if flat is not None:
+        return flat
+    result = BRepBuilderAPI_GTransform(shape, gtrsf, True)
+    if not result.IsDone():
+        raise GeometryError("Non-uniform transform failed")
+    out = result.Shape()
+    if _has_null_surface(out):
+        raise GeometryError("Non-uniform transform produced degenerate "
+                            "geometry")
+    return out
+
+
+def _gtransform_flat_face(shape, gtrsf):
+    """A single plane face under a linear map, kept a true plane; None for
+    anything else.
+
+    BRepBuilderAPI_GTransform turns every surface into NURBS. A plane comes
+    out still flat but no longer a plane to anything that asks for one: a
+    clipping plane stretched along one axis stopped cutting and lost its
+    arrow, and the normal read off the NURBS surface cannot be trusted
+    either, since a plane that has been mirrored to flip it keeps the old
+    parameter directions and would quietly turn back round. So the outline
+    alone is mapped, and laid back on a plane whose normal is carried across
+    the way a plane's normal is, by the inverse transpose, sense and all.
+    One hole or more and it is left to the general transform.
+    """
+    import numpy as np
+    from OCP.BRepTools import BRepTools
+    if shape.IsNull() or shape.ShapeType() != occ.FACE:
+        return None
+    face = occ.to_face(shape)
+    try:
+        normal = np.asarray(face_normal(face), float)
+    except GeometryError:
+        return None                       # not a plane: nothing to keep
+    wires = TopExp_Explorer(face, occ.WIRE)
+    count = 0
+    while wires.More():
+        count += 1
+        wires.Next()
+    if count != 1:
+        return None
+    m = np.array([[gtrsf.Value(r, c) for c in (1, 2, 3)] for r in (1, 2, 3)],
+                 float)
+    if abs(np.linalg.det(m)) < 1e-12:
+        return None
+    turned = np.linalg.inv(m).T @ normal
+    turned /= np.linalg.norm(turned)
+    moved = BRepBuilderAPI_GTransform(BRepTools.OuterWire_s(face), gtrsf,
+                                      True)
+    if not moved.IsDone():
+        return None
+    wire = occ.to_wire(moved.Shape())
+    origin = np.asarray(centroid(face), float)
+    t = np.array([gtrsf.Value(r, 4) for r in (1, 2, 3)], float)
+    at = m @ origin + t
+    from OCP.gp import gp_Pln
+    built = BRepBuilderAPI_MakeFace(
+        gp_Pln(gp_Pnt(*at), gp_Dir(*turned)), wire, True)
+    if not built.IsDone():
+        return None
+    out = built.Face()
+    if float(np.dot(face_normal(out), turned)) < 0:
+        out = occ.to_face(out.Reversed())
+    return out
+
+
+def _has_null_surface(shape) -> bool:
+    from OCP.BRep import BRep_Tool
+    exp = TopExp_Explorer(shape, occ.FACE)
+    while exp.More():
+        if BRep_Tool.Surface_s(occ.to_face(exp.Current())) is None:
+            return True
+        exp.Next()
+    return False
+
+
+def scale(shape, center: Point, factor: float,
+          factors: Point | None = None) -> TopoDS_Shape:
+    """Uniform scale, or non-uniform when `factors=(sx,sy,sz)` given."""
+    from .mesh import MeshShape
+    from .pointcloud import PointCloudShape
+    if isinstance(shape, (MeshShape, PointCloudShape)):
+        import numpy as np
+        f = np.asarray(factors if factors is not None
+                       else (factor, factor, factor), float)
+        if np.any(np.abs(f) < 1e-12):
+            raise GeometryError("Scale factor cannot be zero")
+        c = np.asarray(center, float)
+        m = np.eye(4)
+        m[:3, :3] = np.diag(f)
+        m[:3, 3] = c - f * c
+        return shape.transformed(m)
+    if factors is None:
+        if factor == 0:
+            raise GeometryError("Scale factor cannot be zero")
+        t = gp_Trsf()
+        t.SetScale(_pnt(center), float(factor))
+        return _apply_trsf(shape, t)
+    sx, sy, sz = (float(f) for f in factors)
+    if 0 in (sx, sy, sz):
+        raise GeometryError("Scale factors cannot be zero")
+    cx, cy, cz = center
+    gt = gp_GTrsf()
+    gt.SetVectorialPart(gp_Mat(sx, 0, 0, 0, sy, 0, 0, 0, sz))
+    gt.SetTranslationPart(gp_XYZ(cx - sx * cx, cy - sy * cy, cz - sz * cz))
+    return _gtransform(shape, gt)
+
+
+def scale_along_axis(shape, center: Point, axis: Point,
+                     factor: float) -> TopoDS_Shape:
+    """Non-uniform scale by `factor` along an arbitrary unit axis."""
+    import numpy as np
+    if abs(factor) < 1e-9:
+        raise GeometryError("Scale factor cannot be zero")
+    a = np.asarray(axis, float)
+    a = a / np.linalg.norm(a)
+    m = np.eye(3) + (float(factor) - 1.0) * np.outer(a, a)
+    c = np.asarray(center, float)
+    t = c - m @ c
+    gt = gp_GTrsf()
+    gt.SetVectorialPart(gp_Mat(*m.flatten()))
+    gt.SetTranslationPart(gp_XYZ(*t))
+    return _gtransform(shape, gt)
+
+
+def mirror(shape, plane_point: Point, plane_normal: Point) -> TopoDS_Shape:
+    from .mesh import MeshShape
+    from .pointcloud import PointCloudShape
+    if isinstance(shape, (MeshShape, PointCloudShape)):
+        import numpy as np
+        n = np.asarray(plane_normal, float)
+        n = n / np.linalg.norm(n)
+        o = np.asarray(plane_point, float)
+        R = np.eye(3) - 2 * np.outer(n, n)
+        m = np.eye(4)
+        m[:3, :3] = R
+        m[:3, 3] = o - R @ o
+        return shape.transformed(m)
+    t = gp_Trsf()
+    t.SetMirror(gp_Ax2(_pnt(plane_point), _dir(plane_normal)))
+    return _apply_trsf(shape, t)
+
+
+def copy_shape(shape) -> TopoDS_Shape:
+    from .mesh import MeshShape
+    from .pointcloud import PointCloudShape
+    from .text_object import TextShape
+    from .hatch import HatchShape
+    from .dimension import DimensionShape
+    if isinstance(shape, (MeshShape, PointCloudShape, TextShape, HatchShape,
+                          DimensionShape)):
+        return shape.copy()
+    return BRepBuilderAPI_Copy(shape).Shape()
+
+
+# --- interrogation ----------------------------------------------------------
+
+_KIND_OF_TYPE = {
+    occ.EDGE: "curve", occ.WIRE: "curve", occ.FACE: "surface",
+    occ.SHELL: "surface", occ.SOLID: "solid", occ.COMPSOLID: "solid",
+    occ.VERTEX: "point",
+}
+
+
+def shape_kind(shape) -> str:
+    """Classify as 'curve' | 'surface' | 'solid' | 'mesh' | 'pointcloud' |
+    'point' | 'compound'.
+
+    Compounds are classified by their contents when uniform: a compound of
+    solids behaves as a solid, of curves as a curve, and so on."""
+    # a plain OCC shape at once, with no imports: it is asked of thousands
+    # of points at a time (a hatch is a compound, so it goes the long way)
+    if isinstance(shape, TopoDS_Shape):
+        kind = _KIND_OF_TYPE.get(shape.ShapeType())
+        if kind is not None:
+            return kind
+    from .mesh import MeshShape
+    from .pointcloud import PointCloudShape
+    from .picture import PictureShape
+    from .hatch import HatchShape
+    if isinstance(shape, PictureShape):
+        return "picture"
+    if isinstance(shape, HatchShape):
+        return "hatch"
+    if isinstance(shape, MeshShape):
+        return "mesh"
+    if isinstance(shape, PointCloudShape):
+        return "pointcloud"
+    st = shape.ShapeType()
+    if st in (occ.EDGE, occ.WIRE):
+        return "curve"
+    if st in (occ.FACE, occ.SHELL):
+        return "surface"
+    if st in (occ.SOLID, occ.COMPSOLID):
+        return "solid"
+    if st == occ.VERTEX:
+        return "point"
+    kinds = set()
+    from .occ import TopoDS_Iterator
+    it = TopoDS_Iterator(shape)
+    while it.More():
+        kinds.add(shape_kind(it.Value()))
+        it.Next()
+    if len(kinds) == 1:
+        return kinds.pop()
+    return "compound"
+
+
+def unwrap_compound(shape) -> TopoDS_Shape:
+    """Strip single-child compound wrappers (some OCCT ops add them)."""
+    from .occ import TopoDS_Iterator
+    while shape.ShapeType() == occ.COMPOUND:
+        it = TopoDS_Iterator(shape)
+        children = []
+        while it.More():
+            children.append(it.Value())
+            it.Next()
+        if len(children) != 1:
+            break
+        shape = children[0]
+    return shape
+
+
+def bbox(shape) -> tuple[Point, Point]:
+    from .mesh import MeshShape
+    from .pointcloud import PointCloudShape
+    if shape is None:
+        # The kernel answers this with a TypeError about argument types,
+        # which reads like a version mismatch and sends you looking in the
+        # wrong place. It is only ever a shape that never arrived.
+        raise GeometryError("This object has no geometry to measure")
+    from .text_object import TextShape
+    if isinstance(shape, (MeshShape, PointCloudShape, TextShape)):
+        return shape.bbox()
+    box = Bnd_Box()
+    occ.bbox_add(shape, box)
+    if box.IsVoid():
+        return ((0, 0, 0), (0, 0, 0))
+    xmin, ymin, zmin, xmax, ymax, zmax = box.Get()
+    return ((xmin, ymin, zmin), (xmax, ymax, zmax))
+
+
+def curve_length(shape) -> float:
+    return occ.linear_properties(shape).Mass()
+
+
+def surface_area(shape) -> float:
+    from .mesh import MeshShape
+    from .pointcloud import PointCloudShape
+    if isinstance(shape, MeshShape):
+        return shape.area()
+    if isinstance(shape, PointCloudShape):
+        return 0.0                    # points have no surface
+    from .hatch import HatchShape
+    if isinstance(shape, HatchShape):
+        shape = shape.region          # the area it covers, not its lines
+    return occ.surface_properties(shape).Mass()
+
+
+def volume(shape) -> float:
+    from .mesh import MeshShape
+    from .pointcloud import PointCloudShape
+    if isinstance(shape, MeshShape):
+        return shape.volume()
+    if isinstance(shape, PointCloudShape):
+        return 0.0
+    return occ.volume_properties(shape).Mass()
+
+
+def centroid(shape) -> Point:
+    from .mesh import MeshShape
+    from .pointcloud import PointCloudShape
+    if isinstance(shape, (MeshShape, PointCloudShape)):
+        return shape.centroid()
+    from .hatch import HatchShape
+    if isinstance(shape, HatchShape):
+        shape = shape.region          # the middle of what it covers
+    kind = shape_kind(shape)
+    if kind == "solid":
+        props = occ.volume_properties(shape)
+    elif kind == "surface":
+        props = occ.surface_properties(shape)
+    else:
+        props = occ.linear_properties(shape)
+    return pnt_tuple(props.CentreOfMass())
+
+
+def is_valid(shape) -> bool:
+    return BRepCheck_Analyzer(shape).IsValid()
+
+
+# --- serialization ----------------------------------------------------------
+
+# An imported mesh is geometry, and BREP has nowhere to put it. Rather
+# than let every caller learn that, the bytes carry their own kind: a
+# mesh is tagged, anything else is the BREP it always was.
+_MESH_TAG = b"SMSH\x01"
+# Version 2 of it: a float64 origin, then the vertices as float32 offsets
+# from it. float32 steps 6cm at a million units, so a survey mesh written
+# absolute was rounded onto that grid every time it went through undo or
+# the clipboard. Offsets are good to a micron wherever the mesh stands and
+# cost the same bytes. A mesh near the origin is still written as \x01.
+_MESH_ORIGIN_TAG = b"SMSH\x02"
+# A point cloud the same way, for the clipboard, the journal and undo: the
+# .byrd file itself keeps clouds as raw blobs (fileio/native.py), not this.
+_CLOUD_TAG = b"SPCL\x01"
+
+
+def shape_to_bytes(shape) -> bytes:
+    from .text_object import TextShape
+    from .hatch import HatchShape
+    from .dimension import DimensionShape
+    if isinstance(shape, (TextShape, HatchShape, DimensionShape)):
+        return shape.to_bytes()
+    from .picture import PictureShape
+    if isinstance(shape, PictureShape):
+        return shape.to_bytes()
+    from .mesh import MeshShape
+    from .pointcloud import PointCloudShape
+    if isinstance(shape, PointCloudShape):
+        return _CLOUD_TAG + _cloud_pack(shape)
+    if isinstance(shape, MeshShape):
+        import numpy as np
+        from ..utils.math3d import offsets_from, origin_for
+        t = np.ascontiguousarray(shape.triangles, "<u4")
+        origin = origin_for(shape.vertices)
+        if origin is None:
+            v = np.ascontiguousarray(shape.vertices, "<f4")
+            return (_MESH_TAG + struct.pack("<II", len(v), len(t))
+                    + v.tobytes() + t.tobytes())
+        v = np.ascontiguousarray(offsets_from(shape.vertices, origin), "<f4")
+        return (_MESH_ORIGIN_TAG + struct.pack("<II", len(v), len(t))
+                + np.ascontiguousarray(origin, "<f8").tobytes()
+                + v.tobytes() + t.tobytes())
+    fd, path = tempfile.mkstemp(suffix=".brep")
+    os.close(fd)
+    try:
+        occ.brep_write(shape, path)
+        with open(path, "rb") as f:
+            return f.read()
+    finally:
+        os.unlink(path)
+
+
+def _cloud_pack(cloud) -> bytes:
+    import numpy as np
+    parts = [struct.pack("<I", cloud.count)]
+    flags = ((1 if cloud.rgb is not None else 0)
+             | (2 if cloud.conf is not None else 0)
+             | (4 if cloud.level is not None else 0)
+             # Bit 8: the float32 points are offsets from a float64 origin
+             # written after them, as the .byrd container stores a scan far
+             # from the world's origin. Records written before this have
+             # the bit clear and their points are absolute.
+             | (8 if cloud.far else 0))
+    parts.append(struct.pack("<I", flags))
+    parts.append(np.ascontiguousarray(cloud.local, "<f4").tobytes())
+    if cloud.rgb is not None:
+        parts.append(np.ascontiguousarray(cloud.rgb, np.uint8).tobytes())
+    if cloud.conf is not None:
+        parts.append(np.ascontiguousarray(cloud.conf, "<f4").tobytes())
+    if cloud.level is not None:
+        parts.append(np.ascontiguousarray(cloud.level, np.uint8).tobytes())
+    if cloud.far:
+        parts.append(np.ascontiguousarray(cloud.origin, "<f8").tobytes())
+    return b"".join(parts)
+
+
+def _cloud_unpack(data: bytes, offset: int):
+    import numpy as np
+    from .pointcloud import PointCloudShape
+    n, flags = struct.unpack("<II", data[offset:offset + 8])
+    at = offset + 8
+    xyz = np.frombuffer(data, "<f4", count=n * 3, offset=at).reshape(-1, 3)
+    at += n * 12
+    rgb = conf = level = None
+    if flags & 1:
+        rgb = np.frombuffer(data, np.uint8, count=n * 3,
+                            offset=at).reshape(-1, 3)
+        at += n * 3
+    if flags & 2:
+        conf = np.frombuffer(data, "<f4", count=n, offset=at)
+        at += n * 4
+    if flags & 4:
+        level = np.frombuffer(data, np.uint8, count=n, offset=at)
+        at += n
+    origin = None
+    if flags & 8:
+        origin = np.frombuffer(data, "<f8", count=3, offset=at)
+    return PointCloudShape(xyz, rgb, conf, level, origin=origin)
+
+
+def shape_from_bytes(data: bytes):
+    from .text_object import TEXT_TAG, TextShape
+    if data.startswith(TEXT_TAG):
+        return TextShape.from_bytes(data)
+    from .hatch import HATCH_TAG, HatchShape
+    if data.startswith(HATCH_TAG):
+        return HatchShape.from_bytes(data)
+    from .dimension import DIMENSION_TAG, DimensionShape
+    if data.startswith(DIMENSION_TAG):
+        return DimensionShape.from_bytes(data)
+    from .picture import PICTURE_TAG, PictureShape
+    if data.startswith(PICTURE_TAG):
+        return PictureShape.from_bytes(data)
+    if data[:len(_CLOUD_TAG)] == _CLOUD_TAG:
+        return _cloud_unpack(data, len(_CLOUD_TAG))
+    if data[:len(_MESH_TAG)] in (_MESH_TAG, _MESH_ORIGIN_TAG):
+        import numpy as np
+        from .mesh import MeshShape
+        rebased = data[:len(_MESH_TAG)] == _MESH_ORIGIN_TAG
+        head = len(_MESH_TAG) + 8
+        nv, nt = struct.unpack("<II", data[len(_MESH_TAG):head])
+        origin = np.zeros(3)
+        if rebased:
+            origin = np.frombuffer(data, "<f8", count=3, offset=head)
+            head += 24
+        cut = head + nv * 12
+        return MeshShape(
+            np.frombuffer(data, "<f4", count=nv * 3,
+                          offset=head).reshape(-1, 3).astype(float) + origin,
+            np.frombuffer(data, "<u4", count=nt * 3,
+                          offset=cut).reshape(-1, 3))
+    fd, path = tempfile.mkstemp(suffix=".brep")
+    os.close(fd)
+    try:
+        with open(path, "wb") as f:
+            f.write(data)
+        return occ.brep_read(path)
+    finally:
+        os.unlink(path)
+
+
+def make_compound(shapes: list) -> TopoDS_Shape:
+    builder = BRep_Builder()
+    comp = TopoDS_Compound()
+    builder.MakeCompound(comp)
+    for s in shapes:
+        builder.Add(comp, s)
+    return comp
+
+
+# --- daily-driver batch: points, pipe, borders, untrim, edgesrf, isocurves ---
+
+def make_point(p: Point) -> TopoDS_Shape:
+    """A point object (vertex)."""
+    from .occ import BRepBuilderAPI_MakeVertex
+    return BRepBuilderAPI_MakeVertex(_pnt(p)).Vertex()
+
+
+def point_coords(shape) -> Point:
+    from OCP.BRep import BRep_Tool
+    p = BRep_Tool.Pnt_s(occ.to_vertex(shape))
+    return (p.X(), p.Y(), p.Z())
+
+
+def transform_points(points, fn) -> list:
+    """Where `fn`, a transform written for shapes, leaves bare positions.
+
+    A control point is a position and nothing else, so there is no shape to
+    hand to a shape transform. Each one goes through as a vertex and comes
+    back as a position, which is what lets a command move the points it is
+    holding by the very rule it moves whole objects by: neither can be given
+    a scale, a mirror or an angle the other did not get.
+    """
+    return [point_coords(fn(make_point(tuple(float(v) for v in p))))
+            for p in points]
+
+
+def free_points(shape) -> list:
+    """The vertices in a shape that no edge already draws.
+
+    A point object is a vertex, and a vertex is the one thing in a shape with
+    nothing to walk along: whatever draws a shape by its edges draws none of it.
+    The corners of a curve are left out, since the curve is already there — what
+    comes back is what would otherwise not be seen at all.
+    """
+    if shape is None:
+        return []
+    if shape.ShapeType() == occ.VERTEX:
+        return [point_coords(shape)]
+    if shape.ShapeType() != occ.COMPOUND:
+        return []
+    from OCP.TopExp import TopExp
+    from OCP.TopTools import TopTools_IndexedDataMapOfShapeListOfShape
+    owners = TopTools_IndexedDataMapOfShapeListOfShape()
+    TopExp.MapShapesAndAncestors_s(shape, occ.VERTEX, occ.EDGE, owners)
+    exp = TopExp_Explorer(shape, occ.VERTEX)
+    out, seen = [], set()
+    while exp.More():
+        v = occ.to_vertex(exp.Current())
+        exp.Next()
+        key = hash(v)                     # the shape's own hash, not a
+        if key in seen:                   # wrapper's address (see edges_of)
+            continue
+        seen.add(key)
+        idx = owners.FindIndex(v)
+        if idx == 0 or owners.FindFromIndex(idx).Size() == 0:
+            out.append(point_coords(v))
+    return out
+
+
+def pipe(rail, radius: float, cap: bool = True) -> TopoDS_Shape:
+    """Tube of the given radius around a rail curve."""
+    if radius <= 0:
+        raise GeometryError("Pipe radius must be positive")
+    from OCP.BRepAdaptor import BRepAdaptor_CompCurve
+    from OCP.BRepBuilderAPI import BRepBuilderAPI_TransitionMode
+    from .occ import BRepOffsetAPI_MakePipeShell, gp_Vec
+
+    wire = occ.to_wire(to_wire(rail))
+    ad = BRepAdaptor_CompCurve(wire)
+    p0, tan = gp_Pnt(), gp_Vec()
+    ad.D1(ad.FirstParameter(), p0, tan)
+    if tan.Magnitude() < 1e-12:
+        raise GeometryError("Cannot find rail direction")
+    profile = make_circle((p0.X(), p0.Y(), p0.Z()), radius,
+                          (tan.X(), tan.Y(), tan.Z()))
+    ps = BRepOffsetAPI_MakePipeShell(wire)
+    ps.SetTransitionMode(
+        BRepBuilderAPI_TransitionMode.BRepBuilderAPI_RoundCorner)
+    ps.Add(occ.to_wire(to_wire(profile)), False, False)
+    ps.Build()
+    if not ps.IsDone():
+        raise GeometryError("Pipe failed on this rail")
+    if cap:
+        ps.MakeSolid()  # caps planar ends; harmless no-op when impossible
+    return ps.Shape()
+
+
+def free_boundaries(shape) -> list:
+    """Naked boundary wires of a surface/polysurface (empty for solids)."""
+    from .occ import ShapeAnalysis_FreeBounds
+    fb = ShapeAnalysis_FreeBounds(shape)
+    wires = []
+    for comp in (fb.GetClosedWires(), fb.GetOpenWires()):
+        if comp is None or comp.IsNull():
+            continue
+        exp = TopExp_Explorer(comp, occ.WIRE)
+        while exp.More():
+            wires.append(occ.to_wire(exp.Current()))
+            exp.Next()
+    return wires
+
+
+def untrim(shape, holes_only: bool = True) -> TopoDS_Shape:
+    """Remove trims from a single face.
+
+    holes_only keeps the outer boundary and drops interior holes; otherwise
+    the face is rebuilt over the surface's natural bounds (infinite
+    directions clamped to the current trimmed range)."""
+    faces = faces_of(shape)
+    if len(faces) != 1:
+        raise GeometryError("Untrim works on a single face")
+    face = faces[0]
+    from OCP.BRep import BRep_Tool
+    from OCP.BRepTools import BRepTools
+    surf = BRep_Tool.Surface_s(face)
+    if holes_only:
+        outer = BRepTools.OuterWire_s(face)
+        mk = BRepBuilderAPI_MakeFace(surf, outer)
+        if not mk.IsDone():
+            raise GeometryError("Untrim failed")
+        return mk.Face()
+    from OCP.BRepAdaptor import BRepAdaptor_Surface
+    from OCP.GeomAdaptor import GeomAdaptor_Surface
+    ga = GeomAdaptor_Surface(surf)
+    ba = BRepAdaptor_Surface(face)
+
+    def _rng(nat_lo, nat_hi, trim_lo, trim_hi):
+        big = 1e50
+        return (nat_lo if abs(nat_lo) < big else trim_lo,
+                nat_hi if abs(nat_hi) < big else trim_hi)
+
+    u1, u2 = _rng(ga.FirstUParameter(), ga.LastUParameter(),
+                  ba.FirstUParameter(), ba.LastUParameter())
+    v1, v2 = _rng(ga.FirstVParameter(), ga.LastVParameter(),
+                  ba.FirstVParameter(), ba.LastVParameter())
+    mk = BRepBuilderAPI_MakeFace(surf, u1, u2, v1, v2, 1e-7)
+    if not mk.IsDone():
+        raise GeometryError("Untrim failed")
+    return mk.Face()
+
+
+def _order_loop(curves: list) -> list:
+    """Order and orient single-edge curves head-to-tail (greedy chaining)."""
+    bs = [_edge_bspline(c) for c in curves]
+    ends = []
+    for b in bs:
+        p0, p1 = b.StartPoint(), b.EndPoint()
+        ends.append(((p0.X(), p0.Y(), p0.Z()), (p1.X(), p1.Y(), p1.Z())))
+    diag = 0.0
+    for (s, e) in ends:
+        diag = max(diag, abs(s[0]) + abs(s[1]) + abs(s[2]),
+                   abs(e[0]) + abs(e[1]) + abs(e[2]))
+    tol = max(diag * 1e-6, 1e-7)
+
+    def _d(a, b):
+        return sum((x - y) ** 2 for x, y in zip(a, b)) ** 0.5
+
+    ordered = [bs[0]]
+    tail = ends[0][1]
+    remaining = list(range(1, len(bs)))
+    while remaining:
+        found = None
+        for i in remaining:
+            s, e = ends[i]
+            if _d(tail, s) < tol:
+                found, rev = i, False
+                break
+            if _d(tail, e) < tol:
+                found, rev = i, True
+                break
+        if found is None:
+            raise GeometryError("Curves do not connect end-to-end")
+        b = bs[found]
+        if rev:
+            b.Reverse()
+        s, e = ends[found]
+        tail = s if rev else e
+        ordered.append(b)
+        remaining.remove(found)
+    return ordered
+
+
+def edge_surface(curves: list) -> TopoDS_Shape:
+    """Coons-style surface from 2, 3 or 4 connected boundary curves."""
+    from OCP.GeomFill import GeomFill_BSplineCurves, GeomFill_FillingStyle
+    n = len(curves)
+    if n not in (2, 3, 4):
+        raise GeometryError("EdgeSrf needs 2, 3 or 4 curves")
+    style = GeomFill_FillingStyle.GeomFill_CoonsStyle
+    if n == 2:
+        b1, b2 = _edge_bspline(curves[0]), _edge_bspline(curves[1])
+        s10, s20 = b1.StartPoint(), b2.StartPoint()
+        e1, e2 = b1.EndPoint(), b2.EndPoint()
+        if (s10.Distance(s20) + e1.Distance(e2)
+                > s10.Distance(e2) + e1.Distance(s20)):
+            b2.Reverse()
+        fill = GeomFill_BSplineCurves(b1, b2, style)
+    else:
+        bs = _order_loop(curves)
+        tail = bs[-1].EndPoint()
+        head = bs[0].StartPoint()
+        if tail.Distance(head) > 1e-5 * max(1.0, tail.XYZ().Modulus()):
+            raise GeometryError("Curves do not form a closed loop")
+        for b in bs:  # Coons fill needs degree >= 2
+            if b.Degree() < 3:
+                b.IncreaseDegree(3)
+        fill = GeomFill_BSplineCurves(*bs, style)
+    surf = fill.Surface()
+    mk = BRepBuilderAPI_MakeFace(surf, 1e-6)
+    if not mk.IsDone():
+        raise GeometryError("EdgeSrf failed to build the surface")
+    return mk.Face()
+
+
+def iso_curve(shape, point: Point, along: str = "u") -> TopoDS_Shape:
+    """Isoparametric curve through `point`, running along U or V."""
+    faces = faces_of(shape)
+    if len(faces) != 1:
+        raise GeometryError("Pick a single surface")
+    face = faces[0]
+    from OCP.BRep import BRep_Tool
+    from OCP.BRepAdaptor import BRepAdaptor_Surface
+    from OCP.ShapeAnalysis import ShapeAnalysis_Surface
+    surf = BRep_Tool.Surface_s(face)
+    uv = ShapeAnalysis_Surface(surf).ValueOfUV(_pnt(point), 1e-6)
+    ba = BRepAdaptor_Surface(face)
+    if along.lower() == "u":
+        curve = surf.VIso(uv.Y())
+        lo, hi = ba.FirstUParameter(), ba.LastUParameter()
+    else:
+        curve = surf.UIso(uv.X())
+        lo, hi = ba.FirstVParameter(), ba.LastVParameter()
+    if curve is None:
+        raise GeometryError("No isocurve at this point")
+    return BRepBuilderAPI_MakeEdge(curve, lo, hi).Edge()
+
+
+def tween_curves(curve_a, curve_b, count: int = 1,
+                 samples: int = 64) -> list:
+    """`count` intermediate curves blended between two curves."""
+    if count < 1:
+        raise GeometryError("Tween needs at least 1 intermediate curve")
+    pa = sample_curve(curve_a, samples)
+    pb = sample_curve(curve_b, samples)
+
+    def _d(p, q):
+        return sum((x - y) ** 2 for x, y in zip(p, q)) ** 0.5
+
+    # orient b to run the same way as a
+    if (_d(pa[0], pb[0]) + _d(pa[-1], pb[-1])
+            > _d(pa[0], pb[-1]) + _d(pa[-1], pb[0])):
+        pb = pb[::-1]
+    closed = is_closed_curve(curve_a) and is_closed_curve(curve_b)
+    out = []
+    for i in range(1, count + 1):
+        t = i / (count + 1)
+        pts = [tuple(a + (b - a) * t for a, b in zip(p, q))
+               for p, q in zip(pa, pb)]
+        if closed:
+            out.append(make_interp_curve(pts[:-1], closed=True))
+        else:
+            out.append(make_interp_curve(pts))
+    return out
+
+
+def smooth_curve(shape, strength: float = 0.2, iterations: int = 5):
+    """Laplacian-smooth a curve's control points (endpoints stay put)."""
+    strength = min(max(float(strength), 0.0), 1.0)
+    if shape.ShapeType() == occ.WIRE:
+        # polylines: relax the vertices themselves, stay a polyline
+        pts, closed = _wire_points(shape)
+        if closed:
+            pts = pts + []
+        n = len(pts)
+        for _ in range(max(1, int(iterations))):
+            ref = list(pts)
+            rng = range(n) if closed else range(1, n - 1)
+            for i in rng:
+                p, a, b = ref[i], ref[(i - 1) % n], ref[(i + 1) % n]
+                pts[i] = tuple(
+                    c + ((x + y) / 2 - c) * strength
+                    for c, x, y in zip(p, a, b))
+        return make_polyline(pts, closed=closed)
+    bs = _edge_bspline(shape)
+    n = bs.NbPoles()
+    if n < 3:
+        return copy_shape(shape)
+    periodic = bs.IsPeriodic()
+    seam = (not periodic
+            and bs.StartPoint().Distance(bs.EndPoint()) < 1e-9)
+
+    def _blend(p, a, b):
+        return gp_Pnt(p.X() + ((a.X() + b.X()) / 2 - p.X()) * strength,
+                      p.Y() + ((a.Y() + b.Y()) / 2 - p.Y()) * strength,
+                      p.Z() + ((a.Z() + b.Z()) / 2 - p.Z()) * strength)
+
+    for _ in range(max(1, int(iterations))):
+        poles = [bs.Pole(i) for i in range(1, n + 1)]
+        if periodic:
+            for i in range(n):
+                bs.SetPole(i + 1, _blend(poles[i], poles[(i - 1) % n],
+                                         poles[(i + 1) % n]))
+        else:
+            for i in range(1, n - 1):
+                bs.SetPole(i + 1, _blend(poles[i], poles[i - 1],
+                                         poles[i + 1]))
+            if seam:
+                # coincident end poles move together across the seam
+                p = _blend(poles[0], poles[n - 2], poles[1])
+                bs.SetPole(1, p)
+                bs.SetPole(n, p)
+    return BRepBuilderAPI_MakeEdge(bs).Edge()
+
+
+def _wire_points(shape) -> tuple[list[Point], bool]:
+    """Ordered vertex points of a wire of straight segments, plus closed?"""
+    from OCP.BRepTools import BRepTools_WireExplorer
+    from OCP.GeomAbs import GeomAbs_CurveType
+    wire = occ.to_wire(shape)
+    pts = []
+    exp = BRepTools_WireExplorer(wire)
+    last_edge = None
+    while exp.More():
+        edge = exp.Current()
+        if (occ.edge_adaptor(edge).GetType()
+                != GeomAbs_CurveType.GeomAbs_Line):
+            raise GeometryError("Only straight-segment polylines supported "
+                                "here (explode curves first)")
+        pts.append(pnt_tuple(occ.point_of_vertex(exp.CurrentVertex())))
+        last_edge = edge
+        exp.Next()
+    if last_edge is None:
+        raise GeometryError("Empty wire")
+    closed = wire.Closed()
+    if not closed:
+        ad = occ.edge_adaptor(last_edge)
+        p_end = ad.Value(ad.LastParameter())
+        end = (p_end.X(), p_end.Y(), p_end.Z())
+        if _d3(end, pts[-1]) < 1e-9:   # reversed final edge
+            p_end = ad.Value(ad.FirstParameter())
+            end = (p_end.X(), p_end.Y(), p_end.Z())
+        pts.append(end)
+    return pts, closed
+
+
+def _d3(a: Point, b: Point) -> float:
+    return sum((x - y) ** 2 for x, y in zip(a, b)) ** 0.5
+
+
+def _map_points(shape, fn, verb: str = "This operation"):
+    """New shape with every control point / vertex passed through fn."""
+    kind = shape_kind(shape)
+    if kind == "point":
+        return make_point(fn(point_coords(shape)))
+    if kind == "curve":
+        if shape.ShapeType() == occ.WIRE:
+            pts, closed = _wire_points(shape)
+            return make_polyline([fn(p) for p in pts], closed=closed)
+        bs = _edge_bspline(shape)
+        for i in range(1, bs.NbPoles() + 1):
+            bs.SetPole(i, _pnt(fn(pnt_tuple(bs.Pole(i)))))
+        return BRepBuilderAPI_MakeEdge(bs).Edge()
+    if kind == "surface":
+        bs, _ = _face_bspline_surface(shape)
+        for i in range(1, bs.NbUPoles() + 1):
+            for j in range(1, bs.NbVPoles() + 1):
+                bs.SetPole(i, j, _pnt(fn(pnt_tuple(bs.Pole(i, j)))))
+        mk = BRepBuilderAPI_MakeFace(bs, tol())
+        if not mk.IsDone():
+            raise GeometryError(f"{verb} failed on this surface")
+        return mk.Face()
+    raise GeometryError(f"{verb} does not support {kind}s")
+
+
+def _set_circular_cap_points(shape, flist, elist, held_f, held_e, target, axes):
+    """A full circular cap is translated along its axis, without changing
+    its analytic boundary or the curved walls that meet it. Return None
+    when the held parts need the corner-mapping path instead.
+    """
+    from OCP.BRepAdaptor import BRepAdaptor_Surface
+    from OCP.GeomAbs import GeomAbs_CurveType, GeomAbs_SurfaceType
+
+    if sum(axes) != 1:
+        return None
+    axis = axes.index(True)
+    caps, covered_edges = {}, set()
+    for index, face in enumerate(flist):
+        try:
+            normal = face_normal(face)
+        except GeometryError:
+            continue
+        if abs(normal[axis]) < 1 - 1e-9:
+            continue
+        boundary = edges_of(face)
+        if not boundary:
+            continue
+        for edge in boundary:
+            curve = occ.edge_adaptor(edge)
+            if (curve.GetType() != GeomAbs_CurveType.GeomAbs_Circle
+                    or abs(curve.LastParameter() - curve.FirstParameter()
+                           - 2 * math.pi) > 1e-9):
+                break
+        else:
+            ring = {i for i, edge in enumerate(elist)
+                    if any(edge.IsSame(e) for e in boundary)}
+            if index in held_f or ring <= held_e:
+                caps[index] = (normal, centroid(face))
+                covered_edges.update(ring)
+    if not caps or not held_f <= caps.keys() or not held_e <= covered_edges:
+        return None
+    offsets = {index: (float(target[axis]) - point[axis]) * normal[axis]
+               for index, (normal, point) in caps.items()
+               if abs(float(target[axis]) - point[axis]) >= tight()}
+    if not offsets:
+        return shape
+    rim_edges = [elist[i] for i in covered_edges]
+    for index, face in enumerate(flist):
+        if index in caps or not any(
+                edge.IsSame(rim) for edge in edges_of(face) for rim in rim_edges):
+            continue
+        surface = BRepAdaptor_Surface(face)
+        if surface.GetType() != GeomAbs_SurfaceType.GeomAbs_Cylinder:
+            return None
+        direction = pnt_tuple(surface.Cylinder().Axis().Direction())
+        if abs(direction[axis]) < 1 - 1e-9:
+            return None
+    out = offset_faces(shape, offsets)
+    # The offset kernel can return a closed shell for an annular cap.
+    # Sewing its exact faces back into a solid keeps both circular loops.
+    if shape_kind(out) != "solid":
+        out = join_surfaces(faces_of(out))
+    if (shape_kind(out) != "solid" or not is_valid(out)
+            or abs(volume(out)) < tight() or free_boundaries(out)):
+        raise GeometryError("SetPt would collapse or break the solid")
+    if volume(out) < 0:
+        out = out.Reversed()
+    return out
+
+
+def _trimmed_flat(face, within: float | None = None) -> bool:
+    """Whether the part of a face inside its boundary lies in one plane,
+    even when the surface it is cut from bends beyond that boundary."""
+    import numpy as np
+    from OCP.BRepAdaptor import BRepAdaptor_Surface
+    from OCP.BRepClass import BRepClass_FaceClassifier
+    from OCP.gp import gp_Pnt2d
+    from OCP.TopAbs import TopAbs_State
+
+    points = []
+    for edge in edges_of(face):
+        curve = occ.edge_adaptor(edge)
+        t0, t1 = curve.FirstParameter(), curve.LastParameter()
+        points += [pnt_tuple(curve.Value(t0 + (t1 - t0) * k / 8))
+                   for k in range(9)]
+    surf = BRepAdaptor_Surface(face)
+    u0, u1 = surf.FirstUParameter(), surf.LastUParameter()
+    v0, v1 = surf.FirstVParameter(), surf.LastVParameter()
+    for i in range(1, 8):
+        for j in range(1, 8):
+            uv = gp_Pnt2d(u0 + (u1 - u0) * i / 8, v0 + (v1 - v0) * j / 8)
+            if (BRepClass_FaceClassifier(face, uv, tol()).State()
+                    == TopAbs_State.TopAbs_IN):
+                points.append(pnt_tuple(surf.Value(uv.X(), uv.Y())))
+    pts = np.asarray(points, float)
+    if len(pts) < 3:
+        return False
+    centered = pts - pts.mean(axis=0)
+    normal = np.linalg.svd(centered)[2][-1]
+    return float(np.max(np.abs(centered @ normal))) <= (within or tol())
+
+
+def _is_straight(edge) -> bool:
+    """A line, or a spline (as Rhino files carry them) that runs straight."""
+    from OCP.GeomAbs import GeomAbs_CurveType
+    curve = occ.edge_adaptor(edge)
+    if curve.GetType() == GeomAbs_CurveType.GeomAbs_Line:
+        return True
+    if curve.GetType() not in (GeomAbs_CurveType.GeomAbs_BSplineCurve,
+                               GeomAbs_CurveType.GeomAbs_BezierCurve):
+        return False
+    t0, t1 = curve.FirstParameter(), curve.LastParameter()
+    a, b = pnt_tuple(curve.Value(t0)), pnt_tuple(curve.Value(t1))
+    span = math.dist(a, b)
+    if span < tight():
+        return False
+    for k in range(1, 8):
+        p = pnt_tuple(curve.Value(t0 + (t1 - t0) * k / 8))
+        along = sum((pi - ai) * (bi - ai) for pi, ai, bi in zip(p, a, b)) / span
+        foot = tuple(ai + (bi - ai) * along / span for ai, bi in zip(a, b))
+        if math.dist(p, foot) > tol():
+            return False
+    return True
+
+
+class _CurvedParts(GeometryError):
+    """The exact SetPt rebuild cannot take these parts; the freeform one may."""
+
+
+def set_part_points(shape, faces, edges, target: Point,
+                    axes: tuple[bool, bool, bool] = (False, False, True),
+                    vertices=()):
+    """Set the chosen coordinates of held faces, edges and corners,
+    exactly where the faces are planar and through their control points
+    where they are curved."""
+    if not vertices:
+        try:
+            return _set_part_points_exact(shape, faces, edges, target, axes)
+        except _CurvedParts:
+            pass
+    if not any(axes):
+        raise GeometryError("Pick at least one axis to set")
+    return deform_parts(shape, faces, edges, vertices,
+                        setting_matrix(target, axes))
+
+
+def setting_matrix(target: Point, axes):
+    """The affine map, as a 3x4 matrix, that SetPt is: the chosen
+    coordinates replaced by the target's, the others kept."""
+    import numpy as np
+    m = np.zeros((3, 4))
+    for i, on in enumerate(axes):
+        if on:
+            m[i, 3] = float(target[i])
+        else:
+            m[i, i] = 1.0
+    return m
+
+
+def affine_of(fn, near: Point = (0.0, 0.0, 0.0)):
+    """The affine map a shape transform `fn` makes, as a 3x4 matrix, read
+    off what it does to four points around `near` (taken near the work, so
+    a map far from the origin keeps its digits)."""
+    import numpy as np
+    base = np.asarray(near, float)
+    probes = [tuple(base)] + [tuple(base + np.eye(3)[i]) for i in range(3)]
+    moved = np.asarray(transform_points(probes, fn), float)
+    linear = np.column_stack([moved[i + 1] - moved[0] for i in range(3)])
+    return np.column_stack((linear, moved[0] - linear @ base))
+
+
+# What a held-parts SetPt needs that does not depend on the target, kept
+# for the last few shapes: a preview asks again at every cursor position.
+_FREEFORM_PLANS: list = []
+
+
+def _freeform_plan(shape, faces, edges, vertices=()):
+    """Everything about a held-parts deformation that the map does not
+    change."""
+    key = (hash(shape), tuple(sorted(int(i) for i in faces)),
+           tuple(sorted(int(i) for i in edges)),
+           tuple(sorted(int(i) for i in vertices)))
+    for entry in _FREEFORM_PLANS:
+        if (entry["key"] == key and entry["shape"].IsSame(shape)
+                and entry["shape"].Orientation() == shape.Orientation()):
+            return entry
+    entry = _make_freeform_plan(shape, faces, edges, vertices)
+    entry["key"] = key
+    entry["shape"] = shape
+    _FREEFORM_PLANS.insert(0, entry)
+    del _FREEFORM_PLANS[3:]
+    return entry
+
+
+def _corners_of(sub) -> list:
+    out = []
+    exp = TopExp_Explorer(sub, occ.VERTEX)
+    while exp.More():
+        out.append(exp.Current())
+        exp.Next()
+    return out
+
+
+def _setpt_reach(shape, faces, edges, vertices=()):
+    """Which corners a held-parts transform moves, and how far a point
+    between moving and fixed boundaries follows them: the share it lies
+    nearer the moving boundary than the fixed one, for (N, 3) points."""
+    import numpy as np
+    from OCP.BRep import BRep_Tool
+    flist, elist = faces_of(shape), edges_of(shape)
+    corners_all = vertices_of(shape)
+    if any(not 0 <= int(i) < len(flist) for i in faces):
+        raise GeometryError("Face index out of range")
+    if any(not 0 <= int(i) < len(elist) for i in edges):
+        raise GeometryError("Edge index out of range")
+    if any(not 0 <= int(i) < len(corners_all) for i in vertices):
+        raise GeometryError("Point index out of range")
+    moving = {hash(corners_all[int(i)]) for i in vertices}
+    for sub in ([flist[int(i)] for i in faces]
+                + [elist[int(i)] for i in edges]):
+        moving.update(hash(v) for v in _corners_of(sub))
+    moving_pts, fixed_pts = [], []
+    for edge in elist:
+        corners = _corners_of(edge)
+        ends = {hash(v) for v in corners}
+        if ends <= moving or not ends & moving:
+            curve = occ.edge_adaptor(edge)
+            t0, t1 = curve.FirstParameter(), curve.LastParameter()
+            (moving_pts if ends <= moving else fixed_pts).extend(
+                pnt_tuple(curve.Value(t0 + (t1 - t0) * k / 24))
+                for k in range(25))
+        for v in corners:
+            (moving_pts if hash(v) in moving else fixed_pts).append(
+                pnt_tuple(BRep_Tool.Pnt_s(occ.to_vertex(v))))
+    mov = np.asarray(moving_pts, float)
+    fix = np.asarray(fixed_pts, float) if fixed_pts else None
+
+    def _nearest(points, to):
+        best = np.full(len(points), np.inf)
+        for start in range(0, len(to), 512):
+            chunk = to[start:start + 512]
+            d = np.linalg.norm(points[:, None, :] - chunk[None, :, :], axis=2)
+            best = np.minimum(best, d.min(axis=1))
+        return best
+
+    def shares_at(points):
+        points = np.asarray(points, float).reshape(-1, 3)
+        if fix is None or not len(points):
+            return np.ones(len(points))
+        dm, df = _nearest(points, mov), _nearest(points, fix)
+        total = dm + df
+        out = np.ones(len(points))
+        apart = total >= tight()
+        out[apart] = df[apart] / total[apart]
+        return out
+
+    return moving, shares_at
+
+
+def setpt_moving_corners(shape, faces, edges, vertices=()):
+    """The corners a held-parts transform moves, as an (N, 3) array."""
+    import numpy as np
+    from OCP.BRep import BRep_Tool
+    moving, _shares = _setpt_reach(shape, faces, edges, vertices)
+    seen, out = set(), []
+    for edge in edges_of(shape):
+        for v in _corners_of(edge):
+            if hash(v) in moving and hash(v) not in seen:
+                seen.add(hash(v))
+                out.append(pnt_tuple(BRep_Tool.Pnt_s(occ.to_vertex(v))))
+    return np.asarray(out, float).reshape(-1, 3)
+
+
+def setpt_edge_shares(shape, faces, edges, points, point_edges,
+                      vertices=()):
+    """For a SetPt draft drawn as edges alone: how far each point of the
+    edge polylines follows the target, 1 on edges whose corners all move,
+    0 on edges none of whose corners do, and in between where a moving
+    corner pulls an edge from a fixed one. `points` is (..., 3) and
+    `point_edges` gives each point's edge index."""
+    import numpy as np
+    moving, shares_at = _setpt_reach(shape, faces, edges, vertices)
+    points = np.asarray(points, float)
+    flat = points.reshape(-1, 3)
+    owner = np.asarray(point_edges).reshape(-1)
+    out = np.zeros(len(flat))
+    for index, edge in enumerate(edges_of(shape)):
+        ends = {hash(v) for v in _corners_of(edge)}
+        if not ends & moving:
+            continue
+        mask = owner == index
+        if ends <= moving:
+            out[mask] = 1.0
+        elif mask.any():
+            out[mask] = shares_at(flat[mask])
+    return out.reshape(points.shape[:-1])
+
+
+def _make_freeform_plan(shape, faces, edges, vertices=()):
+    import numpy as np
+    from OCP.BRep import BRep_Tool
+    from OCP.BRepTools import BRepTools, BRepTools_WireExplorer
+    from OCP.GeomAbs import GeomAbs_CurveType
+    from OCP.ShapeAnalysis import ShapeAnalysis_ShapeTolerance
+    from OCP.TopAbs import TopAbs_Orientation
+    from OCP.TopExp import TopExp
+    from OCP.TopoDS import TopoDS_Vertex
+
+    forward_of = TopAbs_Orientation.TopAbs_FORWARD
+    flist = faces_of(shape)
+    nedges = edges_of(shape)
+    held_f = {int(i) for i in faces}
+
+    def _vertices(sub):
+        out = []
+        exp = TopExp_Explorer(sub, occ.VERTEX)
+        while exp.More():
+            out.append(exp.Current())
+            exp.Next()
+        return out
+
+    moving, shares_at = _setpt_reach(shape, faces, edges, vertices)
+
+    def _share(p):
+        return float(shares_at(np.asarray([p], float))[0])
+
+    def _greville(seq, degree, count):
+        knots = [seq.Value(i) for i in range(seq.Lower(), seq.Upper() + 1)]
+        return [sum(knots[i + 1:i + degree + 1]) / degree if degree
+                else knots[i] for i in range(count)]
+
+    corners = {}
+    for edge in nedges:
+        for v in _vertices(edge):
+            if hash(v) not in corners:
+                corners[hash(v)] = (
+                    hash(v) in moving,
+                    pnt_tuple(BRep_Tool.Pnt_s(occ.to_vertex(v))),
+                    occ.to_vertex(v.Oriented(forward_of)))
+
+    edge_plans = {}
+    for edge in nedges:
+        ends = {hash(v) for v in _vertices(edge)}
+        if not ends & moving:
+            edge_plans[hash(edge)] = {"keep": edge}
+            continue
+        span = occ.edge_adaptor(edge)
+        bs = _bspline_of_edge(edge)
+        if span.GetType() == GeomAbs_CurveType.GeomAbs_BSplineCurve:
+            first, last = span.FirstParameter(), span.LastParameter()
+            if (first > bs.FirstParameter() + 1e-12
+                    or last < bs.LastParameter() - 1e-12):
+                # an edge on part of its curve: cut the curve to it so
+                # the edge's ends are poles and move exactly
+                bs.Segment(first, last)
+        full = ends <= moving
+        at = _greville(bs.KnotSequence(), bs.Degree(), bs.NbPoles())
+        start, end = TopoDS_Vertex(), TopoDS_Vertex()
+        TopExp.Vertices_s(occ.to_edge(edge.Oriented(forward_of)), start, end)
+        edge_plans[hash(edge)] = {
+            "curve": bs,
+            "first": bs.FirstParameter(), "last": bs.LastParameter(),
+            "shares": [1.0 if full else _share(pnt_tuple(bs.Value(t)))
+                       for t in at],
+            "start": hash(start), "end": hash(end),
+            "old": edge,
+        }
+
+    face_plans = []
+    for index, face in enumerate(flist):
+        if not {hash(v) for v in _vertices(face)} & moving:
+            face_plans.append({"keep": face})
+            continue
+        forward = occ.to_face(face.Oriented(forward_of))
+        if BRep_Tool.Surface_s(forward) is None:
+            raise GeometryError("Reshaping needs faces with surfaces")
+        bs, _ = _face_bspline_surface(forward)
+        full = index in held_f
+        us = _greville(bs.UKnotSequence(), bs.UDegree(), bs.NbUPoles())
+        vs = _greville(bs.VKnotSequence(), bs.VDegree(), bs.NbVPoles())
+        shares = {(i, j): 1.0 if full else _share(
+                      pnt_tuple(bs.Value(us[i - 1], vs[j - 1])))
+                  for i in range(1, bs.NbUPoles() + 1)
+                  for j in range(1, bs.NbVPoles() + 1)}
+        outer = BRepTools.OuterWire_s(forward)
+        wires = [outer]
+        exp = TopExp_Explorer(forward, occ.WIRE)
+        while exp.More():
+            wire = occ.to_wire(exp.Current())
+            if not wire.IsSame(outer):
+                wires.append(wire)
+            exp.Next()
+        loops = []
+        for wire in wires:
+            loop = []
+            walk = BRepTools_WireExplorer(wire, forward)
+            while walk.More():
+                current = walk.Current()
+                loop.append((hash(current.Oriented(forward_of)),
+                             current.Orientation(),
+                             hash(walk.CurrentVertex())))
+                walk.Next()
+            loops.append(loop)
+        own = ShapeAnalysis_ShapeTolerance().Tolerance(face, 1)
+        flat = (flat_normal(face) is not None
+                or _trimmed_flat(face, max(tol(), own)))
+        # modelled flat but a little off, as imported faces often are
+        nearly = flat or (not full and _trimmed_flat(face, tol() * 20))
+        try:
+            was = face_point_normal(face)[1]
+        except GeometryError:
+            was = None
+        frame = None
+        if nearly:
+            ring = np.asarray([corners[v][1] for loop in loops
+                               for _e, _o, v in loop], float)
+            if len(ring) >= 3:
+                axes_ = np.linalg.svd(ring - ring.mean(axis=0))[2]
+                frame = (ring.mean(axis=0), axes_[0], axes_[1])
+        face_plans.append({
+            "frame": frame,
+            "index": index, "face": face, "forward": forward, "full": full,
+            "surface": bs, "shares": shares, "loops": loops, "own": own,
+            "flat": flat, "nearly": nearly, "was": was,
+            "bent": None if full else _bent_plan(
+                forward, nearly, edge_plans),
+            "triangles": (_triangle_plan(forward, loops, corners)
+                          if not full and nearly else None),
+        })
+    return {"edges": edge_plans, "faces": face_plans, "corners": corners,
+            "kind": shape_kind(shape)}
+
+
+def _tps_kernel(r):
+    import numpy as np
+    with np.errstate(divide="ignore", invalid="ignore"):
+        return np.where(r > 0, r * r * np.log(r), 0.0)
+
+
+_BENT_GRID = 16
+_BENT_STEPS = 20
+
+
+def _bent_plan(near, flat, edge_plans):
+    """The fixed half of spreading a boundary's displacement across a face:
+    where the boundary is sampled, the face's base grid, and the linear map
+    from boundary shifts to grid shifts (a thin-plate spline)."""
+    import numpy as np
+    from OCP.BRep import BRep_Tool
+    from OCP.BRepTools import BRepTools
+    from OCP.ShapeAnalysis import ShapeAnalysis_Surface
+    from OCP.TopAbs import TopAbs_Orientation
+
+    forward_of = TopAbs_Orientation.TopAbs_FORWARD
+    keys, before = [], []
+    walk = TopExp_Explorer(near, occ.EDGE)
+    while walk.More():
+        edge = occ.to_edge(walk.Current())
+        keys.append(hash(edge.Oriented(forward_of)))
+        curve = occ.edge_adaptor(edge)
+        t0, t1 = curve.FirstParameter(), curve.LastParameter()
+        before += [pnt_tuple(curve.Value(t0 + (t1 - t0) * k / _BENT_STEPS))
+                   for k in range(_BENT_STEPS + 1)]
+        walk.Next()
+    old_pts = np.asarray(before, float)
+    if flat:
+        origin = old_pts.mean(axis=0)
+        frame = np.linalg.svd(old_pts - origin)[2]
+        e1, e2 = frame[0], frame[1]
+        xy = np.column_stack(((old_pts - origin) @ e1, (old_pts - origin) @ e2))
+        low = xy.min(axis=0)
+        span = np.maximum(xy.max(axis=0) - low, tight())
+
+        def _base(q):
+            x, y = low + q * span
+            return origin + x * e1 + y * e2
+    else:
+        old_surface = BRep_Tool.Surface_s(near)
+        on_surface = ShapeAnalysis_Surface(old_surface)
+        xy = np.asarray([(lambda uv: (uv.X(), uv.Y()))(
+            on_surface.ValueOfUV(_pnt(tuple(p)), tol())) for p in old_pts])
+        u0, u1, v0, v1 = BRepTools.UVBounds_s(near)
+        low = np.array([u0, v0])
+        span = np.maximum(np.array([u1 - u0, v1 - v0]), tight())
+
+        def _base(q):
+            u, v = low + q * span
+            return np.asarray(pnt_tuple(old_surface.Value(u, v)))
+    uv = (xy - low) / span
+    keep = np.unique(np.round(uv, 9), axis=0, return_index=True)[1]
+    uv = uv[keep]
+    n = len(uv)
+    system = np.zeros((n + 3, n + 3))
+    system[:n, :n] = _tps_kernel(
+        np.linalg.norm(uv[:, None, :] - uv[None, :, :], axis=2))
+    system[:n, n] = 1.0
+    system[:n, n + 1:] = uv
+    system[n, :n] = 1.0
+    system[n + 1:, :n] = uv.T
+    solve = np.linalg.pinv(system)[:, :n]
+    steps = np.linspace(-0.02, 1.02, _BENT_GRID)
+    grid_q = np.array([(a, b) for a in steps for b in steps])
+    rows = np.hstack((
+        _tps_kernel(np.linalg.norm(grid_q[:, None, :] - uv[None, :, :], axis=2)),
+        np.ones((len(grid_q), 1)), grid_q))
+    return {"keys": keys, "keep": keep, "old": old_pts,
+            "map": rows @ solve,
+            "base": np.asarray([_base(q) for q in grid_q], float)}
+
+
+def _triangle_plan(near, loops, corners):
+    """Ear-clipped triangles of a flat, straight-edged single-loop face, by
+    corner, laid out on the face as it was."""
+    import numpy as np
+    if len(loops) != 1 or not all(_is_straight(e) for e in edges_of(near)):
+        return None
+    order_keys = [vertex for _edge, _o, vertex in loops[0]]
+    if len(order_keys) < 4:
+        return None
+    a = np.asarray([corners[k][1] for k in order_keys], float)
+    frame = np.linalg.svd(a - a.mean(axis=0))[2]
+    xy = np.column_stack(((a - a.mean(axis=0)) @ frame[0],
+                          (a - a.mean(axis=0)) @ frame[1]))
+    x, y = xy[:, 0], xy[:, 1]
+    order = list(range(len(xy)))
+    if float(np.dot(x, np.roll(y, -1)) - np.dot(np.roll(x, -1), y)) < 0:
+        order.reverse()
+
+    def _cross(o, p, q):
+        return ((xy[p][0] - xy[o][0]) * (xy[q][1] - xy[o][1])
+                - (xy[p][1] - xy[o][1]) * (xy[q][0] - xy[o][0]))
+
+    tris = []
+    while len(order) > 3:
+        for k in range(len(order)):
+            o, p, q = order[k - 1], order[k], order[(k + 1) % len(order)]
+            if _cross(o, p, q) <= 0:
+                continue
+            if any(_cross(o, p, r) >= 0 and _cross(p, q, r) >= 0
+                   and _cross(q, o, r) >= 0
+                   for r in order if r not in (o, p, q)):
+                continue
+            tris.append((o, p, q))
+            order.pop(k)
+            break
+        else:
+            return None
+    tris.append(tuple(order))
+    return [tuple(order_keys[i] for i in tri) for tri in tris]
+
+
+def _folds(step, new_edges) -> bool:
+    """Whether a flat face's new boundary, seen in the face's old plane,
+    crosses itself: the face would fold over, and no rebuild is worth
+    attempting (a repair can search for seconds before giving up)."""
+    import numpy as np
+    from OCP.TopAbs import TopAbs_Orientation
+    origin, e1, e2 = step["frame"]
+    segments = []
+    for loop in step["loops"]:
+        ring = []
+        for key, orientation, _vertex in loop:
+            curve = occ.edge_adaptor(new_edges[key])
+            t0, t1 = curve.FirstParameter(), curve.LastParameter()
+            pts = [pnt_tuple(curve.Value(t0 + (t1 - t0) * k / 4))
+                   for k in range(4)]
+            if orientation == TopAbs_Orientation.TopAbs_REVERSED:
+                pts = [pnt_tuple(curve.Value(t1 - (t1 - t0) * k / 4))
+                       for k in range(4)]
+            ring += pts
+        flat = [((np.asarray(p) - origin) @ e1, (np.asarray(p) - origin) @ e2)
+                for p in ring]
+        segments += [(flat[i], flat[(i + 1) % len(flat)])
+                     for i in range(len(flat))]
+
+    def _side(a, b, c):
+        return (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
+
+    eps = tight()
+    for i, (a, b) in enumerate(segments):
+        for c, d in segments[i + 2:]:
+            if (c is b or d is a or
+                    (abs(c[0] - b[0]) < eps and abs(c[1] - b[1]) < eps) or
+                    (abs(d[0] - a[0]) < eps and abs(d[1] - a[1]) < eps)):
+                continue
+            if (_side(a, b, c) * _side(a, b, d) < -eps * eps
+                    and _side(c, d, a) * _side(c, d, b) < -eps * eps):
+                return True
+    return False
+
+
+def deform_parts(shape, faces, edges, vertices, matrix):
+    """Put held faces, edges and corners of a surface or solid through an
+    affine map (a 3x4 matrix), the rest of it following.
+
+    A held face has every control point mapped, which is exact since the
+    map is affine, so a curved face is carried as well as a flat one. A
+    neighbour meeting both moving and fixed boundaries is stretched between
+    them: each control point moves by the share its Greville point lies
+    nearer the moving boundary than the fixed one. Where that cannot meet
+    the new boundary, the boundary's displacement is spread smoothly
+    across the face, and a flat straight-edged face can fall back to planar
+    triangles. Works the same however far from the origin.
+    """
+    import numpy as np
+    kind = shape_kind(shape)
+    if kind not in ("solid", "surface"):
+        raise GeometryError("Only parts of surfaces and solids can be reshaped")
+    if not len(faces) and not len(edges) and not len(vertices):
+        raise GeometryError("Nothing held to reshape")
+    matrix = np.asarray(matrix, float).reshape(3, 4)
+    # Each face and edge is copied on its own: converting the whole shape
+    # can leave a face without a surface, and the scene's shape must never
+    # be changed in place, not even by a preview.
+    plan = _freeform_plan(shape, faces, edges, vertices)
+    # The click that accepts a preview asks for the same map again.
+    asked = tuple(round(float(c), 12) for c in matrix.ravel())
+    last = plan.get("last")
+    if last is not None and last[0] == asked:
+        if isinstance(last[1], GeometryError):
+            raise last[1]
+        return last[1]
+    try:
+        out = _apply_freeform_plan(plan, kind, matrix)
+    except GeometryError as exc:
+        plan["last"] = (asked, exc)
+        raise
+    plan["last"] = (asked, out)
+    return out
+
+
+def _apply_freeform_plan(plan, kind, matrix):
+    import numpy as np
+    from OCP.BRep import BRep_Tool
+    from OCP.BRepBuilderAPI import (
+        BRepBuilderAPI_Copy, BRepBuilderAPI_MakeEdge, BRepBuilderAPI_MakeFace,
+        BRepBuilderAPI_MakeVertex, BRepBuilderAPI_MakeWire)
+    from OCP.BRepTopAdaptor import BRepTopAdaptor_FClass2d
+    from OCP.GeomAbs import GeomAbs_Shape
+    from OCP.GeomAPI import GeomAPI_PointsToBSplineSurface
+    from OCP.ShapeAnalysis import ShapeAnalysis_ShapeTolerance
+    from OCP.ShapeFix import ShapeFix_Shape
+    from OCP.TColgp import TColgp_Array2OfPnt
+    from OCP.TopAbs import TopAbs_State
+
+    linear, shift = matrix[:, :3], matrix[:, 3]
+
+    def _set(p):
+        return tuple(float(c) for c in linear @ np.asarray(p, float) + shift)
+
+    def _moved(pole, share):
+        p = pnt_tuple(pole)
+        q = _set(p)
+        return _pnt(tuple(a + share * (b - a) for a, b in zip(p, q)))
+
+    # Edges meet at shared corners, as in the original, so every wire stays
+    # closed in either orientation of its face.
+    corners = {}
+
+    def _corner(key):
+        if key not in corners:
+            moving, point, vertex = plan["corners"][key]
+            corners[key] = (BRepBuilderAPI_MakeVertex(_pnt(_set(point))).Vertex()
+                            if moving else vertex)
+        return corners[key]
+
+    new_edges = {}
+    for key, step in plan["edges"].items():
+        if "keep" in step:
+            new_edges[key] = step["keep"]
+            continue
+        bs = step["curve"].Copy()
+        for i, share in enumerate(step["shares"], start=1):
+            bs.SetPole(i, _moved(bs.Pole(i), share))
+        spread = [pnt_tuple(bs.Pole(i)) for i in range(1, bs.NbPoles() + 1)]
+        if max(math.dist(spread[0], p) for p in spread) < tight():
+            raise GeometryError("This would collapse an edge")
+        mk = BRepBuilderAPI_MakeEdge(bs, _corner(step["start"]),
+                                     _corner(step["end"]),
+                                     step["first"], step["last"])
+        if not mk.IsDone():
+            raise GeometryError("Could not rebuild an edge")
+        if curve_length(mk.Edge()) < tight():
+            raise GeometryError("This would collapse an edge")
+        new_edges[key] = mk.Edge()
+
+    def _made(mk, inner):
+        if not mk.IsDone():
+            return None
+        for wire in inner:
+            mk.Add(wire)
+        if not mk.IsDone():
+            return None
+        fixer = ShapeFix_Shape(mk.Face())
+        fixer.Perform()
+        fixed = faces_of(fixer.Shape())
+        return fixed[0] if len(fixed) == 1 else None
+
+    def _bent(step, wires):
+        bent = step["bent"]
+        after = []
+        for key in bent["keys"]:
+            curve = occ.edge_adaptor(new_edges[key])
+            t0, t1 = curve.FirstParameter(), curve.LastParameter()
+            after += [pnt_tuple(curve.Value(t0 + (t1 - t0) * k / _BENT_STEPS))
+                      for k in range(_BENT_STEPS + 1)]
+        shifts = (np.asarray(after, float) - bent["old"])[bent["keep"]]
+        points = bent["base"] + bent["map"] @ shifts
+        grid = TColgp_Array2OfPnt(1, _BENT_GRID, 1, _BENT_GRID)
+        for n, p in enumerate(points):
+            grid.SetValue(n // _BENT_GRID + 1, n % _BENT_GRID + 1,
+                          _pnt((float(p[0]), float(p[1]), float(p[2]))))
+        surface = GeomAPI_PointsToBSplineSurface(
+            grid, 3, 8, GeomAbs_Shape.GeomAbs_C2, tol() / 2).Surface()
+        return _made(BRepBuilderAPI_MakeFace(surface, wires[0], True), wires[1:])
+
+    def _triangles(step):
+        # Last resort for a flat, straight-edged face pulled out of its
+        # plane: planar triangles meet every new corner exactly.
+        pieces = []
+        for tri in step["triangles"] or ():
+            points = [pnt_tuple(BRep_Tool.Pnt_s(_corner(k))) for k in tri]
+            if np.linalg.norm(np.cross(np.subtract(points[1], points[0]),
+                                       np.subtract(points[2], points[0]))) < tight():
+                return None
+            made = BRepBuilderAPI_MakeFace(occ.to_wire(
+                make_polyline(points, closed=True)), True)
+            if not made.IsDone():
+                return None
+            piece = made.Face()
+            if step["was"] is not None and sum(
+                    a * b for a, b in zip(face_normal(piece), step["was"])) < 0:
+                piece = occ.to_face(piece.Reversed())
+            pieces.append(piece)
+        return pieces or None
+
+    rebuilt = []
+    for step in plan["faces"]:
+        if "keep" in step:
+            rebuilt.append(step["keep"])
+            continue
+        bs = step["surface"].Copy()
+        for (i, j), share in step["shares"].items():
+            bs.SetPole(i, j, _moved(bs.Pole(i, j), share))
+        new_wires = []
+        for loop in step["loops"]:
+            mk = BRepBuilderAPI_MakeWire()
+            for key, orientation, _vertex in loop:
+                mk.Add(occ.to_edge(new_edges[key].Oriented(orientation)))
+            if not mk.IsDone():
+                raise GeometryError("Could not rebuild a boundary")
+            new_wires.append(mk.Wire())
+        full = step["full"]
+        if step["frame"] is not None and _folds(step, new_edges):
+            raise GeometryError("This would fold a face")
+
+        # Every attempt works on its own copy of the boundary: a repair
+        # loosens edge tolerances in place, which would spoil the next
+        # attempt, the next face and the scene's own shape.
+        def _copies():
+            return [occ.to_wire(BRepBuilderAPI_Copy(w).Shape())
+                    for w in new_wires]
+
+        def _on_plane():
+            wires = _copies()
+            return _made(BRepBuilderAPI_MakeFace(wires[0], True), wires[1:])
+
+        def _on_surface():
+            wires = _copies()
+            return _made(BRepBuilderAPI_MakeFace(bs, wires[0], True),
+                         wires[1:])
+
+        builds = []
+        if not full and step["flat"]:
+            # a flat neighbour stays flat when its new boundary allows it,
+            # and a plane always reaches the whole of that boundary
+            builds.append(_on_plane)
+        if not full:
+            builds.append(lambda: _bent(step, _copies()))
+        builds.append(_on_surface)
+        # a rebuild that had to loosen the tolerance to close the face has
+        # bent it out of shape; a twisting neighbour gets a little leeway
+        loose = 1.001 * max(tol() if full else tol() * 10, step["own"])
+        new_face = None
+        for build in builds:
+            try:
+                made = build()
+            except Exception:                      # noqa: BLE001
+                continue
+            if (made is not None and is_valid(made)
+                    and ShapeAnalysis_ShapeTolerance().Tolerance(made, 1)
+                    <= loose):
+                new_face = made
+                break
+        if new_face is None:
+            pieces = _triangles(step) if not full and step["nearly"] else None
+            if not pieces:
+                raise GeometryError("Could not rebuild a face")
+            rebuilt.extend(pieces)
+            continue
+        # a boundary running the wrong way round makes the face its outside
+        if (BRepTopAdaptor_FClass2d(new_face, tight()).PerformInfinitePoint()
+                == TopAbs_State.TopAbs_IN):
+            new_face = occ.to_face(new_face.Reversed())
+        if step["was"] is not None:
+            try:
+                now = face_point_normal(new_face)[1]
+                if sum(a * b for a, b in zip(step["was"], now)) < 0:
+                    new_face = occ.to_face(new_face.Reversed())
+            except GeometryError:
+                pass
+        rebuilt.append(new_face)
+    out = join_surfaces(rebuilt)
+    if shape_kind(out) != kind or not is_valid(out):
+        raise GeometryError(f"This would collapse or break the {kind}")
+    if kind == "solid":
+        size = _rough_volume(out)
+        if abs(size) < tight() or free_boundaries(out):
+            raise GeometryError("This would collapse or break the solid")
+        if size < 0:
+            out = out.Reversed()
+    elif surface_area(out) < tight():
+        raise GeometryError("This would collapse or break the surface")
+    return out
+
+
+def _set_part_points_exact(shape, faces, edges, target: Point,
+                           axes: tuple[bool, bool, bool] = (False, False, True)):
+    """Set the chosen coordinates of held faces and their boundaries.
+
+    Shared corners are mapped once, including on their unheld neighbours.
+    Planar boundaries are rebuilt from those corners; complete circular
+    caps and untrimmed single-face NURBS surfaces retain their native
+    geometry. A projection that collapses an edge, bends a planar face,
+    or opens a solid is refused before the original shape is replaced.
+    """
+    import numpy as np
+    from OCP.BRep import BRep_Tool
+    from OCP.BRepTools import BRepTools, BRepTools_WireExplorer
+
+    kind = shape_kind(shape)
+    if kind not in ("solid", "surface"):
+        raise GeometryError("SetPt on held faces or edges needs a surface or solid")
+    if not any(axes):
+        raise GeometryError("Pick at least one axis to set")
+    flist, elist = faces_of(shape), edges_of(shape)
+    held_f, held_e = set(map(int, faces)), set(map(int, edges))
+    if any(not (0 <= i < len(flist)) for i in held_f):
+        raise GeometryError("Face index out of range")
+    if any(not (0 <= i < len(elist)) for i in held_e):
+        raise GeometryError("Edge index out of range")
+    if not held_f and not held_e:
+        raise GeometryError("Nothing held to set")
+
+    if kind == "surface" and len(flist) == 1 and held_f == {0}:
+        from OCP.Geom import Geom_BSplineSurface, Geom_BezierSurface
+        face = flist[0]
+        surface = BRep_Tool.Surface_s(face)
+        if isinstance(surface, (Geom_BSplineSurface, Geom_BezierSurface)):
+            wires = TopExp_Explorer(face, occ.WIRE)
+            wires.Next()
+            if not BRep_Tool.NaturalRestriction_s(face) or wires.More():
+                raise _CurvedParts("SetPt on a curved face needs an untrimmed surface")
+            out = set_points(shape, target, axes)
+            if not is_valid(out) or surface_area(out) < tight():
+                raise GeometryError("SetPt would collapse or break the surface")
+            return out
+    if kind == "solid":
+        out = _set_circular_cap_points(
+            shape, flist, elist, held_f, held_e, target, axes)
+        if out is not None:
+            return out
+
+    moving = set()
+    for sub in ([flist[i] for i in held_f] + [elist[i] for i in held_e]):
+        exp = TopExp_Explorer(sub, occ.VERTEX)
+        while exp.More():
+            moving.add(hash(exp.Current()))
+            exp.Next()
+
+    rebuilt = []
+    for face in flist:
+        exp = TopExp_Explorer(face, occ.VERTEX)
+        affected = False
+        while exp.More():
+            affected |= hash(exp.Current()) in moving
+            exp.Next()
+        if not affected:
+            rebuilt.append(face)
+            continue
+        if flat_normal(face) is None and not _trimmed_flat(face):
+            raise _CurvedParts("SetPt on these parts needs planar faces")
+        normal = face_point_normal(face)[1]
+        outer = BRepTools.OuterWire_s(face)
+        wires = [outer]
+        exp = TopExp_Explorer(face, occ.WIRE)
+        while exp.More():
+            wire = occ.to_wire(exp.Current())
+            if not wire.IsSame(outer):
+                wires.append(wire)
+            exp.Next()
+        loops = []
+        for wire in wires:
+            pts = []
+            walk = BRepTools_WireExplorer(wire)
+            while walk.More():
+                if not _is_straight(walk.Current()):
+                    raise _CurvedParts(
+                        "SetPt on these parts needs straight face boundaries")
+                vertex = walk.CurrentVertex()
+                p = pnt_tuple(BRep_Tool.Pnt_s(vertex))
+                if hash(vertex) in moving:
+                    p = tuple(float(t) if on else c
+                              for c, t, on in zip(p, target, axes))
+                pts.append(p)
+                walk.Next()
+            if len(pts) < 3:
+                raise GeometryError("SetPt would collapse a face")
+            if any(math.dist(a, b) < tight()
+                   for a, b in zip(pts, pts[1:] + pts[:1])):
+                raise GeometryError("SetPt would collapse an edge")
+            loops.append(pts)
+        points = np.asarray([p for loop in loops for p in loop], float)
+        _, sv, _ = np.linalg.svd(points - points.mean(axis=0))
+        if sv[1] < tight():
+            raise GeometryError("SetPt would collapse a face")
+        if sv[-1] > tol() * 10:
+            raise _CurvedParts("SetPt would bend a face beside the held parts")
+        mk = BRepBuilderAPI_MakeFace(
+            occ.to_wire(make_polyline(loops[0], closed=True)), True)
+        for loop in loops[1:]:
+            mk.Add(occ.to_wire(make_polyline(loop, closed=True)))
+        if not mk.IsDone():
+            raise _CurvedParts("SetPt could not rebuild a face")
+        new_face = mk.Face()
+        if sum(a * b for a, b in zip(face_normal(new_face), normal)) < 0:
+            new_face = occ.to_face(new_face.Reversed())
+        rebuilt.append(new_face)
+    out = join_surfaces(rebuilt)
+    if shape_kind(out) != kind or not is_valid(out):
+        raise GeometryError(f"SetPt would collapse or break the {kind}")
+    size = _rough_volume(out) if kind == "solid" else None
+    if kind == "solid" and abs(size) < tight():
+        raise GeometryError("SetPt would collapse or break the solid")
+    if kind == "surface" and surface_area(out) < tight():
+        raise GeometryError("SetPt would collapse or break the surface")
+    if kind == "solid" and size < 0:
+        out = out.Reversed()
+    return out
+
+
+def set_points(shape, target: Point,
+               axes: tuple[bool, bool, bool] = (False, False, True)):
+    """Rhino SetPt: force chosen coordinates of every control point /
+    vertex to the target's value (default: flatten Z)."""
+    if not any(axes):
+        raise GeometryError("Pick at least one axis to set")
+
+    def _snap(p: Point) -> Point:
+        return tuple(t if on else c for c, t, on in zip(p, target, axes))
+
+    return _map_points(shape, _snap, "SetPt")
+
+
+def project_to_plane(shape, origin: Point, normal: Point):
+    """Flatten a curve/surface/point onto the plane through origin."""
+    import numpy as np
+    o = np.asarray(origin, float)
+    n = np.asarray(normal, float)
+    n = n / np.linalg.norm(n)
+
+    def _proj(p: Point) -> Point:
+        v = np.asarray(p, float)
+        return tuple(v - float(np.dot(v - o, n)) * n)
+
+    return _map_points(shape, _proj, "ProjectToCPlane")
+
+
+def chamfer_curves(edge_a, edge_b, d1: float, d2: float | None = None):
+    """Chamfer two line/arc edges: returns (trimmed_a, bevel, trimmed_b)."""
+    from OCP.ChFi2d import ChFi2d_ChamferAPI
+    if d1 <= 0:
+        raise GeometryError("Chamfer distance must be positive")
+    if d2 is None:
+        d2 = d1
+    api = ChFi2d_ChamferAPI(occ.to_edge(edge_a), occ.to_edge(edge_b))
+    if not api.Perform():
+        raise GeometryError("Chamfer failed (curves may not meet)")
+    ea_out = occ.TopoDS_Edge()
+    eb_out = occ.TopoDS_Edge()
+    bevel = api.Result(ea_out, eb_out, float(d1), float(d2))
+    if bevel.IsNull():
+        raise GeometryError("Chamfer produced no result")
+    return ea_out, bevel, eb_out
+
+
+def _strip_from_rows(anchor_row, tangent_row, length, v_knots, v_mults,
+                     v_degree, weights_row=None):
+    """Degree-1-by-N ruled strip from a pole row along unit tangents."""
+    import numpy as np
+    from OCP.Geom import Geom_BSplineSurface
+    n = len(anchor_row)
+    poles = TColgp_Array1OfPnt(1, 2 * n)
+    # build a 2 x n grid: row 1 = anchor, row 2 = anchor + L * unit tangent
+    grid = []
+    for q, d in zip(anchor_row, tangent_row):
+        dv = np.asarray(d, float)
+        norm = float(np.linalg.norm(dv))
+        if norm < 1e-12:
+            dv = np.zeros(3)
+        else:
+            dv = dv / norm * float(length)
+        grid.append((tuple(q), tuple(np.asarray(q, float) + dv)))
+    u_knots = TColStd_Array1OfReal(1, 2)
+    u_knots.SetValue(1, 0.0)
+    u_knots.SetValue(2, 1.0)
+    u_mults = TColStd_Array1OfInteger(1, 2)
+    u_mults.SetValue(1, 2)
+    u_mults.SetValue(2, 2)
+    vk = TColStd_Array1OfReal(1, len(v_knots))
+    vm = TColStd_Array1OfInteger(1, len(v_mults))
+    for i, (k, m) in enumerate(zip(v_knots, v_mults), start=1):
+        vk.SetValue(i, float(k))
+        vm.SetValue(i, int(m))
+    from OCP.TColgp import TColgp_Array2OfPnt
+    from OCP.TColStd import TColStd_Array2OfReal
+    poles2 = TColgp_Array2OfPnt(1, 2, 1, n)
+    w2 = TColStd_Array2OfReal(1, 2, 1, n)
+    for j in range(n):
+        a, b = grid[j]
+        poles2.SetValue(1, j + 1, _pnt(a))
+        poles2.SetValue(2, j + 1, _pnt(b))
+        w = weights_row[j] if weights_row else 1.0
+        w2.SetValue(1, j + 1, float(w))
+        w2.SetValue(2, j + 1, float(w))
+    surf = Geom_BSplineSurface(poles2, w2, u_knots, vk, u_mults, vm,
+                               1, v_degree, False, False)
+    mk = BRepBuilderAPI_MakeFace(surf, tol())
+    if not mk.IsDone():
+        raise GeometryError("Extension strip failed")
+    return mk.Face()
+
+
+def extend_surface(shape, edge_index: int, length: float) -> TopoDS_Shape:
+    """Extend a single-face surface past one boundary edge by a tangent
+    ruled strip, sewn with the base into one shell."""
+    if length <= 0:
+        raise GeometryError("Extension length must be positive")
+    faces = faces_of(shape)
+    if len(faces) != 1:
+        raise GeometryError("ExtendSrf works on single surfaces")
+    face = faces[0]
+    edges = edges_of(face)
+    if not (0 <= edge_index < len(edges)):
+        raise GeometryError("Edge index out of range")
+    edge = edges[edge_index]
+    ad = occ.edge_adaptor(edge)
+    mid = ad.Value((ad.FirstParameter() + ad.LastParameter()) / 2)
+
+    bs, _ = _face_bspline_surface(face)
+    nu, nv = bs.NbUPoles(), bs.NbVPoles()
+    if nu < 2 or nv < 2:
+        raise GeometryError("Surface too simple to extend")
+    rational = bs.IsURational() or bs.IsVRational()
+
+    def pole(i, j):
+        return pnt_tuple(bs.Pole(i, j))
+
+    def weight(i, j):
+        return bs.Weight(i, j)
+
+    # candidate boundaries: (anchor_row, inner_row, along-V?)
+    candidates = {
+        "u0": ([pole(1, j) for j in range(1, nv + 1)],
+               [pole(2, j) for j in range(1, nv + 1)],
+               [weight(1, j) for j in range(1, nv + 1)], True),
+        "u1": ([pole(nu, j) for j in range(1, nv + 1)],
+               [pole(nu - 1, j) for j in range(1, nv + 1)],
+               [weight(nu, j) for j in range(1, nv + 1)], True),
+        "v0": ([pole(i, 1) for i in range(1, nu + 1)],
+               [pole(i, 2) for i in range(1, nu + 1)],
+               [weight(i, 1) for i in range(1, nu + 1)], False),
+        "v1": ([pole(i, nv) for i in range(1, nu + 1)],
+               [pole(i, nv - 1) for i in range(1, nu + 1)],
+               [weight(i, nv) for i in range(1, nu + 1)], False),
+    }
+
+    def row_dist(row):
+        import numpy as np
+        c = np.mean(np.asarray(row, float), axis=0)
+        return float(np.linalg.norm(c - (mid.X(), mid.Y(), mid.Z())))
+
+    key = min(candidates, key=lambda k: row_dist(candidates[k][0]))
+    anchor, inner, weights_row, along_v = candidates[key]
+    tangents = [tuple(a - b for a, b in zip(p, q))
+                for p, q in zip(anchor, inner)]
+    if along_v:
+        n_knots = bs.NbVKnots()
+        knots = [bs.VKnot(i) for i in range(1, n_knots + 1)]
+        mults = [bs.VMultiplicity(i) for i in range(1, n_knots + 1)]
+        degree = bs.VDegree()
+    else:
+        n_knots = bs.NbUKnots()
+        knots = [bs.UKnot(i) for i in range(1, n_knots + 1)]
+        mults = [bs.UMultiplicity(i) for i in range(1, n_knots + 1)]
+        degree = bs.UDegree()
+    strip = _strip_from_rows(anchor, tangents, length, knots, mults, degree,
+                             weights_row if rational else None)
+
+    from .occ import BRepBuilderAPI_Sewing
+    sew = BRepBuilderAPI_Sewing(tol())
+    sew.Add(face)
+    sew.Add(strip)
+    sew.Perform()
+    out = sew.SewedShape()
+    if out.IsNull():
+        raise GeometryError("Extension could not be joined to the surface")
+    return out
+
+
+def blend_surfaces(face_a, edge_a, face_b, edge_b) -> TopoDS_Shape:
+    """G1 blend surface between two surface edges (straight side rails)."""
+    import math
+    from OCP.BRepOffsetAPI import BRepOffsetAPI_MakeFilling
+    from OCP.GeomAbs import GeomAbs_Shape
+    (a0, a1) = curve_endpoints(edge_a)
+    (b0, b1) = curve_endpoints(edge_b)
+    if (math.dist(a0, b0) + math.dist(a1, b1)
+            > math.dist(a0, b1) + math.dist(a1, b0)):
+        b0, b1 = b1, b0
+    fill = BRepOffsetAPI_MakeFilling()
+    fill.Add(occ.to_edge(edge_a), occ.to_face(face_a),
+             GeomAbs_Shape.GeomAbs_G1, True)
+    fill.Add(occ.to_edge(edge_b), occ.to_face(face_b),
+             GeomAbs_Shape.GeomAbs_G1, True)
+    if math.dist(a0, b0) > 1e-9:
+        fill.Add(occ.to_edge(make_line(a0, b0)),
+                 GeomAbs_Shape.GeomAbs_C0, True)
+    if math.dist(a1, b1) > 1e-9:
+        fill.Add(occ.to_edge(make_line(a1, b1)),
+                 GeomAbs_Shape.GeomAbs_C0, True)
+    fill.Build()
+    if not fill.IsDone():
+        raise GeometryError("Blend failed between these edges")
+    result = fill.Shape()
+    if result.IsNull():
+        raise GeometryError("Blend produced no surface")
+    return result

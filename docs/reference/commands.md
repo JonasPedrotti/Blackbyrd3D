@@ -1,0 +1,336 @@
+# Command reference
+
+Every command is typed on the command line (Tab completes,
+F1 opens this list inside the app). Aliases in parentheses.
+Commands that need a file open a filtered chooser by default. Append
+`--headless` to keep the typed path prompt for scripts and automation.
+
+## Booleans
+
+| Command | Does |
+|---|---|
+| `booleandifference` (`difference`, `bd`) | Booleandifference |
+| `booleanintersection` (`intersection`, `bi`) | Booleanintersection |
+| `booleanunion` (`union`, `bu`) | Booleanunion |
+| `curveboolean` (`curvebool`) | Closed curves around the regions of overlapping planar curves. KeepObjects leaves the curves it worked from in place. |
+
+## Camera
+
+| Command | Does |
+|---|---|
+| `camera` (`cam`) | Camera |
+
+## Capture
+
+| Command | Does |
+|---|---|
+| `turntable` | Orbit the camera once around the work and write a video clip; |
+| `turntableui` | Record a portrait turntable of the current shot and application UI. |
+
+## Curves
+
+| Command | Does |
+|---|---|
+| `arc` (`a`) | Arc through three points; or Center and a sweep, or StartEnd. |
+| `circle` (`c`, `ci`) | Circle from center and radius; or 2Point across, or 3Point through. |
+| `closecrv` (`cc`, `closecurve`) | Close open curves with a straight segment between their ends. |
+| `curve` (`cv`) | NURBS curve by control points, as Rhino's Curve does. |
+| `divide` | Divide |
+| `ellipse` (`el`) | Ellipse from center and two radii; Diameter takes an axis whole. |
+| `interpcrv` (`interpcurve`) | NURBS curve through picked points; Close joins it back smoothly. |
+| `line` (`l`) | Straight line; BothSides grows it evenly out of its middle. |
+| `point` (`pt`) | Point |
+| `polyline` (`pl`, `pline`) | Polyline |
+| `rectangle` (`rect`, `rec`) | Rectangle corner to corner; or Center out, or 3Point to lean it. |
+| `tweencurves` (`tween`) | Tweencurves |
+
+## Deformation
+
+| Command | Does |
+|---|---|
+| `bend` | Bend |
+| `curvaturegraph` (`combs`) | Toggle curvature combs on selected curves. |
+| `draftanalysis` (`draft`) | Colour faces by draft angle relative to the pull direction (+Z): |
+| `extend` | Extend |
+| `flow` (`flowalongcrv`) | Flow |
+| `matchcrv` (`match`) | Matchcrv |
+| `taper` | Taper |
+| `twist` | Twist |
+
+## Display & views
+
+| Command | Does |
+|---|---|
+| `1view` (`oneview`, `singleview`) | 1view |
+| `4view` (`fourview`, `quadview`) | Split the model area into Top / Front / Right / Perspective. |
+| `ai` (`assistant`) | Open the AI assistant panel — model by describing what you want. |
+| `angle` | Angle at a vertex point between two directions. |
+| `area` | Area |
+| `back` | Back |
+| `bottom` | Bottom |
+| `clippingplane` (`clip`) | Place a rectangular clipping plane parallel to the CPlane through the first corner. |
+| `cplane` | Reposition the construction plane (drawing plane + grid). |
+| `curvature` | Curvature |
+| `curvatureanalysis` (`curvmap`) | Curvatureanalysis |
+| `disableclippinginview` (`dcv`) | Switch clipping planes off in the view you are in (the pane, or the detail you are inside) and leave them cutting every other view. |
+| `disableclippingplane` (`dcc`) | Pause clipping planes (they stay in the scene, the cut stops). |
+| `distance` (`dist`) | Distance |
+| `enableclippinginview` (`ecv`) | Switch clipping planes back on in the view you are in (the pane, or the detail you are inside). |
+| `enableclippingplane` (`ecc`) | Re-enable paused clipping planes. |
+| `floatviewport` (`floatvp`) | Open a floating viewport window (drag it to another monitor). |
+| `front` | Front |
+| `ghosted` (`gh`) | Ghosted |
+| `grid` | Grid |
+| `gridsnap` | Gridsnap |
+| `gumball` | Gumball |
+| `gumballalignment` | Choose what the gumball's axes follow: the CPlane, the object, the world or the view. |
+| `isocurves` (`showisocurves`) | Show or hide the wires across surfaces in this viewport. |
+| `isometric` (`iso`) | Isometric |
+| `left` | Left |
+| `length` (`len`) | Length |
+| `maxviewport` (`max`, `maximizeviewport`) | Give the pane you are in the whole window; again puts it back. |
+| `namedview` (`nv`) | Namedview |
+| `newviewport` (`newvp`, `splitview`) | Open an extra live viewport in a dockable panel — drag its title |
+| `ortho` | Toggle ortho: picked points lock to CPlane axes from the last |
+| `osnap` | Toggle one object-snap type (or All = the master switch) — |
+| `perspective` (`persp`) | Perspective |
+| `pictureframe` (`picture`) | Choose and place an embedded reference image for tracing. |
+| `pointsoff` (`pf`) | Pointsoff |
+| `pointson` (`po`) | Show control points for selected curves and surfaces (F10). |
+| `printcheck` (`printinfo`) | Check selected objects for 3D-print readiness: watertight, manifold, |
+| `radius` | Radius of curvature of a curve at a picked point. |
+| `redoview` | Go forward again through the views `undoview` stepped back through. |
+| `rendered` (`render`) | Environment-lit display with materials and a ground shadow. |
+| `right` | Right |
+| `selclippingplane` | Select every clipping plane object. |
+| `shaded` (`sh`) | Shaded |
+| `snap` | Snap |
+| `spacemouse` (`3dmouse`) | SpaceMouse status, on/off toggle, and a live axis readout for |
+| `surfaceedges` (`showedges`) | Show or hide the outlines of faces. Curves and text are unaffected. |
+| `technical` (`tech`) | Hidden-line technical display (parallel projection linework). |
+| `tolerance` | Show or set the document's absolute modelling tolerance. |
+| `top` | Top |
+| `undoview` | Put the view back where it was before the last view change. |
+| `units` | Set document units; optionally rescale the model to keep real size. |
+| `viewcapturetoclipboard` (`vcc`) | Copy the active viewport image to the clipboard. |
+| `viewcapturetofile` (`vcf`, `viewcapture`) | Save the active viewport as a PNG image. |
+| `volume` (`vol`) | Volume |
+| `wireframe` (`wf`) | Wireframe |
+| `zebra` | Zebra |
+| `zoom` (`z`) | Zoom the active view: Selected, Extents, a picked Window, In, Out. |
+| `zoomextents` (`ze`, `zea`) | Zoomextents |
+| `zoomselected` (`zs`) | Frame the current selection in the active view. |
+| `zoomwindow` (`zw`) | Zoom into a window picked with two corner points. |
+
+## Drafting & layouts
+
+| Command | Does |
+|---|---|
+| `annotedit` (`editnote`, `edittext`) | Edit the annotation nearest a picked point (text, style). |
+| `detail` | Detail |
+| `detailborder` | Detailborder |
+| `detaildelete` | Detaildelete |
+| `detaillock` | Lock or unlock a detail's view and scale; its frame still moves |
+| `detailmode` | Detailmode |
+| `detailscale` | Detailscale |
+| `detailsection` | Detailsection |
+| `dim` (`dimension`, `dimlinear`) | Dim |
+| `dimangle` (`dimangular`) | Dimangle |
+| `dimdiameter` (`dimdia`) | Dimdiameter |
+| `dimradius` (`dimr`) | Dimradius |
+| `dimstyle` (`textstyle`) | Create or edit a named annotation style (text height, arrows). |
+| `dot` (`annotationdot`) | Model-space annotation dots: a label bubble anchored to a 3D point. |
+| `exportdxf` | Export the active layout sheet (or the model) to DXF. |
+| `exportpdf` (`pdf`) | Exportpdf |
+| `exportsvg` | Exportsvg |
+| `hideindetail` | Inside a detail, hide the objects you pick in that detail only, as Rhino's HideInDetail does. |
+| `hatch` | Fill a region with a pattern, on a sheet or in the model, starting from its layer's hatch. Curves that cross ask which of the regions they make to fill (All, or Alt+A, for every one). The popup shows the hatch it would make while it is open. |
+| `hatchpatterns` (`loadpat`) | Load installs the hatch patterns in a .pat file, offered in every drawing from then on; Delete takes one off again. A drawing saves the patterns it uses. |
+| `layout` | Layout |
+| `leader` | Leader |
+| `make2d` | Make2d |
+| `printsheets` (`print`, `plot`) | Print sheets, or save them as one PDF, choosing them from the set. |
+| `revision` | Add a row to this sheet's revision table (drawn by the title block). |
+| `scalebar` | Scalebar |
+| `sheetindex` | Place an index of all sheets as a note on the current layout. |
+| `showindetail` | Inside a detail, show every object it has hidden. |
+| `showselectedindetail` | Inside a detail, show the objects you pick of those it has hidden. |
+| `text` (`note`) | Place text: a note on a sheet, editable lettering in the model. |
+| `titleblock` | Titleblock |
+
+## Editing
+
+| Command | Does |
+|---|---|
+| `boundingbox` (`bb`) | Create the world-aligned bounding box of the selection. |
+| `chamfer` | Bevel the corner between two curves with straight cut-offs. |
+| `delete` (`del`, `erase`) | Delete |
+| `dir` | Show which way curves run and which way surfaces face. |
+| `explode` (`x`) | Explode |
+| `fillet` | Round the corner between two curves, or edges of a selected solid/surface. Pick each curve near the corner you mean. Radius and Trim stay on the prompt and can be changed between the picks (a typed number is the radius, `t` flips Trim), and both are remembered until the program is started again. Radius 0 gives a sharp corner: the curves are cut back, or carried out, to the point they cross at. |
+| `filletcorners` | Round every corner of a polyline at once with one radius — straight and arc pieces both round. |
+| `flip` | Turn curves round and surfaces inside out, as Rhino's Flip does. |
+| `hide` | Hide the objects you pick, in the model and in every detail. |
+| `insertknot` (`insertcontrolpoint`) | Add a control point to a curve without moving the curve. |
+| `join` (`j`) | Join |
+| `layer` | Layer |
+| `material` (`mat`) | Assign a look (metallic/roughness/opacity) for rendered display |
+| `offset` | Offset |
+| `plugins` | List loaded plugins and where they came from. |
+| `rebuild` | Rebuild |
+| `recordhistory` (`history`) | Toggle record history: loft/extrude/revolve outputs rebuild when |
+| `redo` | Redo |
+| `removecontrolpoint` | Delete the control points you are holding, as Delete does. |
+| `removeknot` | Take a knot out of a curve and say how far the curve moved. |
+| `rename` | Rename |
+| `selall` (`sa`) | Selall |
+| `selnone` (`sn`) | Selnone |
+| `show` (`unhide`) | Show every hidden object. |
+| `showselected` (`unhideselected`) | Show the hidden objects you pick, with them on show while you choose, as Rhino's ShowSelected does. |
+| `smooth` | Relax a curve's control points toward their neighbours. |
+| `split` | Split |
+| `trim` (`tr`) | Cut objects with the cutters and take away the part clicked. |
+| `undo` | Undo |
+
+## Files
+
+| Command | Does |
+|---|---|
+| `export` (`exp`) | Export |
+| `import` (`imp`) | Import |
+| `new` | New |
+| `open` | Open |
+| `save` | Save |
+| `setdefaultapp` | Make Blackbyrd3D the default application for .byrd files. |
+
+## Help
+
+| Command | Does |
+|---|---|
+| `help` (`?`) | Describe a command, or list every command by category. |
+
+## Organisation
+
+| Command | Does |
+|---|---|
+| `audit` | Check every object's geometry for validity. |
+| `block` | Turn a selection into a block definition and one instance in its place: pick the objects, then the base point, then name it. |
+| `blocklist` (`blockmanager`) | Blocklist |
+| `breptomesh` (`meshify`) | Convert BREP objects into lightweight native meshes. |
+| `bringforward` (`bringforwards`) | Nudge the selected objects one step towards the front. |
+| `bringtofront` (`bf`) | Draw the selected objects on top of overlapping ones. |
+| `changelayer` (`tolayer`) | Move objects to a layer by name (created if missing). |
+| `count` | Count objects: totals by block, kind and layer (for takeoffs). |
+| `getusertext` | Report the user text on the selected objects, as Rhino's GetUserText does: one key's value, or with Enter every key. |
+| `group` | Group objects and keep them selected. |
+| `insert` | Insert |
+| `linetype` (`lt`, `setlinetype`) | Set the dash style of selected objects (Continuous/Dashed/…/ByLayer). |
+| `lock` | Lock what is picked, in the model or on a sheet: still drawn and snapped to, but not pickable. |
+| `lockother` | Lock everything except what you picked, as Rhino's LockOther does (on a sheet, the rest of that sheet). |
+| `matchprops` (`matchproperties`) | Copy an object's layer, colour, material, print width and hatch. |
+| `meshtobrep` | Convert mesh objects into exact BREP shells (slow for big meshes). |
+| `pointcloud` (`pc`) | Point clouds: `info` says what a scan holds; `subsample` keeps an |
+| `printwidth` (`plotweight`, `printweight`) | Set the pen width selected objects plot with, or ByLayer. |
+| `purge` | Remove empty layers and unused block definitions. |
+| `sectionhatch` (`sectionstyle`) | Set how a section cut through selected objects is filled. |
+| `sendbackward` (`sendbackwards`) | Nudge the selected objects one step towards the back. |
+| `sendtoback` (`sb`) | Draw the selected objects behind overlapping ones. |
+| `setusertext` (`setattributeusertext`) | Set a key of user text on the selected objects, as Rhino's SetUserText does. |
+| `ungroup` | Ungroup objects and keep them selected. |
+| `unlockall` (`unlock`) | Unlock every locked object and every locked sheet item. |
+| `what` | Report details of the selected objects. |
+
+## Selection
+
+| Command | Does |
+|---|---|
+| `invert` (`selinv`) | Invert |
+| `isolate` | Isolate |
+| `selcrv` (`selcurves`) | Selcrv |
+| `seldup` | Select later duplicates of identical, identically-placed objects. |
+| `selfilter` (`selectionfilter`) | Restrict viewport picking to one kind of object (Off = anything). |
+| `selfiltertoggle` (`sft`) | Pause/resume the selection filter without changing its kind. |
+| `selhatch` (`selhatches`) | Select every hatch. |
+| `sellast` | Sellast |
+| `sellayer` | Sellayer |
+| `selname` | Select objects whose name contains the given text. |
+| `selpointcloud` (`selpc`, `selpointclouds`) | Selpointcloud |
+| `selprev` | Restore the previous selection. |
+| `selpt` (`selpoints`) | Selpt |
+| `selsolid` (`selsolids`) | Selsolid |
+| `selsrf` (`selsurfaces`) | Selsrf |
+| `unisolate` | Unisolate |
+
+## Solid editing
+
+| Command | Does |
+|---|---|
+| `booleansplit` (`bsplit`) | Split solids with cutters, keeping every piece. |
+| `cap` | Cap |
+| `chamferedge` (`che`) | Chamferedge |
+| `contour` | Contour |
+| `filletedge` (`fe`) | Fillet edges. Ctrl+Shift-click edges first to fillet only those; the radius may be `start,end` or `u:r;u:r;…` for a variable law along the smooth chain, straight between points on request. |
+| `intersect` (`int`) | Intersect |
+| `mergeallcoplanarfaces` (`mergeallfaces`) | Fuse coplanar neighbouring faces of each selected polysurface. |
+| `pushpull` (`pp`, `moveface`) | SketchUp-style push/pull on a planar face. |
+| `section` (`sec`) | Cut the selection with a plane drawn as a line across it. |
+
+## Solids
+
+| Command | Does |
+|---|---|
+| `box` | Box from a base and height; Center spreads the base evenly. |
+| `cone` | Cone |
+| `cylinder` (`cyl`) | Cylinder |
+| `sphere` (`sph`) | Sphere from center and radius; 2Point spans a diameter instead. |
+| `torus` | Torus |
+
+## Surfaces
+
+| Command | Does |
+|---|---|
+| `blendcrv` (`blend`) | Blendcrv |
+| `blendsrf` | G1 blend surface between two Ctrl+Shift-picked surface edges. |
+| `dupborder` | Dupborder |
+| `dupedge` | Duplicate Ctrl+Shift-picked edges as curves. |
+| `dupfaceborder` | Duplicate the border wires of Ctrl+Shift-picked faces as curves. |
+| `edgesrf` (`srfedges`) | Edgesrf |
+| `extendsrf` | Extend a surface past a Ctrl+Shift-picked boundary edge. |
+| `extractisocurve` (`isocurve`) | Extractisocurve |
+| `extractsrf` (`extractsurface`, `extractface`) | Pull Ctrl+Shift-picked faces out of the polysurfaces holding them. |
+| `extrude` (`ext`, `extrudecrv`) | Extrude |
+| `helix` | Helix |
+| `loft` | Loft |
+| `offsetsrf` | Offsetsrf |
+| `patch` (`networksrf`) | Patch |
+| `pipe` | Pipe |
+| `planarsrf` (`planar`, `planesrf`) | Planarsrf |
+| `project` | Project |
+| `pull` | Pull |
+| `revolve` (`rev`) | Revolve |
+| `shell` | Hollow a solid out, keeping its outside. Click the solid on the face to open, or Ctrl+Shift-click faces first to open several; a solid named rather than clicked is shelled closed, hollow inside. |
+| `sweep1` (`sweep`) | Sweep1 |
+| `sweep2` | Sweep2 |
+| `unrollsrf` (`unroll`) | Unrollsrf |
+| `untrim` | Untrim |
+
+## Transforms
+
+| Command | Does |
+|---|---|
+| `array` | Array |
+| `arraypath` (`arraycrv`) | Arraypath |
+| `arraypolar` | Arraypolar |
+| `copy` (`co`, `cp`) | Copy objects; Vertical constrains copies along the CPlane normal. |
+| `mirror` (`mi`) | Mirror |
+| `move` (`m`) | Move objects or held parts; Vertical constrains movement along the CPlane normal. |
+| `orient` (`o2`) | Remap objects from two reference points to two target points |
+| `orient3pt` (`o3`) | Remap objects from three reference points to three target points |
+| `projecttocplane` (`flatten`) | Flatten curves/surfaces/points onto the construction plane. |
+| `rotate` (`ro`) | Rotate around the CPlane normal: type an angle, or pick a |
+| `rotate3d` (`ro3`) | Rotate around an arbitrary axis picked as two points: type an |
+| `scale` (`sc`) | Scale about a base point: type a factor, or grab a reference |
+| `scale1d` | Stretch along one direction only: type a factor and it stretches |
+| `scale2d` | Scale in the CPlane only (thickness along the CPlane normal is |
+| `scalenu` | Scale by a different amount along each axis: type the three |
+| `setpt` (`setpoints`) | Set chosen X/Y/Z coordinates on objects or held faces, edges and curve segments, with live previews. |

@@ -1,0 +1,254 @@
+"""A clipping plane draws an arrow toward its visible side.
+
+Asked for by a user: the plane could have a line showing its orientation.
+A clipping plane is a rectangle, and a rectangle looks the same from both
+sides, so nothing on screen says which half of the model it is about to
+take away. You find out by dragging something across it and watching the
+thing vanish, which is a strange way to be told.
+
+Rhino's direction indicator points at the visible half. Existing plane
+geometry and the hidden half stay unchanged when the indicator is corrected.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+import pytest
+from PySide6.QtWidgets import QApplication
+
+from blackbyrd3d.core import geometry as g
+from blackbyrd3d.core.scene import Scene
+from blackbyrd3d.core.selection import SelectionManager
+from blackbyrd3d.ui import theme
+from blackbyrd3d.ui.camera import Camera
+from blackbyrd3d.ui.viewport import (CLIP_ARROW_PX, Viewport, clip_equation,
+                                      clip_normal_arrows, clip_plane_frames)
+
+
+def _rect_on_xy(z=0.0):
+    """A rectangle lying flat on the world XY plane, wound anticlockwise."""
+    return g.planar_face(g.make_polyline(
+        [(-5, -5, z), (5, -5, z), (5, 5, z), (-5, 5, z)], closed=True))
+
+
+def _scene_with_plane(enabled=True, flipped=False):
+    scene = Scene()
+    face = _rect_on_xy()
+    if flipped:
+        face = g.mirror(face, (0, 0, 0), (0, 0, 1))
+    obj = scene.add(face, name="Clipping Plane 01")
+    scene.update(obj.id, clip_plane={"enabled": enabled})
+    return scene
+
+
+def _hidden_by(origin, normal, point):
+    """What the shader works out for `point`: it is drawn when this is
+    positive and thrown away when it is negative."""
+    eq = clip_equation(origin, normal)
+    return float(np.dot(eq[:3], np.asarray(point, float)) + eq[3]) < 0
+
+
+# --- where the arrow points ------------------------------------------------
+
+@pytest.mark.parametrize("flipped", [False, True])
+def test_the_arrow_points_at_the_visible_half(flipped):
+    frames = clip_plane_frames(_scene_with_plane(flipped=flipped).all())
+    (origin, normal, _enabled), = frames
+    (segments, _), = clip_normal_arrows(frames, _camera(), 800, 600)
+
+    assert not _hidden_by(origin, normal, segments[1])
+    assert _hidden_by(origin, normal, 2 * segments[0] - segments[1])
+
+
+def test_flipping_the_plane_turns_the_arrow_round():
+    """Flip is how you say you meant the other half, so the arrow has to
+    say it too."""
+    (_, up, _), = clip_plane_frames(_scene_with_plane().all())
+    (_, down, _), = clip_plane_frames(
+        _scene_with_plane(flipped=True).all())
+
+    assert np.dot(up, down) < -0.99
+
+
+def test_the_arrow_starts_at_the_middle_of_the_plane():
+    """Anywhere else and it reads as belonging to whatever it is nearest."""
+    (origin, _, _), = clip_plane_frames(_scene_with_plane().all())
+
+    assert np.allclose(origin, (0, 0, 0), atol=1e-9)
+
+
+# --- which planes get one --------------------------------------------------
+
+def test_a_paused_plane_still_says_which_way_it_faces():
+    """Pausing a plane is what you do while you are still deciding, which
+    is exactly when you want to see which way it is round. It comes back
+    marked paused so it can be drawn faintly rather than not at all."""
+    frames = clip_plane_frames(_scene_with_plane(enabled=False).all())
+
+    assert len(frames) == 1
+    assert frames[0][2] is False
+
+
+def test_ordinary_objects_get_no_arrow():
+    scene = Scene()
+    scene.add(g.make_box((0, 0, 0), 10, 10, 10))
+    scene.add(g.make_line((0, 0, 0), (10, 0, 0)))
+
+    assert clip_plane_frames(scene.all()) == []
+
+
+# --- the arrow itself ------------------------------------------------------
+
+def _camera():
+    cam = Camera()
+    cam.target = np.array([0.0, 0.0, 0.0])
+    cam.distance = 80.0
+    return cam
+
+
+def test_the_arrow_leaves_the_plane_opposite_its_geometry_normal():
+    """The shaft is the first segment: it starts on the plane and ends out
+    into the visible half, and the barbs behind the tip make it an arrow rather
+    than a line you have to guess the sense of."""
+    frames = clip_plane_frames(_scene_with_plane().all())
+    (segs, _color), = clip_normal_arrows(frames, _camera(), 800, 600)
+
+    tail, tip = segs[0], segs[1]
+    normal = np.asarray(frames[0][1], float)
+    assert np.allclose(tail, frames[0][0], atol=1e-9)
+    assert np.dot(tip - tail, normal) < 0
+    assert len(segs) == 6                    # shaft, then two barbs
+
+
+def test_the_arrow_is_the_same_size_on_screen_however_far_away_it_is():
+    """Fixed on the glass, like the direction arrows and the control point
+    markers. A plane at the far end of a big model should still be readable
+    and a near one should not throw a spike across the viewport.
+
+    Measured with the plane facing across the screen, where the shaft lies
+    flat against the glass and its length in pixels is the whole story."""
+    cam = _camera()
+    right, _up = cam.right_up()
+    lengths = []
+    for distance in (40.0, 400.0):
+        cam.distance = distance
+        (segs, _), = clip_normal_arrows(
+            [((0.0, 0.0, 0.0), tuple(right), True)], cam, 800, 600)
+        scr = cam.project(np.asarray(segs[:2]), 800, 600)
+        lengths.append(float(np.hypot(*(scr[1][:2] - scr[0][:2]))))
+
+    assert lengths[0] == pytest.approx(CLIP_ARROW_PX, rel=0.02)
+    assert lengths[1] == pytest.approx(CLIP_ARROW_PX, rel=0.02)
+
+
+def test_a_paused_plane_gets_a_faint_arrow_drawn_under_the_live_ones():
+    """Two passes, paused first, so where planes lie on top of each other
+    the arrow you see is the one that is actually cutting."""
+    scene = _scene_with_plane()
+    paused = scene.add(_rect_on_xy(z=2.0), name="Clipping Plane 02")
+    scene.update(paused.id, clip_plane={"enabled": False})
+
+    passes = clip_normal_arrows(clip_plane_frames(scene.all()),
+                                _camera(), 800, 600)
+
+    assert [c for _s, c in passes] == [theme.CLIP_NORMAL_PAUSED,
+                                       theme.CLIP_NORMAL]
+
+
+def test_no_clipping_planes_means_no_arrows():
+    assert clip_normal_arrows([], _camera(), 800, 600) == []
+
+
+# --- the arrow and the cut are the same thing ------------------------------
+
+@pytest.fixture
+def pane():
+    QApplication.instance() or QApplication([])
+    scene = Scene()
+    return Viewport(scene, SelectionManager(scene))
+
+
+def test_the_cut_uses_the_direction_the_arrow_is_drawn_in(pane):
+    """If these two ever came from different code, the arrow would point
+    one way and the model would vanish the other, which is worse than
+    drawing nothing."""
+    face = _rect_on_xy()
+    obj = pane.scene.add(face, name="Clipping Plane 01")
+    pane.scene.update(obj.id, clip_plane={"enabled": True})
+
+    frames = clip_plane_frames(pane.scene.visible_objects())
+    expected = [clip_equation(o, n) for o, n, on in frames if on]
+
+    assert np.allclose(pane._clip_vectors(), expected)
+
+
+def test_a_paused_plane_cuts_nothing(pane):
+    obj = pane.scene.add(_rect_on_xy(), name="Clipping Plane 01")
+    pane.scene.update(obj.id, clip_plane={"enabled": False})
+
+    assert clip_plane_frames(pane.scene.visible_objects()) != []
+    assert pane._clip_vectors() == []
+
+
+def test_hiding_a_planes_layer_keeps_the_cut_and_drops_the_arrow(pane):
+    """Hidden, a plane is out of the way of what it cuts, and still cuts;
+    only a plane on screen has an arrow to draw. Hiding a layer does not
+    move the scene's revision, so this is also that the frames hear of
+    it."""
+    layer = pane.scene.layers.create("Clipping")
+    obj = pane.scene.add(_rect_on_xy(), layer_id=layer.id)
+    pane.scene.update(obj.id, clip_plane={"enabled": True})
+    revision = pane.scene.revision
+    assert len(pane._clip_vectors()) == 1
+    assert len(pane._clip_frames(shown=True)) == 1
+
+    pane.scene.layers.set_visible(layer.id, False)
+    assert pane.scene.revision == revision
+    assert len(pane._clip_vectors()) == 1
+    assert pane._clip_frames(shown=True) == []
+    pane.scene.layers.set_visible(layer.id, True)
+    assert len(pane._clip_frames(shown=True)) == 1
+
+
+def test_a_failed_draw_releases_clipping_before_qt_draws(pane, monkeypatch):
+    from blackbyrd3d.ui import viewport
+
+    obj = pane.scene.add(_rect_on_xy())
+    pane.scene.update(obj.id, clip_plane={"enabled": True})
+    enabled = set()
+    monkeypatch.setattr(viewport.GL, "glEnable", enabled.add)
+    monkeypatch.setattr(viewport.GL, "glDisable", enabled.discard)
+    for name in ("_mesh_prog", "_line_prog", "_thick_prog", "_point_prog"):
+        setattr(pane, name, 1)
+
+    def refused_uniform(prog, clips):
+        if clips:
+            raise RuntimeError("driver refused clip uniforms")
+
+    monkeypatch.setattr(pane, "_set_clip_uniforms", refused_uniform)
+    with pytest.raises(RuntimeError, match="driver refused"):
+        pane._draw_objects(np.eye(4), np.eye(4))
+    assert enabled == set()
+
+
+def test_repainting_the_arrow_does_not_repeat_native_geometry_reads(pane, monkeypatch):
+    from blackbyrd3d.ui import viewport
+
+    obj = pane.scene.add(_rect_on_xy())
+    pane.scene.update(obj.id, clip_plane={"enabled": True})
+    normal = g.face_normal
+    calls = []
+
+    def counted(face):
+        calls.append(1)
+        return normal(face)
+
+    monkeypatch.setattr(g, "face_normal", counted)
+    monkeypatch.setattr(viewport.GL, "glDisable", lambda *_: None)
+    monkeypatch.setattr(viewport.GL, "glEnable", lambda *_: None)
+    pane._frame_anchor = None
+    monkeypatch.setattr(pane, "_draw_thick_segments", lambda *_: None)
+    pane._clip_vectors()
+    pane._draw_clip_normals(np.eye(4))
+    pane._draw_clip_normals(np.eye(4))
+    assert len(calls) == 1

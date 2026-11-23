@@ -1,0 +1,1280 @@
+"""Editing commands: delete, join, hide/show, selection, undo/redo, layers."""
+
+from ..core import geometry as g
+from .base import (
+    UNDO_POINT, NumberReq, OptionReq, PointReq, SelectReq, TextReq, command)
+
+
+def _delete_held_points(ctx) -> bool:
+    """Take out any held control points. True if that is what Delete meant."""
+    cvs = [(oid, i) for (oid, kind, i) in ctx.selection.subobjects
+           if kind == "cv"]
+    if not cvs:
+        return False
+    by_obj: dict[str, list[int]] = {}
+    for oid, i in cvs:
+        by_obj.setdefault(oid, []).append(i)
+    done = 0
+    for oid, indices in by_obj.items():
+        obj = ctx.scene.get(oid)
+        if obj is None:
+            continue
+        was_closed = g.is_closed_curve(obj.shape)
+        try:
+            shape = g.delete_control_points(obj.shape, indices)
+        except g.GeometryError as exc:
+            ctx.echo(f"{obj.name}: {exc}")
+            continue
+        done += len(indices)
+        if shape is None:
+            ctx.scene.remove(oid)
+            ctx.echo(f"{obj.name}: last control point deleted, "
+                     "so the object went with it.")
+            continue
+        new = ctx.scene.replace_shape(oid, shape)
+        # taking a curve apart this far changes what it is, and the
+        # viewport alone does not say so once the points are gone
+        if new.kind == "point":
+            ctx.echo(f"{obj.name} is a point now.")
+        elif was_closed and not g.is_closed_curve(shape):
+            ctx.echo(f"{obj.name} is open now.")
+    if done:
+        ctx.echo(f"Deleted {done} control point(s).")
+    return True
+
+
+def _delete_held_faces(ctx) -> bool:
+    """Take out any Ctrl+Shift-picked faces. True if that is what Delete
+    meant.
+
+    A face is already something you can hold: it is how `pushpull` and
+    `extractsrf` are aimed. Holding one and pressing Delete plainly means
+    that face, so it goes, and the solid it came off is a shell afterwards.
+    That is the useful half of the operation, not a side effect: it is how
+    you open something up to get at the inside of it.
+    """
+    faces = [(oid, i) for (oid, kind, i) in ctx.selection.subobjects
+             if kind == "face"]
+    if not faces:
+        return False
+    by_obj: dict[str, list[int]] = {}
+    for oid, i in faces:
+        by_obj.setdefault(oid, []).append(i)
+    done = 0
+    opened = []
+    for oid, indices in by_obj.items():
+        obj = ctx.scene.get(oid)
+        if obj is None:
+            continue
+        if obj.kind == "mesh":
+            # a mesh's face is a triangle: the rest stay, the points too
+            import numpy as np
+            from ..core.mesh import MeshShape
+            mesh = obj.shape
+            keep = np.ones(len(mesh.triangles), bool)
+            drop = [i for i in set(indices) if 0 <= i < len(keep)]
+            keep[drop] = False
+            done += len(drop)
+            if not keep.any():
+                ctx.scene.remove(oid)
+                ctx.echo(f"{obj.name}: every face deleted, "
+                         "so the mesh went with it.")
+            else:
+                ctx.scene.replace_shape(oid, MeshShape(
+                    mesh.vertices, mesh.triangles[keep],
+                    faceted=mesh.faceted))
+            continue
+        was_solid = g.shape_kind(obj.shape) == "solid"
+        try:
+            # All of them at once. Taking one out renumbers the rest, so a
+            # face at a time would delete whatever had shuffled into the
+            # index rather than the face that was picked.
+            rest = g.remove_faces(obj.shape, indices)
+        except g.GeometryError as exc:
+            ctx.echo(f"{obj.name}: {exc}")
+            continue
+        done += len(set(indices))
+        if rest is None:
+            ctx.scene.remove(oid)
+            ctx.echo(f"{obj.name}: every face deleted, "
+                     "so the object went with it.")
+            continue
+        ctx.scene.replace_shape(oid, rest)
+        if was_solid and g.shape_kind(rest) != "solid":
+            opened.append(obj.name)
+    # The gap is visible, but which objects stopped being solid is the thing
+    # that changes what the next command can do with them.
+    ctx.selection.set_subobjects([e for e in ctx.selection.subobjects
+                                  if e[1] != "face"])
+    if done:
+        ctx.echo(f"Deleted {done} face(s)."
+                 + (f" {', '.join(opened)} is open now."
+                    if len(opened) == 1 else
+                    f" {len(opened)} objects are open now." if opened else ""))
+    return True
+
+
+def _delete_held_segments(ctx) -> bool:
+    """Take out any Ctrl+Shift-picked segments of curves. True when that
+    is what Delete meant.
+
+    A segment is already something you hold: it is how the gumball takes
+    hold of one side of a rectangle. Holding one and pressing Delete
+    plainly means that segment, so it goes and the rest of the curve
+    stays. A solid's edge is not this: there is no segment of it to take
+    away, so a held edge of one is left alone.
+    """
+    held = [(oid, i) for (oid, kind, i) in ctx.selection.subobjects
+            if kind == "edge"]
+    if not held:
+        return False
+    by_obj: dict[str, list[int]] = {}
+    for oid, i in held:
+        by_obj.setdefault(oid, []).append(i)
+    done = 0
+    opened = []
+    touched = []
+    for oid, indices in by_obj.items():
+        obj = ctx.scene.get(oid)
+        if obj is None or obj.kind != "curve":
+            continue
+        try:
+            rest = g.remove_segments(obj.shape, indices)
+        except g.GeometryError as exc:
+            ctx.echo(f"{obj.name}: {exc}")
+            continue
+        was_closed = g.is_closed_curve(obj.shape)
+        done += len(set(indices))
+        touched.append(oid)
+        if not rest:
+            ctx.scene.remove(oid)
+            ctx.echo(f"{obj.name}: every segment deleted, "
+                     "so the curve went with it.")
+            continue
+        ctx.scene.replace_shape(oid, rest[0])
+        for piece in rest[1:]:
+            ctx.scene.add_from(piece, obj)
+        if len(rest) > 1:
+            opened.append(f"{obj.name} is now {len(rest)} curves")
+        elif was_closed:
+            opened.append(f"{obj.name} is open")
+    if not done:
+        return False
+    # the indices left behind would mean different segments of the curve
+    # that is there now, so let go of them
+    ctx.selection.set_subobjects(
+        [e for e in ctx.selection.subobjects
+         if not (e[1] == "edge" and e[0] in touched)])
+    tail = " — " + ", ".join(opened) if opened else ""
+    ctx.echo(f"Deleted {done} segment(s){tail}.")
+    return True
+
+
+@command("delete", aliases=("del", "erase"), space="any", repeatable=False)
+def cmd_delete(ctx):
+    lv = ctx.sheet_view()
+    if lv is not None:
+        # what is picked on a sheet is the sheet's own, and the sheet is what
+        # knows how to take a frame or an annotation out of itself
+        count = len(lv.selected)
+        if not lv.delete_selected():
+            ctx.echo("Nothing is picked on this sheet — click the geometry, "
+                     "a detail frame or an annotation first.")
+            return
+        ctx.echo(f"Deleted {count} sheet item(s).")
+        return
+    # held control points, faces or curve segments are the picked thing
+    # when no object is
+    if not ctx.selection.ids and (_delete_held_points(ctx)
+                                  or _delete_held_faces(ctx)
+                                  or _delete_held_segments(ctx)):
+        return
+    # min_count=0: a bare Enter comes back here, where clicking a control
+    # point during the wait (which bypasses the request) can still answer
+    objs = yield SelectReq("Select objects or control points to delete",
+                           min_count=0)
+    if not objs:
+        if (_delete_held_points(ctx) or _delete_held_faces(ctx)
+                or _delete_held_segments(ctx)):
+            return
+        ctx.echo("Nothing selected to delete.")
+        return
+    for o in objs:
+        ctx.scene.remove(o.id)
+    ctx.echo(f"Deleted {len(objs)} object(s).")
+
+
+@command("join", aliases=("j",))
+def cmd_join(ctx):
+    objs = yield SelectReq("Select curves or surfaces to join",
+                           kinds=("curve", "surface"), min_count=2,
+                           too_few_ends=True)
+    kinds = {o.kind for o in objs}
+    if kinds == {"curve"}:
+        joined = g.join_curves([o.shape for o in objs])
+        for o in objs[1:]:
+            ctx.scene.remove(o.id)
+        new = ctx.scene.replace_shape(objs[0].id, joined)
+        ctx.select_result([new])
+        ctx.flash([new])
+        ctx.echo(f"Joined {len(objs)} curves into {new.name}.")
+        return
+    if kinds != {"surface"}:
+        ctx.echo("Join needs all curves or all surfaces, not a mix of the two.")
+        return
+
+    result = g.join_surfaces([o.shape for o in objs])
+    pieces = g.joined_pieces(result)
+    if len(pieces) >= len(objs):
+        # Nothing merged: every surface came back as its own piece. Leave
+        # the scene untouched rather than shuffle the same faces around.
+        ctx.echo("These surfaces share no edges, so nothing was joined.")
+        return
+
+    new = ctx.scene.replace_shape(objs[0].id, pieces[0])
+    made = [new]
+    for p in pieces[1:]:
+        made.append(ctx.scene.add(p, layer_id=objs[0].layer_id))
+    for o in objs[1:]:
+        ctx.scene.remove(o.id)
+    ctx.select_result(made)
+    ctx.flash(made)
+
+    if len(pieces) == 1:
+        tail = (" into a closed solid" if new.kind == "solid"
+                else f" into {new.name}")
+        ctx.echo(f"Joined {len(objs)} surfaces{tail}.")
+    else:
+        ctx.echo(f"Joined {len(objs)} surfaces into {len(pieces)} "
+                 f"polysurfaces.")
+
+
+@command("offset")
+def cmd_offset(ctx):
+    objs = yield SelectReq("Select curve to offset", kinds=("curve",),
+                           max_count=1)
+    from . import dragging
+    from .base import PointReq
+    shape = objs[0].shape
+    mid = dragging.curve_middle(shape)
+    out = dragging.offset_direction(shape, tuple(ctx.cplane.normal))
+    read = dragging.signed_along(mid, out)
+
+    def _offset_to(p):
+        v = read(p)
+        if abs(v) < 1e-9:
+            return None
+        try:
+            return g.offset_curve(shape, v)
+        except g.GeometryError:
+            return None
+
+    dp = yield PointReq("Offset distance (click a side, or type a number)",
+                        axis_lock=(mid, out),
+                        number_from=(mid, out), rubber_from=mid,
+                        preview_fn=_offset_to)
+    dist = read(dp)
+    if abs(dist) < 1e-9:
+        ctx.echo("Zero offset — nothing created.")
+        return
+    new_shape = g.offset_curve(shape, dist)
+    obj = ctx.scene.add(new_shape, layer_id=objs[0].layer_id)
+    ctx.echo(f"Offset -> {obj.name}.")
+
+
+# What a fillet is made of, carried on the prompt rather than asked for
+# afterwards: a radius to round the corner with, zero for a sharp one,
+# and whether the curves are cut back to it. Rhino puts them here too,
+# and the command reads them at the end rather than up front, so a
+# number typed between the two picks still counts.
+#
+# Remembered while the program runs, as Rhino remembers them: a radius
+# typed once is what the next fillet opens on, and the one after that.
+# They go back to a sharp, trimming corner when the program is started
+# again, which is what a module holding them does by itself.
+_FILLET_STICKY = {"Radius": "0", "Trim": "Yes"}
+
+
+def _fillet_choices() -> dict:
+    """The options as they stand, the remembered value first so that it
+    is what the chip shows and what Enter alone would take."""
+    other = "No" if _FILLET_STICKY["Trim"] == "Yes" else "Yes"
+    return {"Radius": [_FILLET_STICKY["Radius"]],
+            "Trim": [_FILLET_STICKY["Trim"], other]}
+
+
+@command("fillet")
+def cmd_fillet(ctx):
+    """Round the corner between two curves, or fillet a solid's edges.
+
+    The clicks say which corner: each curve is picked near the end that
+    is to meet the other, which is also what decides which side of a
+    crossing is kept. The fillet is made as soon as the second curve is
+    picked, with the radius and Trim as they stand on the prompt then.
+    Radius 0 is Rhino's sharp corner: the curves are cut back, or carried
+    out, to the point they cross at, with no arc between them.
+    """
+    from .solids_edit import cmd_filletedge
+
+    held = ctx.selection.objects()
+    edge_objects = [ctx.scene.get(oid)
+                    for oid, kind, _ in ctx.selection.subobjects
+                    if kind == "edge"]
+    if (any(o is not None and o.kind in ("solid", "surface")
+            for o in edge_objects)
+            or (held and all(o.kind in ("solid", "surface") for o in held))):
+        yield from cmd_filletedge(ctx)
+        return
+    # No preselection: where the curve is clicked is half the answer,
+    # and a curve that is merely selected says nothing about which
+    # corner is meant. It is also what a fillet leaves behind, so taking
+    # it would make the next run start on its own result.
+    a = yield SelectReq("Select first curve", kinds=("curve", "solid",
+                                                     "surface"),
+                        max_count=1, choices=_fillet_choices(),
+                        number_option="Radius", want_point=True,
+                        allow_preselected=False)
+    if a[0].kind != "curve":
+        yield from cmd_filletedge(ctx, objs=a)
+        return
+    near_a = ctx.pick_points.get(a[0].id)
+    b = yield SelectReq("Select second curve", kinds=("curve",),
+                        max_count=1, allow_preselected=False,
+                        choices=_fillet_choices(), number_option="Radius",
+                        want_point=True)
+    near_b = ctx.pick_points.get(b[0].id)
+    if b[0].id == a[0].id:
+        ctx.echo("A curve cannot be filleted with itself.")
+        return
+    _fillet_the_corner(ctx, a[0], b[0], near_a, near_b)
+
+
+def _fillet_the_corner(ctx, first, second, near_a, near_b):
+    """Make the corner the two picks asked for, as the options stand."""
+    radius = _fillet_radius(ctx)
+    trim = ctx.opt("Trim", "Yes") == "Yes"
+    if near_a is None or near_b is None:
+        # Typed, scripted or chosen from a list: no click to read a
+        # corner off, so the ends that are nearest each other are meant.
+        near_a, near_b = g.nearest_ends(first.shape, second.shape)
+    try:
+        if radius <= 0:
+            ea, eb = g.corner_curves(first.shape, second.shape,
+                                     near_a, near_b)
+            pieces = [ea, eb]
+        else:
+            ea, arc, eb = g.fillet_curves(first.shape, second.shape, radius,
+                                          near_a, plane=ctx.cplane)
+            pieces = [ea, arc, eb]
+    except g.GeometryError as exc:
+        ctx.echo(f"{exc}")
+        return
+    if trim:
+        joined = g.join_curves(pieces)
+        ctx.scene.remove(second.id)
+        new = ctx.scene.replace_shape(first.id, joined)
+        ctx.select_result([new])
+        ctx.echo(f"Filleted into {new.name} (r={radius:g})." if radius > 0
+                 else f"Trimmed to a corner in {new.name}.")
+        return
+    # The curves stay as they were drawn; only what fills the corner is
+    # new, and at radius zero there is nothing to fill it with.
+    if radius <= 0:
+        ctx.echo("Radius 0 with Trim=No leaves the curves as they are.")
+        return
+    added = ctx.scene.add(arc, layer_id=first.layer_id)
+    ctx.select_result([added])
+    ctx.echo(f"Fillet arc added (r={radius:g}).")
+
+
+def _fillet_radius(ctx) -> float:
+    """The radius as the prompt last had it, in document units (2mm,
+    0.5in and 1/2" are read as lengths), zero if it is not one.
+
+    Also what the next fillet will open on: the options are remembered
+    for as long as the program runs.
+    """
+    from ..utils.units import parse_length
+    text = str(ctx.opt("Radius", _FILLET_STICKY["Radius"]))
+    radius = max(0.0, parse_length(text, ctx.scene.units) or 0.0)
+    _FILLET_STICKY["Radius"] = f"{radius:g}"
+    _FILLET_STICKY["Trim"] = ctx.opt("Trim", _FILLET_STICKY["Trim"])
+    return radius
+
+
+@command("filletcorners")
+def cmd_filletcorners(ctx):
+    """Round every corner of a polyline at once, straight and arc pieces alike."""
+    from .solids_edit import _edge_size_req
+    objs = yield SelectReq("Select polyline to fillet every corner of",
+                           kinds=("curve",), max_count=1)
+    read, req = _edge_size_req(
+        ctx, objs, "Fillet radius (click, or type a number)",
+        lambda r: g.fillet_corners(objs[0].shape, r))
+    radius = read((yield req))
+    if radius < 1e-9:
+        ctx.echo("Zero radius — nothing filleted.")
+        return
+    try:
+        new = ctx.scene.replace_shape(
+            objs[0].id, g.fillet_corners(objs[0].shape, radius))
+    except g.GeometryError as exc:
+        ctx.echo(f"{objs[0].name}: {exc}")
+        return
+    ctx.echo(f"Rounded every corner of {new.name} (r={radius:g}).")
+
+
+@command("explode", aliases=("x",))
+def cmd_explode(ctx):
+    objs = yield SelectReq("Select objects to explode")
+    made, whole = [], []
+    for o in objs:
+        parts = g.explode(o.shape)
+        if not parts:
+            ctx.echo(f"{o.name} cannot be exploded further.")
+            whole.append(o)
+            continue
+        for p in parts:
+            made.append(ctx.scene.add(p, layer_id=o.layer_id))
+        ctx.scene.remove(o.id)
+    # What could not be exploded stays picked beside what could.
+    ctx.select_result(made + whole)
+    if made:
+        ctx.flash(made)
+        ctx.echo(f"Exploded into {len(made)} object(s).")
+
+
+def _add_split_piece(ctx, shape, target):
+    """Keep a picture's display attributes with each cropped region."""
+    if target.kind == "picture":
+        obj = ctx.scene.add_from(shape, target)
+        ctx.scene.update(obj.id, linetype=target.linetype,
+                         draw_order=target.draw_order, block_id=target.block_id)
+        return obj
+    return ctx.scene.add(shape, layer_id=target.layer_id)
+
+
+_SPLIT_KINDS = ("curve", "surface", "solid", "picture", "hatch")
+
+
+@command("split")
+def cmd_split(ctx):
+    yield from _split(ctx)
+
+
+@command("splitpoints", label="Split with points")
+def cmd_splitpoints(ctx):
+    """Split, cutting a curve at points picked on it rather than by cutters."""
+    yield from _split(ctx, at_points=True)
+
+
+def _split(ctx, at_points=False):
+    targets = yield SelectReq(
+        "Select curve, surface, hatch or picture to split",
+        kinds=_SPLIT_KINDS, max_count=1)
+    target = targets[0]
+    is_curve = target.kind == "curve"
+    if not (is_curve and at_points):
+        cutters = yield SelectReq(
+            "Select cutting objects", allow_preselected=False,
+            extra_options=("Points",) if is_curve else ())
+        at_points = cutters == "Points"
+    if at_points:
+        points = yield from _points_on(ctx, target.shape)
+        if not points:
+            return
+        pieces = g.split_curve_at_points(target.shape, points)
+    else:
+        pieces = g.split_shape(target.shape, [c.shape for c in cutters],
+                               direction=tuple(ctx.cplane.normal))
+    made = [_add_split_piece(ctx, p, target) for p in pieces]
+    ctx.scene.remove(target.id)
+    ctx.select_result(made)
+    ctx.flash(made)
+    ctx.echo(f"Split {target.name} into {len(pieces)} pieces.")
+
+
+def _points_on(ctx, curve):
+    """Points picked on `curve` until Enter, each moved onto it."""
+    def ghost(p):
+        try:
+            return g.make_point(g.closest_point_on(curve, p))
+        except (g.GeometryError, TypeError, ValueError):
+            return None
+
+    points = []
+    while True:
+        p = yield PointReq(
+            "Point on the curve to split at"
+            + (", Enter when done" if points else ""),
+            allow_empty=True, snap_on=curve, steps_back=True,
+            extra_options=(UNDO_POINT,) if points else (),
+            marks=[(q, "") for q in points],
+            rubber_band=False, preview_fn=ghost)
+        if p is None:
+            return points
+        if p == UNDO_POINT:
+            points.pop()
+            continue
+        points.append(g.closest_point_on(curve, p))
+
+
+@command("trim", aliases=("tr",))
+def cmd_trim(ctx):
+    """Cut objects with the cutters and take away the part clicked.
+
+    One click says both which object and which part of it goes, as in
+    Rhino (#31): the piece nearest where the click landed is removed at
+    once, and it asks again for the next until Enter. A pick with no
+    position (typed, scripted, or chosen from a list) cannot say which
+    part, so it asks which piece instead, as trim always did.
+    """
+    cutters = yield SelectReq("Select cutting objects")
+    cutting = [(c.id, c.shape) for c in cutters]
+    trimmed = 0
+    while True:
+        picked = yield SelectReq(
+            "Click the part to trim away"
+            + (", Enter when done" if trimmed else ""),
+            kinds=("curve", "surface", "solid", "picture", "hatch"),
+            min_count=0 if trimmed else 1, max_count=1,
+            allow_preselected=False, want_point=True)
+        if not picked:
+            break
+        target = picked[0]
+        at = ctx.pick_points.get(target.id)
+        pieces = _pieces_to_trim(ctx, target, cutting)
+        if pieces is None:
+            if at is None:
+                return          # scripted, as trim always was: said, and done
+            continue            # clicked: say so and let the next click try
+        if len(pieces) == 1:
+            # only touching the cutters: there is one part, and it goes
+            ctx.scene.remove(target.id)
+            trimmed += 1
+            if at is None:
+                break
+            continue
+        if at is None:
+            yield from _trim_by_asking(ctx, target, pieces)
+            return
+        doomed = _piece_nearest(pieces, at)
+        for i, piece in enumerate(pieces):
+            if i != doomed:
+                kept = _add_split_piece(ctx, piece, target)
+                ctx.scene.update(kept.id, name=target.name)
+        ctx.scene.remove(target.id)
+        trimmed += 1
+    if trimmed:
+        ctx.echo(f"Trimmed {trimmed} part(s).")
+
+
+def _pieces_to_trim(ctx, target, cutting):
+    """`target` cut by every cutter but itself, or None, said why."""
+    others = [shape for cid, shape in cutting if cid != target.id]
+    if not others:
+        ctx.echo(f"{target.name} is the only cutter; nothing to trim it with.")
+        return None
+    try:
+        pieces = g.split_shape(target.shape, others,
+                               direction=tuple(ctx.cplane.normal))
+    except g.GeometryError:
+        pieces = []
+    if len(pieces) < 2:
+        if target.kind == "curve" and any(
+                g.shapes_touch(target.shape, c) for c in others):
+            return [target.shape]
+        ctx.echo(f"The cutters do not cross {target.name}; nothing to trim.")
+        return None
+    return pieces
+
+
+def _piece_nearest(pieces, at) -> int:
+    """Which piece the clicked point is on: the one nearest to it."""
+    from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeVertex
+    from OCP.BRepExtrema import BRepExtrema_DistShapeShape
+    from OCP.gp import gp_Pnt
+    here = BRepBuilderAPI_MakeVertex(gp_Pnt(*at)).Vertex()
+    best, best_d = 0, float("inf")
+    for i, piece in enumerate(pieces):
+        shape = piece.face() if hasattr(piece, "face") else piece
+        try:
+            d = BRepExtrema_DistShapeShape(here, shape).Value()
+        except Exception:                                   # noqa: BLE001
+            continue
+        if d < best_d:
+            best, best_d = i, d
+    return best
+
+
+def _trim_by_asking(ctx, target, pieces):
+    """The object split, then each piece clicked taken away until Enter.
+
+    Each click takes its piece away at once and the prompt comes back for
+    the next, the way Rhino does it; Enter or Escape ends with whatever
+    was trimmed staying trimmed (issue #23). Only the pieces are on offer,
+    so the cutters and the rest of the model cannot be clicked away.
+    """
+    added = [_add_split_piece(ctx, p, target) for p in pieces]
+    ctx.scene.remove(target.id)
+    piece_ids = {a.id for a in added}
+    trimmed = 0
+    try:
+        while len(piece_ids) > 1:
+            picked = yield SelectReq(
+                "Click the piece to trim away, Enter when done",
+                min_count=0, max_count=1, allow_preselected=False,
+                accept=lambda o: o.id in piece_ids)
+            if not picked:
+                break
+            ctx.scene.remove(picked[0].id)
+            piece_ids.discard(picked[0].id)
+            trimmed += 1
+    finally:
+        if trimmed == 0:
+            # nothing chosen: a trim that trims nothing must not leave the
+            # object split behind it
+            for a in added:
+                ctx.scene.remove(a.id)
+            whole = ctx.scene.add_from(target.shape, target)
+            ctx.scene.update(whole.id, name=target.name)
+    ctx.echo(f"Trimmed {trimmed} piece(s); {len(piece_ids)} kept."
+             if trimmed else f"{target.name} left as it was.")
+
+
+@command("rebuild")
+def cmd_rebuild(ctx):
+    objs = yield SelectReq("Select curves to rebuild", kinds=("curve",))
+    from .base import IntReq
+    count = yield IntReq("Point count", default=10, minimum=2)
+    degree = yield IntReq("Degree", default=3, minimum=1)
+    for o in objs:
+        ctx.scene.replace_shape(
+            o.id, g.rebuild_curve(o.shape, point_count=count, degree=degree))
+    ctx.echo(f"Rebuilt {len(objs)} curve(s) with {count} points, "
+             f"degree {degree}.")
+
+
+# --- knots ------------------------------------------------------------------
+
+def _live(ctx, ids):
+    """The picked objects as they are now. A knot put in a moment ago means
+    the shape the SelectReq handed over is already out of date."""
+    return [o for o in (ctx.scene.get(i) for i in ids) if o is not None]
+
+
+def _aimed_at(objs, p):
+    """The curve the click is on. Several can be picked at once, and the
+    point says which of them you meant, the way clicking it does in Rhino."""
+    best, best_d = None, None
+    for o in objs:
+        try:
+            d = g.distance_point_to_shape(o.shape, p)
+        except g.GeometryError:
+            continue
+        if best_d is None or d < best_d:
+            best, best_d = o, d
+    return best
+
+
+def _show_points(ctx, ids):
+    """Turn the control points on, as Rhino does for these two commands.
+    Both of them are about a point you are about to gain or lose, and that
+    is hard to follow with nothing on screen to gain or lose it from."""
+    vp = getattr(ctx, "viewport", None)
+    if vp is None:
+        return
+    vp.cv_enabled.update(ids)
+    vp.scene.cv_auto.difference_update(ids)
+    from .view import _redraw_all
+    _redraw_all(ctx)
+
+
+@command("insertknot", aliases=("insertcontrolpoint",))
+def cmd_insertknot(ctx):
+    """Add a control point to a curve without moving the curve.
+
+    Rhino's InsertKnot and InsertControlPoint. Automatic puts a knot in the
+    middle of every span instead of taking them one click at a time.
+    """
+    objs = yield SelectReq("Select curves for knot insertion",
+                           kinds=("curve",))
+    ids = [o.id for o in objs]
+    _show_points(ctx, ids)
+
+    def ghost(p):
+        # the curve does not move, so a ghost of the curve would show
+        # nothing. What changes is the control polygon and where the new
+        # handle sits in it, so that is what follows the cursor.
+        if not isinstance(p, (tuple, list)):
+            return None
+        o = _aimed_at(_live(ctx, ids), p)
+        if o is None:
+            return None
+        try:
+            out = g.insert_knot(o.shape, p)
+            return g.make_polyline(g.get_control_points(out),
+                                   closed=g.is_closed_curve(out))
+        except g.GeometryError:
+            return None
+
+    added = 0
+    while True:
+        p = yield PointReq("Point on curve to add a knot (Enter to finish)",
+                           allow_empty=True, extra_options=("Automatic",),
+                           preview_fn=ghost)
+        if p is None:
+            break
+        if p == "Automatic":
+            for o in _live(ctx, ids):
+                before = len(g.get_control_points(o.shape))
+                try:
+                    shape = g.insert_knots_at_spans(o.shape)
+                except g.GeometryError as exc:
+                    ctx.echo(f"{o.name}: {exc}")
+                    continue
+                ctx.scene.replace_shape(o.id, shape)
+                added += len(g.get_control_points(shape)) - before
+            continue
+        o = _aimed_at(_live(ctx, ids), p)
+        if o is None:
+            continue
+        try:
+            ctx.scene.replace_shape(o.id, g.insert_knot(o.shape, p))
+        except g.GeometryError as exc:
+            ctx.echo(f"{o.name}: {exc}")
+            continue
+        added += 1
+    ctx.echo(f"Added {added} control point(s)." if added
+             else "Nothing added.")
+
+
+@command("removeknot")
+def cmd_removeknot(ctx):
+    """Take a knot out of a curve and say how far the curve moved.
+
+    Rhino's RemoveKnot. One span fewer, so the curve has to give up
+    whatever that knot was holding.
+    """
+    objs = yield SelectReq("Select curves for knot removal", kinds=("curve",))
+    ids = [o.id for o in objs]
+    _show_points(ctx, ids)
+
+    def ghost(p):
+        # this one does move the curve, so the curve is the honest preview
+        if not isinstance(p, (tuple, list)):
+            return None
+        o = _aimed_at(_live(ctx, ids), p)
+        if o is None:
+            return None
+        try:
+            return g.remove_knot(o.shape, p)
+        except g.GeometryError:
+            return None
+
+    removed = 0
+    while True:
+        p = yield PointReq("Point on curve near the knot to remove "
+                           "(Enter to finish)", allow_empty=True,
+                           preview_fn=ghost)
+        if p is None:
+            break
+        o = _aimed_at(_live(ctx, ids), p)
+        if o is None:
+            continue
+        try:
+            shape = g.remove_knot(o.shape, p)
+        except g.GeometryError as exc:
+            ctx.echo(f"{o.name}: {exc}")
+            continue
+        moved = g.max_deviation(o.shape, shape)
+        ctx.scene.replace_shape(o.id, shape)
+        removed += 1
+        ctx.echo(f"{o.name}: knot out, curve moved by up to "
+                 f"{ctx.scene.format_length(moved)}.")
+    ctx.echo(f"Removed {removed} knot(s)." if removed else "Nothing removed.")
+
+
+@command("removecontrolpoint", repeatable=False)
+def cmd_removecontrolpoint(ctx):
+    """Delete the control points you are holding, as Delete does.
+
+    Rhino's RemoveControlPoint, for the muscle memory that types it.
+    """
+    if not _delete_held_points(ctx):
+        ctx.echo("No control points are held — turn them on with F10 or "
+                 "`pointson`, then click the ones to remove.")
+    yield from ()
+
+
+# --- direction ---------------------------------------------------------------
+
+def flip_objects(ctx, objs) -> int:
+    """Turn each object round, whichever kind it is. Returns how many went.
+
+    Shared with `dir`, which is the same edit with the arrows up so you can
+    see what you did to them.
+    """
+    done = 0
+    for o in objs:
+        live = ctx.scene.get(o.id)
+        if live is None:
+            continue
+        try:
+            shape = (g.reverse_curve(live.shape) if live.kind == "curve"
+                     else g.flip_surface(live.shape))
+        except g.GeometryError as exc:
+            ctx.echo(f"{live.name}: {exc}")
+            continue
+        ctx.scene.replace_shape(live.id, shape)
+        done += 1
+    return done
+
+
+@command("flip")
+def cmd_flip(ctx):
+    """Turn curves round and surfaces inside out, as Rhino's Flip does.
+
+    A curve runs from one end to the other and a surface faces one way, and
+    both decide things you only find out later: which end an offset comes
+    out on, which way a sweep travels, which side a shell thickens.
+    """
+    objs = yield SelectReq("Select curves or surfaces to flip",
+                           kinds=("curve", "surface", "solid"))
+    done = flip_objects(ctx, objs)
+    ctx.echo(f"Flipped {done} object(s)." if done else "Nothing flipped.")
+
+
+@command("dir")
+def cmd_dir(ctx):
+    """Show which way curves run and which way surfaces face.
+
+    Rhino's Dir. Flip turns round whatever it is showing and leaves the
+    arrows up, because the reason to look is to fix what you find, and a
+    flip you cannot see is a flip you do twice.
+    """
+    from .view import _redraw_all
+    objs = yield SelectReq("Select objects to show the direction of",
+                           kinds=("curve", "surface", "solid"))
+    ids = [o.id for o in objs]
+    ctx.scene.dir_enabled.update(ids)
+    _redraw_all(ctx)
+    try:
+        while True:
+            choice = yield OptionReq("Direction shown (Enter when done)",
+                                     options=["Flip", "Done"], default="Done")
+            if choice == "Done":
+                break
+            done = flip_objects(ctx, _live(ctx, ids))
+            ctx.echo(f"Flipped {done} object(s)." if done
+                     else "Nothing flipped.")
+            _redraw_all(ctx)
+    finally:
+        # the arrows belong to the command, not to the drawing: Rhino's go
+        # when Dir ends, whether you finished or pressed Escape
+        for i in ids:
+            ctx.scene.dir_enabled.discard(i)
+        _redraw_all(ctx)
+
+
+@command("hide")
+def cmd_hide(ctx):
+    from ..core import clipping
+    objs = yield SelectReq("Select objects to hide")
+    in_sight = clipping.in_sight(ctx.scene)
+    ctx.scene.update_many([o.id for o in objs], visible=False)
+    ctx.echo(f"Hid {len(objs)} object(s).")
+    # a hidden clipping plane still cuts, with nothing on screen to say so
+    note = clipping.still_cuts(clipping.hidden_since(ctx.scene, in_sight))
+    if note:
+        ctx.echo(note)
+
+
+@command("show", aliases=("unhide",))
+def cmd_show(ctx):
+    n = ctx.scene.update_many([o.id for o in ctx.scene.all() if not o.visible],
+                              visible=True)
+    ctx.echo(f"Showed {n} object(s).")
+    yield from ()
+
+
+def pick_from_hidden(ctx, ids, prompt: str):
+    """Offer hidden objects in place of those in sight for one selection.
+
+    Restore the view however the prompt ends, including Escape or a failed
+    redraw. Only the caller's subsequent edit changes object visibility.
+    """
+    from .view import _redraw_all
+    offered = frozenset(ids)
+    ctx.selection.clear()
+    try:
+        ctx.scene.showing_only = offered
+        _redraw_all(ctx)
+        picked = yield SelectReq(prompt, allow_preselected=False,
+                                 accept=lambda o: o.id in offered)
+    finally:
+        ctx.scene.showing_only = None
+        _redraw_all(ctx)
+    return picked
+
+
+@command("showselected", aliases=("unhideselected",))
+def cmd_showselected(ctx):
+    """Show the hidden objects you pick and leave the rest hidden."""
+    # Objects on an off layer would still be out of sight after showing.
+    hidden = [o.id for o in ctx.scene.all()
+              if not o.visible and ctx.scene.layers.is_visible(o.layer_id)]
+    if not hidden:
+        ctx.echo("There is nothing hidden to show.")
+        return
+    objs = yield from pick_from_hidden(ctx, hidden,
+                                       "Select hidden objects to show")
+    n = ctx.scene.update_many([o.id for o in objs], visible=True)
+    ctx.echo(f"Showed {n} object(s); {len(hidden) - n} still hidden.")
+
+
+def _detail_here(ctx):
+    """The detail you are inside on a sheet, or None, saying why not."""
+    vp = getattr(ctx, "viewport", None)
+    lv = getattr(vp, "layout_view", None)
+    detail = lv._entered() if lv is not None else None
+    if detail is None:
+        ctx.echo("This works inside a detail: double-click one on a sheet "
+                 "to go inside it first.")
+    return detail
+
+
+def _set_hidden_in(ctx, detail, ids):
+    # assigned, not edited in place: undo holds a copy of the detail
+    detail.hidden_objects = list(ids)
+    ctx.scene.notify("layouts")
+
+
+@command("hideindetail")
+def cmd_hideindetail(ctx):
+    """Hide the objects you pick in the detail you are inside, and nowhere
+    else: the model and every other detail still show them."""
+    detail = _detail_here(ctx)
+    if detail is None:
+        return
+    objs = yield SelectReq("Select objects to hide in this detail")
+    hidden = list(detail.hidden_objects)
+    hidden += [o.id for o in objs if o.id not in hidden]
+    _set_hidden_in(ctx, detail, hidden)
+    ctx.echo(f"Hid {len(objs)} object(s) in this detail; 'showindetail' "
+             "brings them back.")
+
+
+@command("showindetail")
+def cmd_showindetail(ctx):
+    """Show everything the detail you are inside has hidden."""
+    detail = _detail_here(ctx)
+    if detail is None:
+        return
+    n = len(detail.hidden_objects)
+    if n:
+        _set_hidden_in(ctx, detail, [])
+    ctx.echo(f"Showed {n} object(s) in this detail.")
+    yield from ()
+
+
+@command("showselectedindetail")
+def cmd_showselectedindetail(ctx):
+    """Show the objects you pick of those the detail you are inside has
+    hidden, and leave the rest hidden there."""
+    detail = _detail_here(ctx)
+    if detail is None:
+        return
+    scene = ctx.scene
+    left_out = (scene.layers.with_descendants(detail.hidden_layers)
+                if detail.hidden_layers else set())
+    # one hidden in the model, or on a layer off here, would not appear
+    offered = [i for i in detail.hidden_objects
+               if (o := scene.get(i)) is not None and o.visible
+               and scene.layers.is_visible(o.layer_id)
+               and o.layer_id not in left_out]
+    if not offered:
+        ctx.echo("There is nothing hidden in this detail to show.")
+        return
+    objs = yield from pick_from_hidden(
+        ctx, offered, "Select objects to show in this detail")
+    back = {o.id for o in objs}
+    _set_hidden_in(ctx, detail,
+                   [i for i in detail.hidden_objects if i not in back])
+    ctx.echo(f"Showed {len(back)} object(s) in this detail; "
+             f"{len(offered) - len(back)} still hidden here.")
+
+
+@command("selall", aliases=("sa",), mutates=False)
+def cmd_selall(ctx):
+    ctx.selection.select_all()
+    ctx.echo(f"Selected {len(ctx.selection.ids)} object(s).")
+    yield from ()
+
+
+@command("selnone", aliases=("sn",), mutates=False)
+def cmd_selnone(ctx):
+    ctx.selection.clear()
+    ctx.echo("Selection cleared.")
+    yield from ()
+
+
+# Not repeatable: both have a key and a button of their own, so a
+# right-click meant for something else should not walk the drawing
+# back a step, and undo must not become the repeat target either: after
+# undoing a bad circle you want another circle to get right, not the loss
+# of the one before it.
+@command("undo", mutates=False, repeatable=False)
+def cmd_undo(ctx):
+    label = ctx.history.undo()
+    ctx.echo(f"Undid {label}." if label else "Nothing to undo.")
+    yield from ()
+
+
+@command("redo", mutates=False, repeatable=False)
+def cmd_redo(ctx):
+    label = ctx.history.redo()
+    ctx.echo(f"Redid {label}." if label else "Nothing to redo.")
+    yield from ()
+
+
+@command("rename")
+def cmd_rename(ctx):
+    objs = yield SelectReq("Select object to rename", max_count=1)
+    name = yield TextReq("New name", default=objs[0].name)
+    ctx.scene.update(objs[0].id, name=name)
+    ctx.echo(f"Renamed to {name}.")
+
+
+@command("layer")
+def cmd_layer(ctx):
+    action = yield OptionReq(
+        "Layer action", options=["New", "Current", "Show", "Hide", "Rename",
+                                 "Weight", "Linetype", "Hatch"],
+        default="New")
+    layers = ctx.scene.layers
+    if action == "New":
+        name = yield TextReq("Layer name", default="")
+        layer = layers.create(name or None)
+        layers.current_id = layer.id
+        ctx.echo(f"Created layer '{layer.name}' (now current).")
+    elif action == "Current":
+        name = yield TextReq("Layer to make current")
+        layer = layers.find_by_name(name)
+        if layer is None:
+            ctx.echo(f"No layer named '{name}'.")
+        else:
+            layers.current_id = layer.id
+            ctx.echo(f"Current layer: {layer.name}.")
+    elif action in ("Show", "Hide"):
+        from ..core import clipping
+        name = yield TextReq("Layer name")
+        layer = layers.find_by_name(name)
+        if layer is None:
+            ctx.echo(f"No layer named '{name}'.")
+        else:
+            in_sight = clipping.in_sight(ctx.scene)
+            layers.set_visible(layer.id, action == "Show")
+            ctx.echo(f"Layer '{layer.name}' "
+                     f"{'shown' if action == 'Show' else 'hidden'}.")
+            note = clipping.still_cuts(
+                clipping.hidden_since(ctx.scene, in_sight))
+            if note:
+                ctx.echo(note)
+    elif action == "Weight":
+        name = yield TextReq("Layer name")
+        layer = layers.find_by_name(name)
+        if layer is None:
+            ctx.echo(f"No layer named '{name}'.")
+        else:
+            w = yield NumberReq("Edge width on screen (pixels)",
+                                default=layer.lineweight, minimum=0.2)
+            layers.set_lineweight(layer.id, float(w))
+            ctx.echo(f"Layer '{layer.name}' draws {w:g}px edges.")
+    elif action == "Linetype":
+        from ..core import linetype as lt
+        name = yield TextReq("Layer name")
+        layer = layers.find_by_name(name)
+        if layer is None:
+            ctx.echo(f"No layer named '{name}'.")
+        else:
+            style = yield OptionReq("Linetype", options=list(lt.LINETYPES),
+                                    default=layer.linetype)
+            layers.set_linetype(layer.id, style)
+            ctx.echo(f"Layer '{layer.name}' draws {style} lines.")
+    elif action == "Hatch":
+        from ..core.layout import (pattern_label, pattern_named,
+                                   section_fills_of)
+        name = yield TextReq("Layer name")
+        layer = layers.find_by_name(name)
+        if layer is None:
+            ctx.echo(f"No layer named '{name}'.")
+        else:
+            # What a section through this layer's material is filled
+            # with, and what a hatch drawn on it starts out as. "None"
+            # leaves a cut outlined and empty.
+            fill = yield OptionReq(
+                "Hatch pattern",
+                options=[pattern_label(p)
+                         for p in section_fills_of(ctx.scene)],
+                default=pattern_label(layer.hatch))
+            layers.set_hatch(layer.id, pattern_named(ctx.scene, fill) or fill)
+            fill = layers.get(layer.id).hatch
+            if fill not in ("none", "solid"):
+                # the lines' angle and spacing, on the paper whatever the
+                # scale of the detail the cut is seen in
+                angle = yield NumberReq("Hatch angle (degrees)",
+                                        default=layer.hatch_angle)
+                layers.set_hatch_angle(layer.id, float(angle))
+                spacing = yield NumberReq("Hatch spacing on paper (mm)",
+                                          default=layer.hatch_spacing,
+                                          minimum=0.2)
+                layers.set_hatch_spacing(layer.id, float(spacing))
+            ctx.echo(f"Cuts through '{layer.name}' are left empty."
+                     if fill == "none" else
+                     f"Cuts through '{layer.name}' are filled with {fill}.")
+    elif action == "Rename":
+        old = yield TextReq("Layer to rename")
+        layer = layers.find_by_name(old)
+        if layer is None:
+            ctx.echo(f"No layer named '{old}'.")
+        else:
+            new = yield TextReq("New name")
+            layers.rename(layer.id, new)
+            ctx.echo(f"Renamed layer to '{new}'.")
+    ctx.scene.notify()
+
+
+_MATERIAL_PRESETS = {
+    "Matte":   {"metallic": 0.0, "roughness": 0.9, "opacity": 1.0},
+    "Plastic": {"metallic": 0.0, "roughness": 0.35, "opacity": 1.0},
+    "Metal":   {"metallic": 1.0, "roughness": 0.25, "opacity": 1.0},
+    "Glass":   {"metallic": 0.0, "roughness": 0.05, "opacity": 0.35},
+}
+
+
+@command("material", aliases=("mat",))
+def cmd_material(ctx):
+    """Assign a look (metallic/roughness/opacity) for rendered display
+    and GLB/USD export."""
+    objs = yield SelectReq("Select objects for the material")
+    preset = yield OptionReq(
+        "Material", options=[*_MATERIAL_PRESETS, "Custom", "Remove"],
+        default="Matte")
+    if preset == "Remove":
+        ctx.scene.update_many([o.id for o in objs], material=None)
+        ctx.echo(f"Cleared material on {len(objs)} object(s).")
+        return
+    if preset == "Custom":
+        metallic = yield NumberReq("Metallic (0-1)", default=0.0, minimum=0.0)
+        roughness = yield NumberReq("Roughness (0-1)", default=0.5,
+                                    minimum=0.0)
+        opacity = yield NumberReq("Opacity (0-1)", default=1.0, minimum=0.05)
+        mat = {"metallic": min(float(metallic), 1.0),
+               "roughness": min(float(roughness), 1.0),
+               "opacity": min(float(opacity), 1.0)}
+    else:
+        mat = dict(_MATERIAL_PRESETS[preset])
+    ctx.scene.update_many([o.id for o in objs], material=mat)
+    ctx.echo(f"{preset if preset != 'Custom' else 'Custom'} material on "
+             f"{len(objs)} object(s) — see it with 'rendered'.")
+
+
+@command("recordhistory", aliases=("history",), mutates=False)
+def cmd_recordhistory(ctx):
+    """Toggle record history: loft/extrude/revolve outputs rebuild when
+    their input curves are edited."""
+    ctx.scene.record_history = not ctx.scene.record_history
+    n = len(ctx.scene.history_records)
+    state = "ON" if ctx.scene.record_history else "OFF"
+    ctx.echo(f"Record history {state}"
+             + (f" ({n} recorded object(s) stay live)." if n else "."))
+    yield from ()
+
+
+@command("plugins", mutates=False)
+def cmd_plugins(ctx):
+    """List loaded plugins and where they came from."""
+    from ..plugins import load_plugins, loaded_plugins, plugin_dir
+    load_plugins(ctx.window)               # pick up newly dropped files
+    plugs = loaded_plugins()
+    if not plugs:
+        ctx.echo(f"No plugins. Drop .py files defining "
+                 f"blackbyrd3d_plugin(ctx) into {plugin_dir()} or install "
+                 "packages with a 'blackbyrd3d.plugins' entry point.")
+    else:
+        for name, origin in plugs:
+            ctx.echo(f"{name} — {origin}")
+    yield from ()
+
+
+@command("boundingbox", aliases=("bb",))
+def cmd_boundingbox(ctx):
+    """Create the world-aligned bounding box of the selection."""
+    objs = yield SelectReq("Select objects for the bounding box")
+    import numpy as np
+    mins = np.full(3, np.inf)
+    maxs = np.full(3, -np.inf)
+    for o in objs:
+        mn, mx = g.bbox(o.shape)
+        mins = np.minimum(mins, mn)
+        maxs = np.maximum(maxs, mx)
+    size = maxs - mins
+    if min(size) < 1e-9:
+        ctx.echo("Selection is flat — bounding box would be degenerate.")
+        return
+    obj = ctx.scene.add(g.make_box(tuple(mins), *map(float, size)))
+    ctx.echo(f"Created {obj.name} "
+             f"({size[0]:g} x {size[1]:g} x {size[2]:g}).")
+
+
+@command("smooth")
+def cmd_smooth(ctx):
+    """Relax a curve's control points toward their neighbours."""
+    objs = yield SelectReq("Select curves to smooth", kinds=("curve",))
+
+    def _preview(s):
+        try:
+            return g.make_compound(
+                [g.smooth_curve(o.shape, s, 5) for o in objs])
+        except g.GeometryError:
+            return None
+
+    strength = yield NumberReq("Smooth factor (0–1)", default=0.2,
+                               minimum=0.0, preview_fn=_preview)
+    n = 0
+    for o in objs:
+        try:
+            ctx.scene.replace_shape(o.id,
+                                    g.smooth_curve(o.shape, strength, 5))
+            n += 1
+        except g.GeometryError as exc:
+            ctx.echo(f"{o.name}: {exc}")
+    ctx.echo(f"Smoothed {n} curve(s).")
+
+
+@command("chamfer")
+def cmd_chamfer(ctx):
+    """Bevel the corner between two curves with straight cut-offs."""
+    a = yield SelectReq("Select first curve to chamfer", kinds=("curve",),
+                        max_count=1)
+    b = yield SelectReq("Select second curve", kinds=("curve",),
+                        max_count=1, allow_preselected=False)
+    from .base import TextReq
+    from ..utils.units import parse_length
+    t = yield TextReq("Chamfer distance (or d1,d2)", default="1")
+    if "," in t:
+        s1, _, s2 = t.partition(",")
+        d1 = parse_length(s1, ctx.scene.units)
+        d2 = parse_length(s2, ctx.scene.units)
+    else:
+        d1 = parse_length(t, ctx.scene.units)
+        d2 = None
+    if d1 is None:
+        ctx.echo("Could not parse distance.")
+        return
+    ea, bevel, eb = g.chamfer_curves(a[0].shape, b[0].shape, d1, d2)
+    joined = g.join_curves([ea, bevel, eb])
+    ctx.scene.remove(b[0].id)
+    new = ctx.scene.replace_shape(a[0].id, joined)
+    ctx.echo(f"Chamfered into {new.name}.")

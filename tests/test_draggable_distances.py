@@ -1,0 +1,666 @@
+"""Distances you can drag, and that show you what you are about to make.
+
+tests/test_command_interaction.py is the structural rule — no command may ask
+for a distance in the model with a keyboard-only request. These are the
+behavioural half: that the drag resolves to the right size, that the ghost is
+the shape you are actually going to get, and that typing the number still
+works for anyone who has the figure already.
+"""
+
+import math
+
+import pytest
+
+import blackbyrd3d.commands  # registers all commands  # noqa: F401
+from blackbyrd3d.commands.base import CommandContext, CommandProcessor
+from blackbyrd3d.core import geometry as g
+from blackbyrd3d.core.history import History
+from blackbyrd3d.core.scene import Scene
+from blackbyrd3d.core.selection import SelectionManager
+
+
+@pytest.fixture
+def env():
+    scene = Scene()
+    selection = SelectionManager(scene)
+    history = History(scene)
+    ctx = CommandContext(scene, selection, history)
+    return scene, selection, history, ctx, CommandProcessor(ctx)
+
+
+def _torus_volume(major, minor):
+    return 2 * math.pi ** 2 * major * minor ** 2
+
+
+# -- torus: the one that was reported --
+
+def test_torus_major_radius_can_be_dragged(env):
+    scene, _sel, _hist, _ctx, proc = env
+    proc.run("torus")
+    proc.provide_text("0,0,0")
+    ghost = proc.preview_for((10, 0, 0))
+    assert ghost is not None, "no ghost while dragging the major radius"
+    assert g.shape_kind(ghost) == "curve", (
+        "the major radius alone does not describe a solid yet — show the "
+        "circle it sweeps")
+
+
+def test_torus_minor_radius_ghosts_the_solid(env):
+    scene, _sel, _hist, _ctx, proc = env
+    proc.run("torus")
+    proc.provide_text("0,0,0")
+    proc.provide_text("10")
+    ghost = proc.preview_for((12, 0, 0))
+    assert ghost is not None, "no ghost while dragging the tube radius"
+    assert g.shape_kind(ghost) == "solid"
+    assert g.volume(ghost) == pytest.approx(_torus_volume(10, 2), rel=1e-3)
+
+
+def test_torus_still_takes_typed_numbers(env):
+    scene, _sel, _hist, _ctx, proc = env
+    proc.run("torus")
+    proc.provide_text("0,0,0")
+    proc.provide_text("10")
+    proc.provide_text("2")
+    assert not proc.busy
+    assert g.volume(scene.all()[0].shape) == pytest.approx(
+        _torus_volume(10, 2), rel=1e-3)
+
+
+def test_torus_dragged_end_to_end(env):
+    scene, _sel, _hist, _ctx, proc = env
+    proc.run("torus")
+    proc.provide_text("0,0,0")
+    proc.provide((10.0, 0.0, 0.0))
+    proc.provide((12.0, 0.0, 0.0))
+    assert not proc.busy
+    assert g.volume(scene.all()[0].shape) == pytest.approx(
+        _torus_volume(10, 2), rel=1e-3)
+
+
+def test_a_torus_with_no_tube_is_not_created(env):
+    scene, _sel, _hist, _ctx, proc = env
+    proc.run("torus")
+    proc.provide_text("0,0,0")
+    proc.provide_text("10")
+    assert proc.preview_for((10, 0, 0)) is None
+    proc.provide((10.0, 0.0, 0.0))
+    assert scene.all() == []
+
+
+# -- ellipse --
+
+def test_ellipse_radii_can_be_dragged(env):
+    scene, _sel, _hist, _ctx, proc = env
+    proc.run("ellipse")
+    proc.provide_text("0,0,0")
+    assert proc.preview_for((10, 0, 0)) is None, "a line to the axis end, no circle"
+    proc.provide((10.0, 0.0, 0.0))
+    ghost = proc.preview_for((0, 4, 0))
+    assert ghost is not None and g.shape_kind(ghost) == "curve"
+    proc.provide((0.0, 4.0, 0.0))
+    assert not proc.busy and len(scene.all()) == 1
+
+
+def test_ellipse_still_takes_typed_numbers(env):
+    scene, _sel, _hist, _ctx, proc = env
+    proc.run("ellipse")
+    proc.provide_text("0,0,0")
+    proc.provide_text("10")
+    proc.provide_text("4")
+    assert not proc.busy
+    lo, hi = g.bbox(scene.all()[0].shape)
+    assert hi[0] - lo[0] == pytest.approx(20, rel=1e-3)
+    assert hi[1] - lo[1] == pytest.approx(8, rel=1e-3)
+
+
+# -- helix --
+
+def test_helix_radius_can_be_dragged(env):
+    """Nothing describes a helix until the pitch is in as well, so the first
+    drag shows the circle the helix will wind around."""
+    scene, _sel, _hist, _ctx, proc = env
+    proc.run("helix")
+    proc.provide_text("0,0,0")
+    ghost = proc.preview_for((5, 0, 0))
+    assert ghost is not None, "no ghost while dragging the helix radius"
+    assert g.shape_kind(ghost) == "curve"
+
+
+def test_helix_pitch_can_be_dragged_up_the_axis(env):
+    scene, _sel, _hist, _ctx, proc = env
+    proc.run("helix")
+    proc.provide_text("0,0,0")
+    proc.provide((5.0, 0.0, 0.0))
+    assert proc.request.axis_lock is not None, (
+        "pitch is a rise along the helix axis — lock the drag to it")
+    ghost = proc.preview_for((0, 0, 4))
+    assert ghost is not None, "no ghost while dragging the pitch"
+
+
+def test_helix_still_takes_typed_numbers(env):
+    scene, _sel, _hist, _ctx, proc = env
+    proc.run("helix")
+    proc.provide_text("0,0,0")
+    proc.provide_text("5")
+    proc.provide_text("4")
+    proc.provide_text("3")
+    assert not proc.busy
+    lo, hi = g.bbox(scene.all()[0].shape)
+    assert hi[2] - lo[2] == pytest.approx(12, rel=1e-2)   # 3 turns x pitch 4
+    # radius 5, so 10 across — a helix is a B-spline and its bounding box
+    # follows the control poles, which stand a little outside the curve
+    assert 10 <= hi[0] - lo[0] < 11.5
+
+
+# -- editing commands: the distance comes off the geometry, not off a click --
+
+def _box(scene, sel=None, corner=(0, 0, 0), size=10):
+    obj = scene.add(g.make_box(corner, size, size, size))
+    if sel is not None:
+        sel.set([obj.id])
+    return obj
+
+
+def test_pushpull_drags_along_the_face_it_is_moving(env):
+    scene, sel, _hist, _ctx, proc = env
+    obj = _box(scene)
+    top = max(range(len(g.faces_of(obj.shape))),
+              key=lambda i: g.face_point_normal(g.faces_of(obj.shape)[i])[0][2])
+    sel.subobjects = [(obj.id, "face", top)]
+    proc.run("pushpull")
+    assert proc.request.axis_lock is not None, (
+        "push/pull moves a face along its own normal — lock the drag to it")
+    ghost = proc.preview_for((5, 5, 14))
+    assert ghost is not None, "no ghost while dragging the face"
+    assert g.volume(ghost) == pytest.approx(1000 + 4 * 100, rel=1e-3)
+
+
+def test_pushpull_inward_is_a_negative_drag(env):
+    scene, sel, _hist, _ctx, proc = env
+    obj = _box(scene)
+    faces = g.faces_of(obj.shape)
+    top = max(range(len(faces)),
+              key=lambda i: g.face_point_normal(faces[i])[0][2])
+    sel.subobjects = [(obj.id, "face", top)]
+    proc.run("pushpull")
+    proc.provide((5.0, 5.0, 7.0))
+    assert not proc.busy
+    assert g.volume(scene.get(obj.id).shape) == pytest.approx(700, rel=1e-3)
+
+
+def test_pushpull_still_takes_typed_numbers(env):
+    scene, sel, _hist, _ctx, proc = env
+    obj = _box(scene)
+    faces = g.faces_of(obj.shape)
+    top = max(range(len(faces)),
+              key=lambda i: g.face_point_normal(faces[i])[0][2])
+    sel.subobjects = [(obj.id, "face", top)]
+    proc.run("pushpull")
+    proc.provide_text("4")
+    assert not proc.busy
+    assert g.volume(scene.get(obj.id).shape) == pytest.approx(1400, rel=1e-3)
+
+
+def _outward_from(proc, radius):
+    """Where the offset drag starts, and the way out of the circle from it."""
+    base, _dir = proc.request.number_from
+    return base, tuple(c / radius for c in base)
+
+
+def test_offset_grows_when_you_drag_away_from_the_curve(env):
+    """OCC picks its own sign for an offset. What matters is that the curve
+    ends up under the cursor, whichever side that is."""
+    scene, sel, _hist, _ctx, proc = env
+    circ = scene.add(g.make_circle((0, 0, 0), 5))
+    sel.set([circ.id])
+    proc.run("offset")
+    assert proc.request.number_from is not None, (
+        "an offset distance should be draggable off the curve")
+    base, out = _outward_from(proc, 5)
+    ghost = proc.preview_for(tuple(b + 3 * o for b, o in zip(base, out)))
+    assert ghost is not None, "no ghost while dragging the offset"
+    lo, hi = g.bbox(ghost)
+    assert hi[0] - lo[0] == pytest.approx(16, rel=1e-3)
+
+
+def test_offset_shrinks_when_you_drag_into_the_curve(env):
+    scene, sel, _hist, _ctx, proc = env
+    circ = scene.add(g.make_circle((0, 0, 0), 5))
+    sel.set([circ.id])
+    proc.run("offset")
+    base, out = _outward_from(proc, 5)
+    proc.provide(tuple(b - 2 * o for b, o in zip(base, out)))
+    assert not proc.busy
+    made = [o for o in scene.all() if o.id != circ.id]
+    lo, hi = g.bbox(made[0].shape)
+    assert hi[0] - lo[0] == pytest.approx(6, rel=1e-3)
+
+
+def test_offset_still_takes_typed_numbers(env):
+    scene, sel, _hist, _ctx, proc = env
+    circ = scene.add(g.make_circle((0, 0, 0), 5))
+    sel.set([circ.id])
+    proc.run("offset")
+    proc.provide_text("2")
+    assert not proc.busy
+    made = [o for o in scene.all() if o.id != circ.id]
+    assert len(made) == 1
+
+
+def test_shell_thickness_is_dragged_off_the_wall(env):
+    """A 1 mm wall on a 10 mm box should be a 1 mm drag, so the drag starts
+    at the surface being thickened, not at the middle of the solid."""
+    scene, _sel, _hist, _ctx, proc = env
+    obj = _box(scene)
+    proc.run("shell")
+    proc.click_object(obj.id, at=(5, 5, 10))
+    proc.finish_selection()
+    assert proc.request.number_from is not None
+    base, _dir = proc.request.number_from
+    assert math.dist(base, (10, 5, 5)) < 1e-6
+    ghost = proc.preview_for((11, 5, 5))
+    assert ghost is not None, "no ghost while dragging the wall thickness"
+    assert g.volume(ghost) < 1000
+
+
+def test_shell_still_takes_typed_numbers(env):
+    scene, _sel, _hist, _ctx, proc = env
+    obj = _box(scene)
+    proc.run("shell")
+    proc.click_object(obj.id, at=(5, 5, 10))
+    proc.finish_selection()
+    proc.provide_text("1")
+    assert not proc.busy
+    # open at the top: a tray, its inside 8 x 8 and 9 deep
+    assert g.volume(scene.get(obj.id).shape) == pytest.approx(
+        1000 - 8 * 8 * 9, rel=0.01)
+
+
+def test_shell_opens_the_clicked_face(env):
+    """The face the solid was clicked on is the one taken away: click the
+    top of a box and it comes back a tray, open upward."""
+    scene, _sel, _hist, _ctx, proc = env
+    obj = _box(scene)
+    proc.run("shell")
+    proc.click_object(obj.id, at=(5, 5, 10))
+    proc.finish_selection()
+    proc.provide_text("1")
+    shape = scene.get(obj.id).shape
+    # 5 outer walls, 5 inner ones, and the rim where the top was
+    assert len(g.faces_of(shape)) == 11
+    # nothing sits across the top any more: the middle of it is open air
+    assert g.distance_point_to_shape(shape, (5, 5, 10)) == pytest.approx(
+        4.0, abs=1e-6)
+
+
+def test_shell_keeps_sharp_corners_sharp():
+    """A star shells to a star: the inner walls meet at points rather than
+    being rounded off, so every face of the result is still flat. Rounding
+    them is a fillet, a step of its own."""
+    from OCP.BRepAdaptor import BRepAdaptor_Surface
+    from OCP.GeomAbs import GeomAbs_SurfaceType
+    pts = []
+    for i in range(10):
+        r = 10 if i % 2 == 0 else 4
+        a = math.pi / 2 + i * math.pi / 5
+        pts.append((r * math.cos(a), r * math.sin(a), 0))
+    star = g.extrude(g.make_polyline(pts, closed=True), (0, 0, 1), 5,
+                     cap=True)
+    top = g.face_index_near(star, (0, 0, 5))
+    shelled = g.shell_solid(star, 0.5, [top])
+    kinds = {BRepAdaptor_Surface(f).GetType() for f in g.faces_of(shelled)}
+    assert kinds == {GeomAbs_SurfaceType.GeomAbs_Plane}
+    assert g.volume(shelled) < g.volume(star)
+
+
+def _half_disc():
+    """A U arc closed by one flat edge across the top, extruded 10."""
+    return g.extrude(g.join_curves([
+        g.make_arc_3pt((-10, 0, 0), (0, -10, 0), (10, 0, 0)),
+        g.make_line((10, 0, 0), (-10, 0, 0))]), (0, 0, 1), 10, cap=True)
+
+
+def _square_u():
+    """20 wide, 20 tall, 5 thick arms and floor, extruded 10."""
+    return g.extrude(g.make_polyline(
+        [(0, 0, 0), (20, 0, 0), (20, 20, 0), (15, 20, 0), (15, 5, 0),
+         (5, 5, 0), (5, 20, 0), (0, 20, 0)], closed=True),
+        (0, 0, 1), 10, cap=True)
+
+
+def test_shell_hollows_every_face_of_an_arc_with_a_flat_edge():
+    """The kernel reports success here and returns the solid untouched, so
+    nothing is hollowed and nothing says why."""
+    solid = _half_disc()
+    for i in range(len(g.faces_of(solid))):
+        shelled = g.shell_solid(solid, 1, [i])
+        assert g.is_valid(shelled)
+        assert g.volume(shelled) < 0.5 * g.volume(solid)
+
+
+def test_shell_opens_a_cap_of_an_arc_with_a_flat_edge_to_the_right_depth():
+    solid = _half_disc()
+    top = g.face_index_near(solid, (0, -5, 10))
+    # the inside is the part of a radius 9 circle below y = -1, 9 deep
+    inside = 81 * math.acos(1 / 9) - math.sqrt(80)
+    assert g.volume(g.shell_solid(solid, 1, [top])) == pytest.approx(
+        g.volume(solid) - inside * 9, rel=1e-3)
+
+
+def test_shell_opens_the_inner_floor_of_a_u():
+    """The walls either side meet it at inside corners and keep their full
+    thickness: the opening is the floor, no wider."""
+    solid = _square_u()
+    floor = g.face_index_near(solid, (10, 5, 5))
+    shelled = g.shell_solid(solid, 1, [floor])
+    # the closed void, 144 x 8, plus the 10 x 1 x 8 slot through the floor
+    assert g.volume(shelled) == pytest.approx(2500 - 144 * 8 - 80, rel=1e-6)
+    assert g.distance_point_to_shape(shelled, (10, 5, 5)) > 0.9
+
+
+def test_shell_opens_a_flat_running_tangent_into_a_curve():
+    solid = g.extrude(g.join_curves([
+        g.make_line((-10, 20, 0), (-10, 0, 0)),
+        g.make_arc_3pt((-10, 0, 0), (0, -10, 0), (10, 0, 0)),
+        g.make_line((10, 0, 0), (10, 20, 0)),
+        g.make_line((10, 20, 0), (-10, 20, 0))]), (0, 0, 1), 10, cap=True)
+    side = g.face_index_near(solid, (-10, 10, 5))
+    shelled = g.shell_solid(solid, 1, [side])
+    assert g.is_valid(shelled)
+    assert g.volume(shelled) < 0.4 * g.volume(solid)
+
+
+def test_shell_says_so_when_the_wall_is_too_thick():
+    """It used to take the process down measuring a null offset."""
+    with pytest.raises(g.GeometryError):
+        g.shell_solid(_half_disc(), 50, [2])
+
+
+def test_shell_opens_every_held_face(env):
+    """Ctrl+Shift-clicked faces are all opened, with no prompt for one."""
+    scene, sel, _hist, _ctx, proc = env
+    obj = _box(scene)
+    top = g.face_index_near(obj.shape, (5, 5, 10))
+    bottom = g.face_index_near(obj.shape, (5, 5, 0))
+    sel.set_subobjects([(obj.id, "face", top), (obj.id, "face", bottom)])
+    proc.run("shell")
+    proc.provide_text("1")
+    assert not proc.busy
+    # a square tube: 10 x 10 outside, 8 x 8 inside, 10 long
+    assert g.volume(scene.get(obj.id).shape) == pytest.approx(
+        1000 - 8 * 8 * 10, rel=0.01)
+
+
+def test_fillet_reads_the_corner_off_the_two_picks(env):
+    """Where each curve is clicked says which corner is meant, so there
+    is nothing left to ask once the second one is picked: the radius and
+    Trim stand on the prompt the whole time (see
+    test_fillet_asks_for_nothing_it_can_read_off_the_clicks.py)."""
+    scene, sel, _hist, _ctx, proc = env
+    a = scene.add(g.make_line((0, 0, 0), (10, 0, 0)))
+    b = scene.add(g.make_line((10, 0, 0), (10, 10, 0)))
+    proc.run("fillet")
+    proc.provide_text("2")           # the radius, as an option
+    proc.click_object(a.id, at=(9.0, 0.0, 0.0))
+    assert "second curve" in proc.request.prompt.lower()
+    proc.click_object(b.id, at=(10.0, 1.0, 0.0))
+
+    assert not proc.busy, "the fillet is made on the second pick"
+    curves = [o for o in scene.all() if o.kind == "curve"]
+    assert len(curves) == 1
+    assert g.curve_length(curves[0].shape) == pytest.approx(
+        16 + math.pi, rel=1e-3)   # two legs of 8 and a quarter circle
+
+
+def test_filletedge_radius_is_dragged_off_the_solid(env):
+    scene, sel, _hist, _ctx, proc = env
+    _box(scene, sel)
+    proc.run("filletedge")
+    assert proc.request.number_from is not None
+    base, _dir = proc.request.number_from
+    assert math.dist(base, (10, 5, 5)) < 1e-6, (
+        "a 1 mm fillet on a 10 mm box should be a 1 mm drag")
+    ghost = proc.preview_for((11, 5, 5))
+    assert ghost is not None, "no ghost while dragging the fillet radius"
+    assert g.volume(ghost) < 1000, "a fillet takes material off a box corner"
+
+
+def test_filletedge_still_takes_typed_numbers(env):
+    scene, sel, _hist, _ctx, proc = env
+    obj = _box(scene, sel)
+    proc.run("filletedge")
+    proc.provide_text("1")
+    assert not proc.busy
+    assert g.volume(scene.get(obj.id).shape) < 1000
+
+
+def test_chamferedge_distance_is_dragged_off_the_solid(env):
+    scene, sel, _hist, _ctx, proc = env
+    _box(scene, sel)
+    proc.run("chamferedge")
+    assert proc.request.number_from is not None
+    ghost = proc.preview_for((11, 5, 5))
+    assert ghost is not None, "no ghost while dragging the chamfer distance"
+    assert g.volume(ghost) < 1000
+
+
+def test_chamferedge_on_picked_edges_is_dragged_too(env):
+    scene, sel, _hist, _ctx, proc = env
+    obj = _box(scene)
+    sel.subobjects = [(obj.id, "edge", 0)]
+    proc.run("chamferedge")
+    assert proc.request.number_from is not None, (
+        "picking edges first should not cost you the drag")
+    assert proc.preview_for((11, 5, 5)) is not None
+
+
+def test_contour_spacing_is_dragged_along_the_contour_axis(env):
+    scene, sel, _hist, _ctx, proc = env
+    _box(scene, sel)
+    proc.run("contour")
+    proc.provide_text("Z")
+    assert proc.request.number_from is not None
+    assert proc.request.axis_lock is not None, (
+        "contour spacing is a rise up the contour axis — lock the drag to it")
+    ghost = proc.preview_for((5, 5, 2.5))
+    assert ghost is not None, "no ghost while dragging the contour spacing"
+
+
+def test_contour_still_takes_typed_numbers(env):
+    scene, sel, _hist, _ctx, proc = env
+    _box(scene, sel)
+    proc.run("contour")
+    proc.provide_text("Z")
+    proc.provide_text("2")
+    assert not proc.busy
+    made = [o for o in scene.all() if o.kind == "curve"]
+    assert len(made) >= 4
+
+
+def test_offsetsrf_is_dragged_along_the_surface_normal(env):
+    scene, sel, _hist, _ctx, proc = env
+    face = scene.add(g.planar_face(g.make_rectangle((0, 0, 0), (10, 10, 0))))
+    sel.set([face.id])
+    proc.run("offsetsrf")
+    assert proc.request.number_from is not None
+    ghost = proc.preview_for((5, 5, 3))
+    assert ghost is not None, "no ghost while dragging the surface offset"
+    lo, hi = g.bbox(ghost)
+    assert lo[2] == pytest.approx(3, abs=1e-6)
+
+
+def test_offset_box_keeps_square_corners():
+    """A box offset outward is a bigger box: the faces are extended until
+    they meet, not joined by rounded edges and corners. Rounding them is a
+    fillet, a step of its own."""
+    from OCP.BRepAdaptor import BRepAdaptor_Surface
+    from OCP.GeomAbs import GeomAbs_SurfaceType
+    box = g.make_box((0, 0, 0), 10, 10, 10)
+    grown = g.offset_surface(box, 2)
+    faces = g.faces_of(grown)
+    assert len(faces) == 6
+    assert {BRepAdaptor_Surface(f).GetType() for f in faces} == {
+        GeomAbs_SurfaceType.GeomAbs_Plane}
+    assert g.volume(grown) == pytest.approx(14 ** 3, rel=1e-6)
+
+
+def test_offsetsrf_still_takes_typed_numbers(env):
+    scene, sel, _hist, _ctx, proc = env
+    face = scene.add(g.planar_face(g.make_rectangle((0, 0, 0), (10, 10, 0))))
+    sel.set([face.id])
+    proc.run("offsetsrf")
+    proc.provide_text("2")
+    assert not proc.busy
+    assert len([o for o in scene.all() if o.id != face.id]) == 1
+
+
+def test_pipe_radius_is_dragged_off_the_rail(env):
+    scene, sel, _hist, _ctx, proc = env
+    rail = scene.add(g.make_line((0, 0, 0), (0, 0, 10)))
+    sel.set([rail.id])
+    proc.run("pipe")
+    assert proc.request.number_from is not None
+    base, _dir = proc.request.number_from
+    assert math.dist(base, (0, 0, 5)) < 1e-6, (
+        "a pipe radius is measured out from the rail it wraps")
+    ghost = proc.preview_for((2, 0, 5))
+    assert ghost is not None, "no ghost while dragging the pipe radius"
+    lo, hi = g.bbox(ghost)
+    assert hi[0] - lo[0] == pytest.approx(4, rel=1e-2)
+
+
+def test_pipe_still_takes_typed_numbers(env):
+    scene, sel, _hist, _ctx, proc = env
+    rail = scene.add(g.make_line((0, 0, 0), (0, 0, 10)))
+    sel.set([rail.id])
+    proc.run("pipe")
+    proc.provide_text("1")
+    proc.provide_text("")
+    assert not proc.busy or len(scene.all()) == 2
+
+
+def test_extend_is_dragged_out_of_the_end_it_extends(env):
+    """The drag starts at the end you chose and runs the way the curve was
+    already heading, so the cursor sits on the new end of the curve."""
+    scene, sel, _hist, _ctx, proc = env
+    line = scene.add(g.make_line((0, 0, 0), (10, 0, 0)))
+    sel.set([line.id])
+    proc.run("extend")
+    proc.provide_text("End")
+    assert proc.request.number_from is not None
+    base, direction = proc.request.number_from
+    assert math.dist(base, (10, 0, 0)) < 1e-6
+    assert direction == pytest.approx((1, 0, 0), abs=1e-6)
+    ghost = proc.preview_for((13, 0, 0))
+    assert ghost is not None, "no ghost while dragging the extension"
+    lo, hi = g.bbox(ghost)
+    assert hi[0] == pytest.approx(13, abs=1e-3)
+
+
+def test_extend_from_the_start_runs_the_other_way(env):
+    scene, sel, _hist, _ctx, proc = env
+    line = scene.add(g.make_line((0, 0, 0), (10, 0, 0)))
+    sel.set([line.id])
+    proc.run("extend")
+    proc.provide_text("Start")
+    base, direction = proc.request.number_from
+    assert math.dist(base, (0, 0, 0)) < 1e-6
+    assert direction == pytest.approx((-1, 0, 0), abs=1e-6)
+
+
+def test_extend_still_takes_typed_numbers(env):
+    scene, sel, _hist, _ctx, proc = env
+    line = scene.add(g.make_line((0, 0, 0), (10, 0, 0)))
+    sel.set([line.id])
+    proc.run("extend")
+    proc.provide_text("End")
+    proc.provide_text("3")
+    assert not proc.busy
+    lo, hi = g.bbox(scene.get(line.id).shape)
+    assert hi[0] == pytest.approx(13, abs=1e-3)
+
+
+def test_text_asks_where_before_how_big(env):
+    """Text height is a size in the model, so it is dragged, but there is
+    nothing to drag it from until the text has somewhere to sit.
+
+    What the ghost measures is glyph outlines, and how tall those come out
+    for a given height is the font's business, not the command's: the same
+    "Hi" spans 1.02 times the drag against DejaVu here and 1.37 times on a
+    Windows box, where PySide6 ships no fonts and Qt falls back to whatever
+    it can find. So the check is that the ghost tracks the drag, which is
+    what text is answerable for.
+    """
+    scene, sel, _hist, _ctx, proc = env
+    proc.run("text")
+    proc.provide_text("Hi")
+    assert "position" in proc.request.prompt.lower()
+    proc.provide((0.0, 0.0, 0.0))
+    assert proc.request.number_from is not None
+
+    tall = []
+    for drag in (20.0, 40.0):
+        ghost = proc.preview_for((0, drag, 0))
+        assert ghost is not None, "no ghost while dragging the text height"
+        lo, hi = g.bbox(ghost)
+        tall.append(hi[1] - lo[1])
+
+    assert tall[1] == pytest.approx(2 * tall[0], rel=1e-6), (
+        f"twice the drag should be twice the ghost, got {tall[0]:.3f} then "
+        f"{tall[1]:.3f}")
+    assert 0.5 < tall[0] / 20.0 < 2.0, (
+        f"a drag of 20 ghosted {tall[0]:.3f} tall, which is further off than "
+        "any font's metrics would put it")
+
+
+def test_text_still_takes_typed_numbers(env):
+    scene, sel, _hist, _ctx, proc = env
+    proc.run("text")
+    proc.provide_text("Hi")
+    proc.provide_text("0,0,0")
+    proc.provide_text("10")
+    assert not proc.busy
+    assert scene.all()
+
+
+def test_array_spacing_puts_the_next_copy_under_the_cursor(env):
+    scene, sel, _hist, _ctx, proc = env
+    _box(scene, sel, size=2)
+    proc.run("array")
+    proc.provide_text("2")           # count X
+    proc.provide_text("1")           # count Y
+    assert proc.request.number_from is not None
+    base, _dir = proc.request.number_from
+    assert math.dist(base, (1, 1, 1)) < 1e-6, (
+        "spacing is centre to centre, so the drag starts at the centre")
+    ghost = proc.preview_for((9, 1, 1))
+    assert ghost is not None, "no ghost while dragging the array spacing"
+    lo, hi = ghost.bounds()
+    assert (lo[0] + hi[0]) / 2 == pytest.approx(9, abs=1e-6), (
+        "the copy should be centred under the cursor")
+
+
+def test_array_spacing_y_is_dragged_too(env):
+    scene, sel, _hist, _ctx, proc = env
+    _box(scene, sel, size=2)
+    proc.run("array")
+    proc.provide_text("1")
+    proc.provide_text("2")
+    proc.provide_text("5")           # spacing X (unused, count X is 1)
+    assert proc.request.number_from is not None
+    assert proc.preview_for((1, 9, 1)) is not None
+
+
+def test_array_still_takes_typed_numbers(env):
+    scene, sel, _hist, _ctx, proc = env
+    obj = _box(scene, sel, size=2)
+    proc.run("array")
+    proc.provide_text("2")
+    proc.provide_text("1")
+    proc.provide_text("8")
+    assert not proc.busy
+    made = [o for o in scene.all() if o.id != obj.id]
+    assert len(made) == 1
+    lo, _hi = g.bbox(made[0].shape)
+    assert lo[0] == pytest.approx(8, abs=1e-6)
