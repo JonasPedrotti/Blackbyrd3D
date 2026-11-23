@@ -370,17 +370,21 @@ def _face_mesh(face) -> tuple | None:
     tri = occ.triangulation(face, loc)
     if tri is None:
         return None
-    trsf = loc.Transformation()
     n = tri.NbNodes()
-    verts = np.empty((n, 3), np.float64)
-    for i in range(1, n + 1):
-        p = tri.Node(i).Transformed(trsf)
-        verts[i - 1] = (p.X(), p.Y(), p.Z())
-    m = tri.NbTriangles()
-    idx = np.empty((m, 3), np.uint32)
-    for i in range(1, m + 1):
-        t = tri.Triangle(i)
-        idx[i - 1] = (t.Value(1) - 1, t.Value(2) - 1, t.Value(3) - 1)
+    # One call per node and per triangle: each crossing into OCCT costs
+    # more than the work it does, and a face has thousands of them.
+    node = tri.Node
+    verts = np.array([node(i).Coord() for i in range(1, n + 1)],
+                     np.float64).reshape(-1, 3)
+    if not loc.IsIdentity():
+        trsf = loc.Transformation()
+        m = np.array([[trsf.Value(r, c) for c in range(1, 5)]
+                      for r in range(1, 4)])
+        verts = verts @ m[:, :3].T + m[:, 3]
+    triangle = tri.Triangle
+    idx = (np.array([triangle(i).Get()
+                     for i in range(1, tri.NbTriangles() + 1)], np.int64)
+           .reshape(-1, 3) - 1).astype(np.uint32)
     reversed_face = (face.Orientation()
                      == TopAbs_Orientation.TopAbs_REVERSED)
     if reversed_face:
@@ -471,11 +475,8 @@ def _polyline_of_degree_one(adaptor) -> np.ndarray | None:
         if first + span * 1e-12 < u < last - span * 1e-12:
             params.append(u)
     params.append(last)
-    pts = np.empty((len(params), 3), np.float64)
-    for i, u in enumerate(params):
-        p = adaptor.Value(u)
-        pts[i] = (p.X(), p.Y(), p.Z())
-    return pts
+    value = adaptor.Value
+    return np.array([value(u).Coord() for u in params], np.float64)
 
 
 def _edge_polyline(edge, deflection: float) -> np.ndarray | None:
@@ -489,11 +490,9 @@ def _edge_polyline(edge, deflection: float) -> np.ndarray | None:
         n = disc.NbPoints()
         if n < 2:
             return None
-        pts = np.empty((n, 3), np.float64)
-        for i in range(1, n + 1):
-            p = disc.Value(i)
-            pts[i - 1] = (p.X(), p.Y(), p.Z())
-        return pts
+        value = disc.Value
+        return np.array([value(i).Coord() for i in range(1, n + 1)],
+                        np.float64)
     except Exception:
         return None
 
@@ -598,22 +597,22 @@ def _face_isocurves(face) -> list[np.ndarray]:
         return []
     classifier = BRepTopAdaptor_FClass2d(face, 1e-9)
     inside = (TopAbs_State.TopAbs_IN, TopAbs_State.TopAbs_ON)
+    perform, value = classifier.Perform, surf.Value
+    steps = [i / _ISO_SAMPLES for i in range(_ISO_SAMPLES + 1)]
 
     polylines = []
     for direction in ("u", "v"):
         for frac in _ISO_FRACTIONS:
             run = []
-            for i in range(_ISO_SAMPLES + 1):
-                t = i / _ISO_SAMPLES
+            for t in steps:
                 if direction == "u":
                     u = u0 + (u1 - u0) * frac
                     v = v0 + (v1 - v0) * t
                 else:
                     u = u0 + (u1 - u0) * t
                     v = v0 + (v1 - v0) * frac
-                if classifier.Perform(gp_Pnt2d(u, v)) in inside:
-                    p = surf.Value(u, v)
-                    run.append((p.X(), p.Y(), p.Z()))
+                if perform(gp_Pnt2d(u, v)) in inside:
+                    run.append(value(u, v).Coord())
                 else:
                     if len(run) >= 2:
                         polylines.append(np.asarray(run, float))

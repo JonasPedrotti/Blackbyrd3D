@@ -14,7 +14,7 @@ from typing import NamedTuple
 import numpy as np
 import shiboken6
 from OpenGL import GL
-from PySide6.QtCore import QPoint, QTimer, Qt, Signal
+from PySide6.QtCore import QObject, QPoint, QTimer, Qt, Signal
 from PySide6.QtGui import QCursor, QOpenGLContext
 from PySide6.QtOpenGLWidgets import QOpenGLWidget
 from PySide6.QtWidgets import QApplication, QMessageBox
@@ -1121,11 +1121,32 @@ def cloud_level_budget(counts: list, budget: int) -> int:
 
 
 _deferred_buffer_deletes = {}
+_share_groups = {}
 
 
 def _current_share_group():
+    """A stand-in for the current context's share group, the same object
+    every time and deleted with the group.
+
+    PySide hands out a fresh wrapper of the group per call, comparing by
+    identity, so keyed on those no buffer was ever shared between the
+    viewports or freed."""
     context = QOpenGLContext.currentContext()
-    return context.shareGroup() if context is not None else None
+    if context is None:
+        return None
+    group = context.shareGroup()
+    address = shiboken6.getCppPointer(group)[0]
+    token = _share_groups.get(address)
+    if token is None:
+        token = _share_groups[address] = QObject()
+        group.destroyed.connect(lambda *_: _retire_share_group(address))
+    return token
+
+
+def _retire_share_group(address):
+    token = _share_groups.pop(address, None)
+    if token is not None:
+        shiboken6.delete(token)
 
 
 def _flush_buffer_deletes():

@@ -82,3 +82,24 @@ def test_a_destroyed_group_is_retired_without_deleting_foreign_names(monkeypatch
     vp._flush_buffer_deletes()
     assert deleted == []
     assert vp._deferred_buffer_deletes == {}
+
+
+def test_one_group_is_one_key_however_pyside_wraps_it(monkeypatch):
+    """PySide wraps a context's share group afresh on every call, and the
+    wrappers compare by identity: keyed on them, no viewport ever shared a
+    buffer with another, nor freed one."""
+    groups = [QObject()]
+    context = SimpleNamespace(shareGroup=lambda: SimpleNamespace(
+        destroyed=groups[-1].destroyed))
+    monkeypatch.setattr(vp, "QOpenGLContext",
+                        SimpleNamespace(currentContext=lambda: context))
+    monkeypatch.setattr(vp.shiboken6, "getCppPointer", lambda _g: (1234,))
+    monkeypatch.setattr(vp, "_share_groups", {})
+    first = vp._current_share_group()
+    assert vp._current_share_group() is first
+    assert shiboken6.isValid(first)
+    # a group made where a destroyed one was is not given its buffers
+    shiboken6.delete(groups[-1])
+    groups.append(QObject())
+    assert not shiboken6.isValid(first)
+    assert vp._current_share_group() is not first
