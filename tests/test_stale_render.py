@@ -75,7 +75,7 @@ def test_moving_an_object_reuploads_its_buffers(monkeypatch):
     sel = SelectionManager(scene)
     view = vp_mod.Viewport(scene, sel)
     monkeypatch.setattr(vp_mod, "_GpuObject",
-                        lambda mesh, dash=None, dash_key=None:
+                        lambda mesh, dash=None, dash_key=None, lazy=False:
                         _StubGpu(mesh, dash_key))
     obj = scene.add(g.make_box((0, 0, 0), 1, 1, 1))
 

@@ -1248,10 +1248,29 @@ class _MeshBuffers:
         self.nbytes = 0
 
 
-class _GpuObject:
-    """One viewport's vertex arrays over the shared buffers for a mesh."""
+def _batchable(mesh, dash_key) -> bool:
+    """What `_GpuObject.plain` will say of this mesh, asked of the mesh."""
+    return (not (mesh.is_cloud and len(mesh.local))
+            and dash_key == "Continuous"
+            and not len(mesh.local_points)
+            and len(mesh.triangles) <= BATCH_MAX_TRIANGLES)
 
-    def __init__(self, mesh, dash=None, dash_key=None, share_id=None):
+
+class _GpuObject:
+    """One viewport's vertex arrays over the shared buffers for a mesh.
+
+    Made `lazy`, an object that can go in a batch holds only what batching
+    asks of it, and uploads on the first draw of its own. Most of a drawing
+    of many small curves is only ever drawn in batches, and its buffers and
+    arrays, one set per object and viewport, were most of opening it.
+    """
+
+    _BUILT_LATER = frozenset({"buffers", "tri_vao", "line_vao", "line_count",
+                              "thick_vao", "thick_count", "iso_vao",
+                              "iso_count", "cloud_vao"})
+
+    def __init__(self, mesh, dash=None, dash_key=None, share_id=None,
+                 lazy=False):
         # The mesh's own serial, not id(mesh): the question "are these
         # buffers still current?" is asked after the mesh they came from may
         # have been freed, and an address gets recycled. See DisplayMesh.uid.
@@ -1263,6 +1282,41 @@ class _GpuObject:
         self._share_key = (_current_share_group(),
                            mesh.uid if share_id is None else share_id,
                            dash_key)
+        self._unbuilt = None
+        if lazy:
+            self._unbuilt = (mesh, dash)
+            self.plain = True
+            self.tri_count = int(mesh.triangles.size)
+            self.cloud_count = 0
+            self.cloud_levels = None
+            self.cloud_colored = False
+            self.anchor = mesh_anchor(mesh)
+            self.anchor_xyz = (None if self.anchor is None
+                               else tuple(float(c) for c in self.anchor))
+            return
+        self._build(mesh, dash)
+
+    def __getattr__(self, name):
+        # Reached only for what is not there yet: a lazy object's buffers.
+        if (name in _GpuObject._BUILT_LATER
+                and self.__dict__.get("_unbuilt") is not None):
+            mesh, dash = self._unbuilt
+            self._unbuilt = None
+            # Built in the middle of a draw, so whatever array is bound
+            # there must neither take this one's bindings nor lose its own.
+            vao = int(GL.glGetIntegerv(GL.GL_VERTEX_ARRAY_BINDING))
+            vbo = int(GL.glGetIntegerv(GL.GL_ARRAY_BUFFER_BINDING))
+            GL.glBindVertexArray(0)
+            try:
+                self._build(mesh, dash)
+            finally:
+                GL.glBindVertexArray(vao)
+                GL.glBindBuffer(GL.GL_ARRAY_BUFFER, vbo)
+            return getattr(self, name)
+        raise AttributeError(name)
+
+    def _build(self, mesh, dash):
+        dash_key = self.dash_key
         self.buffers = gpu_share.acquire(
             self._share_key, lambda: _MeshBuffers(mesh, dash))
         buf = self.buffers
@@ -1334,6 +1388,9 @@ class _GpuObject:
         return vao
 
     def release(self):
+        if self.__dict__.get("_unbuilt") is not None:
+            self._unbuilt = None             # nothing made, nothing claimed
+            return
         for vao in (self.tri_vao, self.line_vao, self.iso_vao,
                     getattr(self, "thick_vao", 0),
                     getattr(self, "cloud_vao", 0)):
@@ -1349,6 +1406,9 @@ class _GpuObject:
         those live in the share group, and the mesh stays resident until the
         last viewport drawing it lets go.
         """
+        if self.__dict__.get("_unbuilt") is not None:
+            self._unbuilt = None
+            return
         self.tri_vao = self.line_vao = self.iso_vao = self.thick_vao = 0
         self.cloud_vao = 0
         gpu_share.release(self._share_key)
@@ -2996,8 +3056,9 @@ class Viewport(QOpenGLWidget):
             if gpu is None:
                 dash = ((_lt.pattern_for(lt_name), 1.0)
                         if lt_name != "Continuous" else None)
-                self._gpu[obj.id] = _GpuObject(obj.mesh, dash=dash,
-                                               dash_key=lt_name)
+                self._gpu[obj.id] = _GpuObject(
+                    obj.mesh, dash=dash, dash_key=lt_name,
+                    lazy=_batchable(obj.mesh, lt_name))
                 self._warm_pick_index(obj.mesh)
         for dead in set(self._gpu) - live:
             self._gpu[dead].release()

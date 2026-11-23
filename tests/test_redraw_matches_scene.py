@@ -27,7 +27,7 @@ class _Recorder:
     them. The vertices are copied: the point is to know what was uploaded,
     which must not be able to change afterwards to match."""
 
-    def __init__(self, mesh, dash=None, dash_key=None):
+    def __init__(self, mesh, dash=None, dash_key=None, lazy=False):
         self.mesh_key = mesh.uid
         self.vertices = np.array(mesh.vertices, float, copy=True)
         self.dash_key = dash_key
