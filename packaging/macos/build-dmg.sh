@@ -5,8 +5,8 @@
 #
 # Produces:  Blackbyrd3D-<version>-arm64.dmg
 #
-# The .app is UNSIGNED. Gatekeeper on the user's Mac will quarantine it;
-# see the README for the right-click-Open / notarization follow-up.
+# The .app is only ad-hoc signed, not notarized. Gatekeeper still blocks
+# the first launch; see the README for "Open Anyway" / notarization follow-up.
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -63,6 +63,12 @@ APP="dist/${APPNAME}.app"
 [ -d "$APP" ] || { echo "ERROR: $APP was not produced"; exit 1; }
 # the .wyrm documents' icon, named in the spec's Info.plist
 cp wyrm.icns "$APP/Contents/Resources/"
+
+echo "=== ad-hoc sign the finished bundle ==="
+# PyInstaller signs before the copy above, which breaks the seal, and a
+# downloaded app with a broken seal is reported as "damaged" by Gatekeeper.
+codesign --force --deep --sign - "$APP"
+codesign --verify --deep --strict --verbose=2 "$APP"
 
 echo "=== bundle selftest (headless: Qt + OCCT + file I/O) ==="
 # Delete last run's report first: a bundle that dies before writing one used
