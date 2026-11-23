@@ -231,6 +231,43 @@ class DisplayMesh:
         return self._bounds
 
 
+# Raise whenever tessellate() draws the same shape differently, so meshes
+# a file carries from before are made afresh rather than shown as they were.
+MESH_CACHE_VERSION = 1
+
+_STORED = ("local", "normals", "triangles", "local_edges", "local_isos",
+           "edge_of_segment", "face_of_triangle", "local_points")
+
+
+def mesh_cache_key() -> str:
+    """What a stored mesh must have been made by to be used as it is."""
+    from .. import __version__
+    return f"{__version__}/{MESH_CACHE_VERSION}"
+
+
+def mesh_to_bytes(mesh: DisplayMesh) -> bytes:
+    import io
+    arrays = {name: getattr(mesh, name) for name in _STORED}
+    arrays["origin"] = np.asarray(mesh.origin, np.float64)
+    arrays["far"] = np.array(mesh.far)
+    if mesh.has_curvature:
+        arrays["curvature"] = mesh.curvature
+    out = io.BytesIO()
+    np.savez(out, **arrays)
+    return out.getvalue()
+
+
+def mesh_from_bytes(data: bytes) -> DisplayMesh:
+    import io
+    with np.load(io.BytesIO(data), allow_pickle=False) as stored:
+        arrays = {name: stored[name] for name in _STORED}
+        curvature = (stored["curvature"] if "curvature" in stored.files
+                     else np.zeros(len(arrays["local"]), np.float32))
+        return DisplayMesh(origin=stored["origin"], curvature=curvature,
+                           has_curvature="curvature" in stored.files,
+                           _far=bool(stored["far"]), **arrays)
+
+
 def _deflection_for(shape) -> float:
     (mn, mx) = geometry.bbox(shape)
     diag = float(np.linalg.norm(np.subtract(mx, mn)))

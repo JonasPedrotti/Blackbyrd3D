@@ -59,6 +59,11 @@ format is chosen by extension.
   comes in as its pieces, so each piece keeps its own keys and takes any it
   lacks from the block that placed it; geometry user text and the
   document's own user text are not read.
+- **Display meshes in `.byrd`.** A `.byrd` saved from the app also keeps
+  what each object looked like on screen, so it opens without meshing
+  everything again. They are used only by the release that wrote them; any
+  other release meshes the exact geometry afresh, as before. Older readers
+  ignore them.
 - **Exact vs. mesh.** `.byrd` and `.step` carry exact geometry both ways;
   `.3dm` is exact for curves but writes surfaces and solids as meshes — for
   an exact round trip through Rhino, export STEP and `import` it there.

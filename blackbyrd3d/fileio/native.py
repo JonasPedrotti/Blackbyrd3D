@@ -14,7 +14,7 @@ from __future__ import annotations
 import base64
 import json
 
-from ..core import geometry, user_text, view_settings
+from ..core import geometry, tessellate, user_text, view_settings
 from ..utils.units import convert, converted_note, rescale
 from ..core.layers import (DEFAULT_CUT_LINE_WIDTH, DEFAULT_LAYER_ID,
                            DEFAULT_SCREEN_WIDTH, Layer, section_fill_dict)
@@ -60,7 +60,11 @@ def _write_container(doc: dict, path: str, thumbnail: bytes | None,
         # Stored, not deflated: float32 coordinates barely compress and a
         # million-point scan would spend seconds finding that out.
         for name, data in (blobs or {}).items():
-            z.writestr(name, data, compress_type=zipfile.ZIP_STORED)
+            if name.startswith("meshes/"):
+                z.writestr(name, data, compress_type=zipfile.ZIP_DEFLATED,
+                           compresslevel=1)
+            else:
+                z.writestr(name, data, compress_type=zipfile.ZIP_STORED)
     import os
     os.replace(tmp, path)          # atomic: a crash never corrupts the file
 
@@ -97,10 +101,21 @@ def save_scene(scene, path: str, thumbnail: bytes | None = None,
     # rest of the drawing with the scan simply absent.
     drawn = [o for o in scene.all() if o.kind not in ("pointcloud", "picture")]
     objects = []
+    # Without Qt there are no fonts, and lettering meshes as boxes: kept,
+    # those would be what the next window to open the file shows.
+    from PySide6.QtGui import QGuiApplication
+    keep_meshes = QGuiApplication.instance() is not None
     for n, obj in enumerate(drawn):
         if progress is not None:
             progress(0.9 * n / len(drawn))
         objects.append(_object_to_json(obj))
+        # What is on screen goes along, so opening the file shows it
+        # without meshing everything again. Older readers never look.
+        if (keep_meshes and obj.kind != "mesh" and obj.mesh_ready
+                and not obj.mesh.is_cloud):
+            name = f"meshes/{n}.npz"
+            blobs[name] = tessellate.mesh_to_bytes(obj.mesh)
+            objects[-1]["display"] = name
     doc = {
         "format": "blackbyrd3d",
         "version": PLAIN_VERSION,
@@ -159,6 +174,7 @@ def save_scene(scene, path: str, thumbnail: bytes | None = None,
         ],
         "current_layer": scene.layers.current_id,
         "objects": objects,
+        "display_meshes": tessellate.mesh_cache_key(),
     }
     if clouds or trajectories or session:
         doc["version"] = 3
@@ -717,6 +733,8 @@ def _load_doc(scene, doc: dict, blobs=None, progress=None):
     scene.history_records = list(doc.get("history_records", []))
 
     objects = doc.get("objects", [])
+    meshes_fit = (blobs is not None and doc.get("display_meshes")
+                  == tessellate.mesh_cache_key())
     for n, od in enumerate(objects):
         if progress is not None:
             progress(0.9 * n / len(objects))
@@ -727,6 +745,12 @@ def _load_doc(scene, doc: dict, blobs=None, progress=None):
         obj = scene.add(shape, name=od["name"],
                         layer_id=id_map.get(od["layer"], "default"),
                         obj_id=od.get("id"))
+        if meshes_fit and od.get("display"):
+            try:
+                obj._mesh = tessellate.mesh_from_bytes(
+                    blobs.read(od["display"]))
+            except Exception:                              # noqa: BLE001
+                pass                    # meshed afresh, as it always was
         if od.get("id"):
             object_id_map[od["id"]] = obj.id
         updates = {}
