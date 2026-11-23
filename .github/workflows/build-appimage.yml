@@ -17,11 +17,11 @@ jobs:
     if: github.repository == 'JonasPedrotti/Blackbyrd3D'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
-      - uses: astral-sh/setup-uv@v5
+      - uses: astral-sh/setup-uv@v7
       - name: System libraries for Qt, OpenGL and the window check
         run: |
           sudo apt-get update
@@ -35,7 +35,7 @@ jobs:
           APPIMAGE_EXTRACT_AND_RUN: "1"
         run: packaging/appimage/build-appimage.sh
       - name: Upload AppImage artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: Blackbyrd3D-x86_64.AppImage
           path: packaging/appimage/dist/Blackbyrd3D-x86_64.AppImage

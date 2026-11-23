@@ -110,7 +110,7 @@ def test_the_configuration_pins_the_installer_metadata():
 
 def test_the_installer_is_uploaded_before_it_is_signed():
     upload = _step("Upload unsigned installer for signing")
-    assert "uses: actions/upload-artifact@v4" in upload
+    assert "uses: actions/upload-artifact@v6" in upload
     assert "id: upload-unsigned" in upload
     assert _input(upload, "path") == f"packaging/windows/Output/{_installer_name()}"
     assert _index("Upload unsigned installer for signing") < _steps().index(_sign_step())

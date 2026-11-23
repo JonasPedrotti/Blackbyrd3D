@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.1.0
 
 - **Blackbyrd3D**, an open-source NURBS surface modeller for Linux, Windows
   and macOS, built on Serpentine3D by Chisomo Banzi. Drawings are saved as

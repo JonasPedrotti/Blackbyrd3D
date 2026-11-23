@@ -26,9 +26,9 @@ jobs:
     env:
       SIGNPATH_ENABLED: ${{ secrets.SIGNPATH_API_TOKEN != '' && vars.SIGNPATH_ORGANIZATION_ID != '' }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
 
@@ -82,7 +82,7 @@ jobs:
       - name: Upload unsigned installer for signing
         id: upload-unsigned
         if: env.SIGNPATH_ENABLED == 'true' && steps.release.outputs.prepared != 'true'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: Blackbyrd3D-Setup-x86_64-unsigned
           path: packaging/windows/Output/Blackbyrd3D-Setup-x86_64.exe
@@ -116,7 +116,7 @@ jobs:
           Copy-Item $signed packaging/windows/Output/Blackbyrd3D-Setup-x86_64.exe -Force
 
       - name: Upload installer artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: Blackbyrd3D-Setup-x86_64
           path: packaging/windows/Output/Blackbyrd3D-Setup-x86_64.exe

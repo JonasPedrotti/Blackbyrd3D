@@ -13,8 +13,8 @@ jobs:
     if: github.repository == 'JonasPedrotti/Blackbyrd3D'
     runs-on: macos-15
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
       - name: Install package and test tools
@@ -28,7 +28,7 @@ jobs:
       - name: Build disk image
         run: packaging/macos/build-dmg.sh "$(which python)"
       - name: Upload disk image artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: Blackbyrd3D-macOS-arm64
           path: packaging/macos/Blackbyrd3D-*-arm64.dmg
