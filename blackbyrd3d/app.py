@@ -124,6 +124,7 @@ class MainWindow(QMainWindow):
         self._panel_width = None
         self._settling = False
         self._settled_width = None
+        self._on_settled: list = []
         self.aux_viewports: list = []           # Top/Front/Right in quad mode
         self.aux_docks: list = []               # their dock wrappers
         self.dock_viewports: list = []          # user-created dockable panes
@@ -559,6 +560,16 @@ class MainWindow(QMainWindow):
         if getattr(self, "_lists_height_due", False):
             self._lists_height_due = False
             self._put_lists_under_layer_page()
+        waiting, self._on_settled = self._on_settled, []
+        for fn in waiting:
+            fn()
+
+    def when_settled(self, fn):
+        """Run `fn` once the window has stopped moving, now if it has."""
+        if self._settling:
+            self._on_settled.append(fn)
+        else:
+            QTimer.singleShot(0, self, fn)
 
     def _hold_panel_width(self):
         if self._panel_width:
@@ -4037,7 +4048,9 @@ def _open_launch_args(window, args: list[str]):
     for arg in args:
         if (not arg.startswith("-") and os.path.exists(arg)
                 and arg.lower().endswith(".wyrm")):
-            window.show_wyrm().open_path(arg)
+            # Restoring the Wyrm dock while the opening window is still
+            # being sized can crash Qt or leave the dock shrunk for good.
+            window.when_settled(lambda: window.show_wyrm().open_path(arg))
             break
         if not arg.startswith("-") and os.path.exists(arg):
             try:

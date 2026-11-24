@@ -851,7 +851,12 @@ def test_a_wyrm_file_handed_to_the_app_opens_in_wyrm(win, tmp_path):
     graph = {"nodes": [{"id": "a", "key": "curve"}], "wires": []}
     path.write_text(json.dumps(graph), encoding="utf-8")
     box = win.scene.add(geo.make_box((0, 0, 0), 1, 1, 1))
+    from PySide6.QtTest import QTest
     _open_launch_args(win, [str(path)])
+    for _ in range(100):            # opened once the window has settled
+        if win._wyrm_dock is not None:
+            break
+        QTest.qWait(20)
     assert win._wyrm_dock.isVisible()
     assert list(win.wyrm.graph.nodes) == ["a"]
     assert win.wyrm.path == str(path)
