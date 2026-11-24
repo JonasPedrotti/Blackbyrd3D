@@ -392,8 +392,9 @@ class CommandContext:
         journal = getattr(window, "journal", None)
         paused = (journal.pause() if journal is not None
                   else contextlib.nullcontext())
+        from ..core.occ import foreground
         try:
-            with paused:
+            with paused, foreground():
                 yield Progress(throttled(report), heading)
         finally:
             card.finish()

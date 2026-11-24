@@ -3198,10 +3198,15 @@ class PropertiesPanel(QWidget):
             # Python hands the lock between threads every 5 ms by default,
             # and the interface thread wants it many times a frame: with
             # this thread measuring, it stood still for seconds at a time.
+            from ..core import occ
             interval = sys.getswitchinterval()
             sys.setswitchinterval(min(interval, _MEASURING_SWITCH))
             try:
-                text = self._measured_now(obj)
+                with occ.wanted_while(lambda: getattr(
+                        self.scene, "revision", 0) == revision):
+                    text = self._measured_now(obj)
+            except occ.Superseded:
+                text = ""                # the drawing changed; dropped below
             finally:
                 sys.setswitchinterval(interval)
             try:
@@ -3222,6 +3227,7 @@ class PropertiesPanel(QWidget):
             self.measure_label.setText(text)
 
     def _measured_now(self, obj) -> str:
+        from ..core.occ import Superseded
         fmt = self.scene.format_length
         u = self.scene.units
         try:
@@ -3236,6 +3242,8 @@ class PropertiesPanel(QWidget):
                 return cloud_measures(obj, fmt)
             if obj.kind == "hatch":
                 return f"Area: {g.surface_area(obj.shape):.3f} {u}²"
+        except Superseded:
+            raise
         except Exception:
             pass
         return "—"

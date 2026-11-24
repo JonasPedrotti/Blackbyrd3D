@@ -5,6 +5,10 @@ via OCP (pip-installable pybind11 wheels); pythonocc-core uses the same class
 names under OCC.Core.*, so porting means editing this file, not the app.
 """
 
+import contextlib
+import threading
+import time
+
 from OCP.gp import (
     gp_Pnt, gp_Vec, gp_Dir, gp_Ax1, gp_Ax2, gp_Ax3, gp_Pln, gp_Trsf,
     gp_GTrsf, gp_Circ, gp_Elips, gp_XYZ, gp_Quaternion, gp_Mat,
@@ -185,12 +189,64 @@ def linear_properties(shape) -> GProp_GProps:
 _FEW_SPANS, _MANY_SPANS = 8, 64
 
 
+# Long jobs the interface thread is running behind a progress card, which
+# a measurement on a thread of its own waits for: both are Python, and
+# sharing the interpreter with it held a merge's card still for a second
+# at a time.
+_ahead = 0
+_ahead_lock = threading.Lock()
+
+
+@contextlib.contextmanager
+def foreground():
+    global _ahead
+    with _ahead_lock:
+        _ahead += 1
+    try:
+        yield
+    finally:
+        with _ahead_lock:
+            _ahead -= 1
+
+
+class Superseded(Exception):
+    """The work on this thread is no longer wanted."""
+
+
+_wanted = threading.local()
+
+
+@contextlib.contextmanager
+def wanted_while(still):
+    """Work on this thread stops at its next give_way once `still()` is
+    false, rather than running on for an answer nobody will read."""
+    _wanted.still = still
+    try:
+        yield
+    finally:
+        _wanted.still = None
+
+
+def give_way():
+    """Wait here, off the interface thread, while it runs a long job, and
+    stop if what this thread works for has gone."""
+    if threading.current_thread() is threading.main_thread():
+        return
+    while _ahead:
+        time.sleep(0.02)
+    still = getattr(_wanted, "still", None)
+    if still is not None and not still():
+        raise Superseded
+
+
 def _faces(shape) -> list:
     out = []
     exp = TopExp_Explorer(shape, FACE)
     while exp.More():
         out.append(TopoDS.Face_s(exp.Current()))
         exp.Next()
+        if not len(out) % 2000:
+            give_way()
     return out
 
 
@@ -307,8 +363,12 @@ def _flat_and_plain(shape, surfaces) -> bool:
     if not surfaces or not all(isinstance(s, Geom_Plane) for s in surfaces):
         return False
     edges = map_shapes(shape, EDGE)
-    return all(_one_piece(BRepAdaptor_Curve(TopoDS.Edge_s(edges.FindKey(i))))
-               for i in range(1, edges.Extent() + 1))
+    for i in range(1, edges.Extent() + 1):
+        if not i % 2000:
+            give_way()
+        if not _one_piece(BRepAdaptor_Curve(TopoDS.Edge_s(edges.FindKey(i)))):
+            return False
+    return True
 
 
 def _middle(shape) -> gp_Pnt:
@@ -330,7 +390,11 @@ def _integrated(shape, inertia) -> GProp_GProps:
     origin = gp_Pnt(0, 0, 0).Transformed(shape.Location().Transformation())
     props = GProp_GProps(origin)
     faces = _faces(shape)
-    surfaces = [BRep_Tool.Surface_s(f) for f in faces]
+    surfaces = []
+    for f in faces:
+        if not len(surfaces) % 2000:
+            give_way()
+        surfaces.append(BRep_Tool.Surface_s(f))
     if any(s is None for s in surfaces):
         # a face with only a mesh, which BRepGProp measures from the mesh
         whole = BRepGProp.VolumeProperties_s if volume else BRepGProp.SurfaceProperties_s
@@ -346,6 +410,7 @@ def _integrated(shape, inertia) -> GProp_GProps:
         # volume depends on where that is.
         builder = BRep_Builder()
         for start in range(0, len(faces), _FACES_PER_CALL):
+            give_way()
             batch = TopoDS_Compound()
             builder.MakeCompound(batch)
             for face in faces[start:start + _FACES_PER_CALL]:
