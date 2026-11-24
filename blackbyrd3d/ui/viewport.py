@@ -6109,6 +6109,10 @@ class Viewport(QOpenGLWidget):
         snap = self._snap_at(px, py)
         if snap is not None:
             self._active_snap = snap
+            if snap[1] in ("mid", "perp"):
+                line = self.snaps.guide_line_through(snap[0])
+                if line is not None:
+                    self._guide_rails = [line]
             return snap[0]
         on_line = self.snaps.on_guide_line(self.camera, px, py, self.width(),
                                            self.height())

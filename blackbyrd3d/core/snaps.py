@@ -857,7 +857,8 @@ class SnapIndex:
                 pts.append(p)
                 kinds.append(kind)
         pending = len(pts)
-        for p, kind in extra_points or ():
+        for p, kind in [*(extra_points or ()),
+                        *self._guide_line_points(base_point)]:
             if self.types.get(kind):
                 pts.append(p)
                 kinds.append(kind)
@@ -995,6 +996,49 @@ class SnapIndex:
             return hit, []
         point = cplane.to_world(*landed)
         return point, [(self.guides[i], point) for i in held]
+
+    def _guide_line_points(self, base_point) -> list:
+        """Mid of every line between two guides, and the foot of the
+        perpendicular from `base_point` where it falls on one."""
+        if not self.tracking or len(self.guides) < 2:
+            return []
+        out = []
+        pts = [np.asarray(g, float) for g in self.guides]
+        base = None if base_point is None else np.asarray(base_point, float)
+        for i in range(len(pts)):
+            for j in range(i + 1, len(pts)):
+                a, b = pts[i], pts[j]
+                span = b - a
+                length2 = float(span @ span)
+                if length2 < 1e-24:
+                    continue
+                out.append((tuple(float(c) for c in (a + b) / 2), "mid"))
+                if base is not None:
+                    t = float((base - a) @ span) / length2
+                    if 0.0 <= t <= 1.0:
+                        foot = a + t * span
+                        if float(np.linalg.norm(foot - base)) > 1e-9:
+                            out.append((tuple(float(c) for c in foot),
+                                        "perp"))
+        return out
+
+    def guide_line_through(self, point):
+        """The pair of guides whose line `point` lies on, or None."""
+        if not self.tracking or len(self.guides) < 2:
+            return None
+        p = np.asarray(point, float)
+        for i in range(len(self.guides)):
+            for j in range(i + 1, len(self.guides)):
+                a = np.asarray(self.guides[i], float)
+                b = np.asarray(self.guides[j], float)
+                span = b - a
+                length2 = float(span @ span)
+                if length2 < 1e-24:
+                    continue
+                t = float((p - a) @ span) / length2
+                if -1e-9 <= t <= 1 + 1e-9 and                         np.linalg.norm(a + t * span - p) < 1e-7:
+                    return (self.guides[i], self.guides[j])
+        return None
 
     def on_guide_line(self, camera, px: float, py: float, width: int,
                       height: int, radius_px: float = GUIDE_ALIGN_PX):
