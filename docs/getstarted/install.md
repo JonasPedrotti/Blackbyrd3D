@@ -9,7 +9,7 @@ to install.
 |---|---|
 | **Linux** | [`Blackbyrd3D-x86_64.AppImage`](https://github.com/JonasPedrotti/Blackbyrd3D/releases/latest/download/Blackbyrd3D-x86_64.AppImage) — `chmod +x` and run |
 | **Windows** | [`Blackbyrd3D-Setup-x86_64.exe`](https://github.com/JonasPedrotti/Blackbyrd3D/releases/latest/download/Blackbyrd3D-Setup-x86_64.exe) — installer ([Privacy](../privacy.md)) |
-| **macOS** (Apple Silicon, macOS 14 or newer) | [`Blackbyrd3D-arm64.dmg`](https://github.com/JonasPedrotti/Blackbyrd3D/releases/latest/download/Blackbyrd3D-0.1.0-arm64.dmg) - drag to Applications, then on first launch **System Settings > Privacy & Security > Open Anyway** |
+| **macOS** (Apple Silicon, macOS 14 or newer) | [`Blackbyrd3D-arm64.dmg`](https://github.com/JonasPedrotti/Blackbyrd3D/releases/latest/download/Blackbyrd3D-arm64.dmg) - drag to Applications, then on first launch **System Settings > Privacy & Security > Open Anyway** |
 
 The GUI needs a GPU with OpenGL 3.3 drivers (any normal desktop). Headless
 use (`byrd3d-batch`, the MCP server, file conversion) works anywhere.

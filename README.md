@@ -92,7 +92,7 @@ of their own.
 | ----------- | ---------------------------------------------------------------------------------------------------------------------------------- | ----------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | **Linux**   | [Blackbyrd3D-x86_64.AppImage](https://github.com/JonasPedrotti/Blackbyrd3D/releases/latest/download/Blackbyrd3D-x86_64.AppImage)   | 269&nbsp;MB | Make it executable and run it. Nothing to install.                                                                                                                  |
 | **Windows** | [Blackbyrd3D-Setup-x86_64.exe](https://github.com/JonasPedrotti/Blackbyrd3D/releases/latest/download/Blackbyrd3D-Setup-x86_64.exe) | 119&nbsp;MB | Unsigned for now: choose **More info**, then **Run anyway**.                                                                                                        |
-| **macOS**   | [Blackbyrd3D-0.1.0-arm64.dmg](https://github.com/JonasPedrotti/Blackbyrd3D/releases/latest/download/Blackbyrd3D-0.1.0-arm64.dmg)   | 268&nbsp;MB | Apple Silicon, macOS 14 or newer. Not notarized yet: on first launch macOS blocks it, then open **System Settings > Privacy & Security** and click **Open Anyway**. |
+| **macOS**   | [Blackbyrd3D-arm64.dmg](https://github.com/JonasPedrotti/Blackbyrd3D/releases/latest/download/Blackbyrd3D-arm64.dmg)   | 268&nbsp;MB | Apple Silicon, macOS 14 or newer. Not notarized yet: on first launch macOS blocks it, then open **System Settings > Privacy & Security** and click **Open Anyway**. |
 
 On Linux, make the AppImage executable and start it:
 

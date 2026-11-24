@@ -4,9 +4,14 @@
 # Produces dist/Blackbyrd3D.app.  See build-dmg.sh for the full flow.
 import importlib.util
 import sys
+import tomllib
 from pathlib import Path
 
-from PyInstaller.utils.hooks import collect_data_files, collect_dynamic_libs
+from PyInstaller.utils.hooks import (collect_data_files, collect_dynamic_libs,
+                                     copy_metadata)
+
+with open(Path(SPECPATH).parents[1] / "pyproject.toml", "rb") as _fh:
+    VERSION = tomllib.load(_fh)["project"]["version"]
 
 sys.path.insert(0, str(Path(SPECPATH).parent))
 from prune_bundle import vtk_libraries_needed  # noqa: E402
@@ -27,8 +32,10 @@ a = Analysis(
     ["byrd3d_entry.py"],
     pathex=[],
     binaries=binaries,
+    # the metadata is where the bundled app reads its own version
     datas=collect_data_files("blackbyrd3d", includes=["examples/*.byrd",
-                                                      "examples/*.wyrm"]),
+                                                      "examples/*.wyrm"])
+          + copy_metadata("blackbyrd3d"),
     hiddenimports=[],
     excludes=[
         "tkinter",
@@ -71,12 +78,12 @@ app = BUNDLE(
     name="Blackbyrd3D.app",
     icon="byrd3d.icns",
     bundle_identifier="com.jonaspedrotti.blackbyrd3d",
-    version="0.1.0",
+    version=VERSION,
     info_plist={
         "CFBundleName": "Blackbyrd3D",
         "CFBundleDisplayName": "Blackbyrd3D",
-        "CFBundleShortVersionString": "0.1.0",
-        "CFBundleVersion": "0.1.0",
+        "CFBundleShortVersionString": VERSION,
+        "CFBundleVersion": VERSION,
         "NSHighResolutionCapable": True,
         "LSMinimumSystemVersion": "14.0",
         "LSApplicationCategoryType": "public.app-category.graphics-design",
