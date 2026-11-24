@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- **Linux uninstall leaves Serpentine3D alone.** Removing Blackbyrd3D from
+  the desktop no longer deletes a Serpentine3D launcher or AppImage.
+
 ## 0.2.0
 
 - **Faster opening.** Display meshes are saved in `.byrd` files and

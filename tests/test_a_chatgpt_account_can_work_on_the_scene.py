@@ -38,7 +38,7 @@ BOX = {"command": "Box", "inputs": ["0,0,0", "4,5,0", "6"]}
 FAKE_CODEX = r'''
 import copy, json, os, pathlib, queue, signal, sys, threading, time, tomllib
 
-root = pathlib.Path(os.environ["SERPENTINE_TEST_CODEX_DIR"])
+root = pathlib.Path(os.environ["BLACKBYRD_TEST_CODEX_DIR"])
 pid = os.getpid()
 events = set(root.glob("event-*.json"))
 inbox = queue.Queue()
@@ -339,7 +339,7 @@ def codex(monkeypatch, tmp_path):
     monkeypatch.setenv("PATH", str(binary_dir))
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
     monkeypatch.setenv("APPDATA", str(tmp_path / "AppData/Roaming"))
-    monkeypatch.setenv("SERPENTINE_TEST_CODEX_DIR", str(tmp_path))
+    monkeypatch.setenv("BLACKBYRD_TEST_CODEX_DIR", str(tmp_path))
 
     def browser(url, *args, **kwargs):
         fake.browser_urls.append(url.toString() if hasattr(url, "toString") else str(url))

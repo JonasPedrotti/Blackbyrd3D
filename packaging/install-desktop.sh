@@ -25,15 +25,7 @@ refresh() {
         2>/dev/null || true
 }
 
-remove_legacy() {
-    # pre-rebrand names ("Serpentine"): drop them so search shows one app
-    rm -f "$DESKTOP_DIR/serpentine.desktop" "$ICON_DIR/serpentine.png" \
-          "$MIME_DIR/packages/serpentine.xml" \
-          "$APPS_DIR/Serpentine.AppImage"
-}
-
 if [ "${1:-}" = "--uninstall" ]; then
-    remove_legacy
     rm -f "$DESKTOP_FILE" "$ICON_DIR/blackbyrd3d.png" \
           "$MIME_ICON_DIR/application-x-blackbyrd3d.png" \
           "$MIME_ICON_DIR/application-x-blackbyrd3d-wyrm.png" \
@@ -59,7 +51,6 @@ else
     EXEC_LINE="$APPS_DIR/Blackbyrd3D.AppImage %F"
 fi
 
-remove_legacy
 mkdir -p "$DESKTOP_DIR" "$ICON_DIR" "$MIME_ICON_DIR" "$MIME_DIR/packages"
 install -m 644 "$HERE/appimage/blackbyrd3d.png" "$ICON_DIR/blackbyrd3d.png"
 install -m 644 "$HERE/appimage/blackbyrd3d.png" \
