@@ -456,12 +456,13 @@ def mesh_from_brep(shape) -> MeshShape:
     return MeshShape(dm.vertices.astype(float), dm.triangles)
 
 
-def brep_from_mesh(mesh: MeshShape, progress=None):
-    """A mesh as a BREP shell of flat triangular faces."""
+def brep_from_mesh(mesh: MeshShape, progress=None, display: bool = False):
+    """A mesh as a BREP shell of flat triangular faces; with `display`,
+    (shell, its display mesh)."""
     from ..fileio.obj import _shell_from_triangles
     from . import geometry
-    shape = _shell_from_triangles(mesh.vertices, mesh.triangles,
-                                  progress=progress)
-    if shape is None:
+    made = _shell_from_triangles(mesh.vertices, mesh.triangles,
+                                 progress=progress, display=display)
+    if (made[0] if display else made) is None:
         raise geometry.GeometryError("Mesh could not be converted")
-    return shape
+    return made

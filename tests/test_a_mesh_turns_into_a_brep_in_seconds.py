@@ -71,6 +71,20 @@ def test_a_triangle_shell_draws_as_the_slow_way_drew_it(move, monkeypatch):
     assert np.allclose(quick.edge_segments, slow.edge_segments)
 
 
+def test_the_converter_hands_over_the_display_tessellate_would_make():
+    rng = np.random.default_rng(3)
+    v = rng.random((40, 3))
+    t = np.array([rng.choice(40, 3, replace=False) for _ in range(60)])
+    shell, made = brep_from_mesh(MeshShape(v, t), display=True)
+    drawn = T.tessellate(shell)
+    assert np.allclose(made.vertices, drawn.vertices)
+    assert np.allclose(made.normals, drawn.normals, atol=1e-6)
+    assert (made.triangles == drawn.triangles).all()
+    assert (made.face_of_triangle == drawn.face_of_triangle).all()
+    assert np.allclose(made.edge_segments, drawn.edge_segments)
+    assert (made.edge_of_segment == drawn.edge_of_segment).all()
+
+
 def test_other_shapes_still_mesh_the_usual_way():
     assert T._triangle_faces_mesh(g.make_box((0, 0, 0), 1, 1, 1)) is None
 

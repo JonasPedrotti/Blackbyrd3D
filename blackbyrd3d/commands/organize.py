@@ -306,12 +306,12 @@ def cmd_meshtobrep(ctx):
                 share = progress.part(i / len(objs), (i + 1) / len(objs),
                                       o.name)
                 try:
-                    shape = brep_from_mesh(o.shape, share.part(0.0, 0.7))
+                    shape, mesh = brep_from_mesh(o.shape, share,
+                                                 display=True)
                 except g.GeometryError as exc:
                     ctx.echo(f"{o.name}: {exc}")
                     continue
-                share.tick(0.7, "Preparing the display")
-                ctx.scene.replace_shape(o.id, shape).mesh
+                ctx.scene.replace_shape(o.id, shape, mesh)
                 done += 1
         except Cancelled:
             ctx.echo("Stopped.")

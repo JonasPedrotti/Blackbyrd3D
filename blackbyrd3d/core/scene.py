@@ -487,11 +487,12 @@ class Scene:
             self._order.remove(obj_id)
             self.notify("objects")
 
-    def replace_shape(self, obj_id: str, shape) -> SceneObject:
-        """Swap an object's geometry (transform, boolean result, ...)."""
+    def replace_shape(self, obj_id: str, shape, mesh=None) -> SceneObject:
+        """Swap an object's geometry (transform, boolean result, ...),
+        with its display mesh when the caller has already made it."""
         old = self.objects[obj_id]
         new = replace(old, _shape=shape, kind=geometry.shape_kind(shape),
-                      _mesh=None)
+                      _mesh=mesh)
         self.objects[obj_id] = new
         self._regenerate_dependents(obj_id)
         self.notify("objects")

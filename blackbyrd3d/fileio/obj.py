@@ -104,13 +104,14 @@ def import_obj(path: str, as_mesh: bool = True) -> list:
 
 
 def _shell_from_triangles(verts: np.ndarray, tris: list,
-                          tolerance: float = 1e-6,
-                          progress=None) -> object | None:
+                          tolerance: float = 1e-6, progress=None,
+                          display: bool = False):
     """One shell of planar faces, built with shared vertices and edges.
 
     Points closer than `tolerance` are welded first, so neighbouring
     triangles share their edges without sewing, which took minutes on
-    meshes of a hundred thousand triangles."""
+    meshes of a hundred thousand triangles. With `display` it comes back
+    with its display mesh, which the arrays here already hold, beside it."""
     from OCP.BRep import BRep_Builder
     from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeEdge
     from OCP.TopoDS import TopoDS_Face, TopoDS_Shell, TopoDS_Vertex, TopoDS_Wire
@@ -120,7 +121,7 @@ def _shell_from_triangles(verts: np.ndarray, tris: list,
     verts = np.asarray(verts, float).reshape(-1, 3)
     tris = np.asarray(tris, np.int64).reshape(-1, 3)
     if not len(tris) or not len(verts):
-        return None
+        return (None, None) if display else None
     keys = np.round(verts / tolerance).astype(np.int64)
     _, first, weld = np.unique(keys, axis=0, return_index=True,
                                return_inverse=True)
@@ -135,7 +136,7 @@ def _shell_from_triangles(verts: np.ndarray, tris: list,
             & (tris[:, 0] != tris[:, 2]) & (lengths > 1e-12 * sides ** 2))
     tris, normals = tris[keep], normals[keep] / lengths[keep, None]
     if not len(tris):
-        return None
+        return (None, None) if display else None
 
     ends = np.stack([tris, np.roll(tris, -1, axis=1)], axis=2)  # (M,3,2)
     lo, hi = ends.min(axis=2), ends.max(axis=2)
@@ -167,9 +168,9 @@ def _shell_from_triangles(verts: np.ndarray, tris: list,
             report((len(pairs) + k) / total, "Building faces")
         wire = TopoDS_Wire()
         builder.MakeWire(wire)
-        for k in range(3):
-            builder.Add(wire, reversed_edges[ids[k]] if flip[k]
-                        else edges[ids[k]])
+        for j in range(3):
+            builder.Add(wire, reversed_edges[ids[j]] if flip[j]
+                        else edges[ids[j]])
         wire.Closed(True)
         face = TopoDS_Face()
         builder.MakeFace(face, Geom_Plane(gp_Pnt(*points[t[0]]),
@@ -177,7 +178,31 @@ def _shell_from_triangles(verts: np.ndarray, tris: list,
         builder.Add(face, wire)
         builder.Add(shell, face)
     shell.Closed(_is_closed(pairs, edge_of))
-    return shell
+    if not display:
+        return shell
+    return shell, _triangles_display(points, tris, normals, pairs, edge_of)
+
+
+def _triangles_display(points, tris, normals, pairs, edge_of):
+    """The display mesh tessellate would make of the shell built from
+    these arrays: a flat triangle per face, and the edges numbered in the
+    order geometry.edges_of meets them, face by face."""
+    from ..core.tessellate import _CURVATURE, DisplayMesh
+    order = edge_of.reshape(-1)
+    _, first = np.unique(order, return_index=True)
+    edge_order = order[np.sort(first)]
+    count = len(tris)
+    mesh = DisplayMesh()
+    mesh.place(vertices=points[tris].reshape(-1, 3),
+               edge_segments=points[pairs[edge_order]],
+               iso_segments=None, points=None)
+    mesh.normals = np.repeat(normals, 3, axis=0).astype(np.float32)
+    mesh.triangles = np.arange(count * 3, dtype=np.uint32).reshape(-1, 3)
+    mesh.curvature = np.zeros(count * 3, np.float32)
+    mesh.has_curvature = _CURVATURE
+    mesh.face_of_triangle = np.arange(count, dtype=np.int32)
+    mesh.edge_of_segment = np.arange(len(edge_order), dtype=np.int32)
+    return mesh
 
 
 def _is_closed(pairs: np.ndarray, edge_of: np.ndarray) -> bool:

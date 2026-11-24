@@ -768,39 +768,54 @@ def _triangle_faces_mesh(shape) -> DisplayMesh | None:
     triangles, read straight off its vertices, or None for anything else.
 
     A mesh turned into a Brep is a hundred thousand such faces, and
-    meshing and measuring each on its own took half a minute."""
+    meshing and measuring each on its own took half a minute. Edges are
+    numbered in the order geometry.edges_of finds them, which walks the
+    faces the same way."""
     from OCP.BRep import BRep_Tool
     from OCP.Geom import Geom_Plane
     from OCP.TopExp import TopExp
+    from OCP.TopTools import TopTools_IndexedMapOfShape
 
     exp = TopExp_Explorer(shape, occ.FACE)
     if not exp.More():
         return None
-    corners, normals = [], []
+    all_edges = TopTools_IndexedMapOfShape()
+    TopExp.MapShapes_s(shape, occ.EDGE, all_edges)
+
+    corners, normals, segments, seen = [], [], [], set()
     reversed_kind = TopAbs_Orientation.TopAbs_REVERSED
+    pnt, first, last = BRep_Tool.Pnt_s, TopExp.FirstVertex_s, \
+        TopExp.LastVertex_s
     while exp.More():
         face = occ.to_face(exp.Current())
         exp.Next()
         plane = BRep_Tool.Surface_s(face)
         if not isinstance(plane, Geom_Plane):
             return None
-        points, count = [], 0
+        points = []
         edges = TopExp_Explorer(face, occ.EDGE)
         while edges.More():
             edge = occ.to_edge(edges.Current())
             edges.Next()
-            count += 1
-            if count > 3 or occ.edge_adaptor(edge).GetType() != _LINE:
+            if len(points) == 3:
                 return None
-            points.append(BRep_Tool.Pnt_s(TopExp.FirstVertex_s(edge, True))
-                          .Coord())
-        if count != 3:
+            a, b = pnt(first(edge)).Coord(), pnt(last(edge)).Coord()
+            points.append(b if edge.Orientation() == reversed_kind else a)
+            key = hash(edge)
+            if key not in seen:
+                if occ.edge_adaptor(edge).GetType() != _LINE:
+                    return None
+                seen.add(key)
+                segments.append((a, b))
+        if len(points) != 3:
             return None
         n = plane.Axis().Direction().Coord()
         if face.Orientation() == reversed_kind:
             n = (-n[0], -n[1], -n[2])
         corners.append(points)
         normals.append(n)
+    if len(segments) != all_edges.Extent():
+        return None       # loose edges as well, numbered differently
 
     verts = np.asarray(corners, np.float64)                  # (F, 3, 3)
     normals = np.asarray(normals, np.float64)
@@ -808,13 +823,7 @@ def _triangle_faces_mesh(shape) -> DisplayMesh | None:
     backwards = np.einsum("ij,ij->i", wound, normals) < 0
     verts[backwards] = verts[backwards][:, ::-1]
     count = len(verts)
-
-    segments, seg_edge_ids = [], []
-    for edge_index, edge in enumerate(geometry.edges_of(shape)):
-        a = BRep_Tool.Pnt_s(TopExp.FirstVertex_s(edge)).Coord()
-        b = BRep_Tool.Pnt_s(TopExp.LastVertex_s(edge)).Coord()
-        segments.append((a, b))
-        seg_edge_ids.append(edge_index)
+    seg_edge_ids = np.arange(len(segments))
 
     mesh = DisplayMesh()
     mesh.place(vertices=verts.reshape(-1, 3),
