@@ -2,6 +2,8 @@ name: Build Linux AppImage
 
 # Builds the AppImage with packaging/appimage/build-appimage.sh, which also
 # starts the packed app under a virtual display before anything is published.
+# One job per architecture, each on a runner of its own kind: python-appimage
+# builds for the machine it runs on.
 # - workflow_dispatch: build and expose the AppImage as a downloadable artifact.
 # - release published: also attach it to that release.
 on:
@@ -15,7 +17,18 @@ permissions:
 jobs:
   build:
     if: github.repository == 'JonasPedrotti/Blackbyrd3D'
-    runs-on: ubuntu-latest
+    strategy:
+      # a broken ARM build must not hold back the x86_64 one
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    env:
+      APPIMAGE_NAME: Blackbyrd3D-${{ matrix.arch }}.AppImage
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-python@v6
@@ -37,8 +50,8 @@ jobs:
       - name: Upload AppImage artifact
         uses: actions/upload-artifact@v6
         with:
-          name: Blackbyrd3D-x86_64.AppImage
-          path: packaging/appimage/dist/Blackbyrd3D-x86_64.AppImage
+          name: ${{ env.APPIMAGE_NAME }}
+          path: packaging/appimage/dist/${{ env.APPIMAGE_NAME }}
           if-no-files-found: error
       - name: Attach to release
         if: github.event_name == 'release'
@@ -47,8 +60,8 @@ jobs:
         run: |
           tag="${{ github.event.release.tag_name }}"
           assets=$(gh release view "$tag" --json assets --jq '.assets[].name')
-          if grep -Fxq "Blackbyrd3D-x86_64.AppImage" <<< "$assets"; then
+          if grep -Fxq "$APPIMAGE_NAME" <<< "$assets"; then
             echo 'Keeping the AppImage already prepared in the draft release.'
           else
-            gh release upload "$tag" packaging/appimage/dist/Blackbyrd3D-x86_64.AppImage
+            gh release upload "$tag" "packaging/appimage/dist/$APPIMAGE_NAME"
           fi

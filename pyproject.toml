@@ -15,7 +15,9 @@ dependencies = [
     "PySide6-Essentials>=6.6",
     "shiboken6>=6.6",       # checks whether a destroyed GL share group is still valid
     "numpy>=1.26",
-    "pye57>=0.4.19,<0.5",
+    # No aarch64 Linux wheel exists, and building it needs Xerces-C: E57
+    # import is left out there and says so (fileio.import_file).
+    "pye57>=0.4.19,<0.5; platform_machine != 'aarch64'",
     "PyOpenGL>=3.1",
     "mcp>=2",               # the server is written against mcp.server.mcpserver
     "httpx>=0.27,<1",       # the AI client speaks it directly; mcp 2 moved to httpx2

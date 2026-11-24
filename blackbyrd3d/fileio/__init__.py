@@ -1,6 +1,7 @@
 """File import/export."""
 
 import os
+import platform
 
 from . import native, obj, step
 from .progress import (Cancelled, Progress,  # noqa: F401  (re-exported)
@@ -236,7 +237,17 @@ def _import_file(scene, path: str, ext: str, report, replace: bool = False,
             scene.add(shape, name=name)
         return len(named)
     if ext == ".e57":
-        from . import e57
+        try:
+            from . import e57
+        except ModuleNotFoundError as exc:
+            if exc.name != "pye57":
+                raise
+            # pyproject leaves pye57 out on ARM Linux, where it has no wheel
+            raise ValueError(
+                "E57 point clouds can't be imported in this build: pye57, "
+                "the library that reads them, is not available for "
+                f"{platform.machine()}. Convert the scan to PLY to bring "
+                "it in.") from exc
         named = e57.import_e57(path, units=scene.units,
                                progress=report.part(0.0, 0.95))
         # Reading and cancellation finish before mutating the scene, so a bad

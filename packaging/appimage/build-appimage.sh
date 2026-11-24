@@ -3,7 +3,8 @@
 #
 #   ./packaging/appimage/build-appimage.sh
 #
-# Produces Blackbyrd3D-x86_64.AppImage in packaging/appimage/dist.
+# Produces Blackbyrd3D-<arch>.AppImage in packaging/appimage/dist, for the
+# machine it runs on (x86_64 or aarch64): python-appimage cannot cross-build.
 # Needs network access (PyPI wheels + a relocatable CPython runtime)
 # and a few GB of scratch space. FUSE is not required to build.
 set -euo pipefail
@@ -12,6 +13,14 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"
 DIST="$HERE/dist"
 PYVER="${BYRD3D_APPIMAGE_PYTHON:-3.12}"
+
+# The glibc each architecture's PySide6 wheels need
+ARCH="$(uname -m)"
+case "$ARCH" in
+    x86_64)  GLIBC=2_34 ;;
+    aarch64) GLIBC=2_39 ;;
+    *) echo "ERROR: no AppImage build for $ARCH" >&2; exit 1 ;;
+esac
 
 # recipe directory: its basename is the fallback app name; the .desktop
 # Name= field (Blackbyrd3D) names the final AppImage.
@@ -54,7 +63,7 @@ printf 'blackbyrd3d@file://%s\n' "$ROOT" > "$RECIPE/requirements.txt"
 # whatever PyPI has newest that day: the AppImage once shipped Qt 6.12 while
 # CI still ran 6.11, and a dock bug only Qt 6.12 had could not be reproduced
 # anywhere else. The lock is resolved for this one target (CPython $PYVER on
-# x86_64 Linux, glibc 2.34 as PySide6's wheels need), which settles every
+# $ARCH Linux, with the glibc PySide6's wheels need), which settles every
 # marker. It goes to pip as a constraints file rather than as requirements:
 # python-appimage installs requirement lines one at a time, so pins listed
 # there arrive after our package has already pulled in the newest of
@@ -66,7 +75,7 @@ if command -v uv > /dev/null 2>&1; then
     ( cd "$ROOT" && uv export --frozen --no-dev --no-hashes --no-emit-project \
         --no-annotate --no-header ) > "$PINS/locked.txt"
     uv pip compile "$PINS/locked.txt" --python-version "$PYVER" \
-        --python-platform x86_64-manylinux_2_34 --no-deps --no-header \
+        --python-platform "$ARCH-manylinux_$GLIBC" --no-deps --no-header \
         --no-annotate -q -o "$PINS/pinned.txt"
     export PIP_CONSTRAINT="$PINS/pinned.txt"
     echo "Pinned to uv.lock: $(wc -l < "$PINS/pinned.txt") packages"
@@ -133,7 +142,9 @@ if [ -n "$BUILT" ]; then
 
     QT_QPA_PLATFORM=offscreen "$PROBE/squashfs-root/usr/bin/python$PYVER" -P - << 'PY'
 import blackbyrd3d.app
-import pye57  # Load libE57 and its bundled Xerces runtime before handoff.
+import platform
+if platform.machine() != "aarch64":  # left out there, see pyproject
+    import pye57  # Load libE57 and its bundled Xerces runtime before handoff.
 import openskp, mapbox_earcut, shapely.geometry  # SketchUp's reader (#42).
 from PySide6.QtWidgets import QApplication
 app = QApplication([])
@@ -179,16 +190,16 @@ PY
     # python-appimage packed the bundle before it was pruned: pack it again.
     TOOL="$(command -v appimagetool || true)"
     if [ -z "$TOOL" ]; then
-        TOOL="$DIST/appimagetool-x86_64.AppImage"
+        TOOL="$DIST/appimagetool-$ARCH.AppImage"
         [ -x "$TOOL" ] || {
-            curl -fsSL -o "$TOOL" "https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage"
+            curl -fsSL -o "$TOOL" "https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-$ARCH.AppImage"
             chmod +x "$TOOL"
         }
     fi
     # The extracted tree comes out 0700, and packed that way only the user
     # who built the AppImage could run it.
     chmod -R a+rX "$PROBE/squashfs-root"
-    APPIMAGE_EXTRACT_AND_RUN=1 ARCH=x86_64 "$TOOL" --no-appstream \
+    APPIMAGE_EXTRACT_AND_RUN=1 ARCH="$ARCH" "$TOOL" --no-appstream \
         "$PROBE/squashfs-root" "$BUILT.pruned" > /dev/null
     mv "$BUILT.pruned" "$BUILT"
     ls -lh "$BUILT"

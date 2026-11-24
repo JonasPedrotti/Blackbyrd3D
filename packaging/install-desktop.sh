@@ -50,7 +50,7 @@ if [ "${1:-}" = "--venv" ]; then
     [ -x "$ROOT/.venv/bin/python" ] || {
         echo "error: $ROOT/.venv/bin/python not found" >&2; exit 1; }
 else
-    APPIMAGE_SRC="$HERE/appimage/dist/Blackbyrd3D-x86_64.AppImage"
+    APPIMAGE_SRC="$HERE/appimage/dist/Blackbyrd3D-$(uname -m).AppImage"
     [ -f "$APPIMAGE_SRC" ] || {
         echo "error: $APPIMAGE_SRC not found — run" \
              "packaging/appimage/build-appimage.sh first" >&2; exit 1; }

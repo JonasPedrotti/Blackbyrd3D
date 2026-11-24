@@ -70,6 +70,62 @@ def test_asset_for_platform_no_matching_asset_is_none():
     assert u.asset_for_platform(only_exe, "Linux") is None
 
 
+# ---------------------------------------------- asset by architecture
+
+def _both_appimages():
+    return [
+        {"name": "Blackbyrd3D-x86_64.AppImage",
+         "browser_download_url": "https://x/Blackbyrd3D-x86_64.AppImage"},
+        {"name": "Blackbyrd3D-aarch64.AppImage",
+         "browser_download_url": "https://x/Blackbyrd3D-aarch64.AppImage"},
+    ]
+
+
+@pytest.mark.parametrize("assets", [_both_appimages(),
+                                    _both_appimages()[::-1]])
+@pytest.mark.parametrize("machine,arch", [
+    ("x86_64", "x86_64"),
+    ("aarch64", "aarch64"),
+])
+def test_linux_gets_the_appimage_for_its_architecture(assets, machine, arch):
+    url = u.asset_for_platform(assets, "Linux", machine)
+    assert url.endswith(f"-{arch}.AppImage")
+
+
+def test_arm_linux_is_not_sent_the_x86_appimage():
+    # releases made before there was an ARM build
+    only_x86 = _both_appimages()[:1]
+    assert u.asset_for_platform(only_x86, "Linux", "aarch64") is None
+
+
+@pytest.mark.parametrize("machine", ["AMD64", "ARM64"])
+def test_windows_machine_names_are_understood(machine):
+    url = u.asset_for_platform(_assets(), "Windows", machine)
+    assert (url is not None) == (machine == "AMD64")
+
+
+def test_mac_arm64_matches_the_arm64_disk_image():
+    url = u.asset_for_platform(_assets(), "Darwin", "arm64")
+    assert url.endswith("-arm64.dmg")
+
+
+def test_an_asset_naming_no_architecture_fits_any():
+    plain = [{"name": "Blackbyrd3D.AppImage",
+              "browser_download_url": "https://x/Blackbyrd3D.AppImage"}]
+    assert u.asset_for_platform(plain, "Linux", "aarch64") is not None
+
+
+def test_an_unknown_machine_only_gets_plain_assets():
+    assert u.asset_for_platform(_both_appimages(), "Linux", "riscv64") is None
+
+
+def test_check_passes_the_machine_through():
+    release = dict(_release(), assets=_both_appimages())
+    got = u.check_for_update("0.3.1", "Linux", "aarch64",
+                             fetch=lambda: json.dumps(release))
+    assert got["download"].endswith("-aarch64.AppImage")
+
+
 # ------------------------------------------------------------ parse release
 
 def _release(tag="v0.3.2"):
