@@ -372,8 +372,7 @@ def test_the_line_shows_only_near_the_cursor():
     vp.snaps.guides += [(0.0, 0.0, 0.0), (10.0, 10.0, 0.0)]
     px, py = _pixel(vp, (7.0, 2.0, 0.0))
     vp.world_point_at(px, py)
-    assert all(rail != ((0.0, 0.0, 0.0), (10.0, 10.0, 0.0))
-               for rail in vp._guide_rails)
+    assert ((0.0, 0.0, 0.0), (10.0, 10.0, 0.0)) not in vp._guide_rails
 
 
 def test_every_pair_of_guides_makes_a_line():
@@ -385,14 +384,25 @@ def test_every_pair_of_guides_makes_a_line():
     assert point[0] + point[1] == pytest.approx(10.0, abs=1e-6)
 
 
-def test_the_line_stops_at_its_guides():
+def test_the_line_runs_on_past_its_guides():
     vp = _viewport()
     vp.snaps.guides += [(0.0, 0.0, 0.0), (10.0, 10.0, 0.0)]
     px, py = _pixel(vp, (16.0, 16.0, 0.0))
-    vp.world_point_at(px, py)
-    assert vp._guide_rails == [] or vp._active_snap[1] != "track" \
-        or all(r != ((0.0, 0.0, 0.0), (10.0, 10.0, 0.0))
-               for r in vp._guide_rails)
+    point = vp.world_point_at(px + 3, py)
+    assert vp._active_snap[1] == "track"
+    assert point[0] == pytest.approx(point[1], abs=1e-6)
+    assert point[0] > 14.0
+    assert vp._guide_rails == [((0.0, 0.0, 0.0), (10.0, 10.0, 0.0))]
+
+
+def test_perp_lands_on_the_line_beyond_its_guides():
+    vp = _viewport(base=(15.0, 8.0, 0.0))
+    vp.snaps.types["perp"] = True
+    vp.snaps.guides += [(0.0, 0.0, 0.0), (10.0, 0.0, 0.0)]
+    px, py = _pixel(vp, (15.0, 0.0, 0.0))
+    point = vp.world_point_at(px + 4, py)
+    assert vp._active_snap[1] == "perp"
+    assert point == pytest.approx((15.0, 0.0, 0.0), abs=1e-9)
 
 
 def test_the_middle_of_a_guide_line_snaps_as_mid():

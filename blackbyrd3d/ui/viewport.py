@@ -4546,8 +4546,14 @@ class Viewport(QOpenGLWidget):
                              (*theme.SELECTION_COLOR, 0.35), 1.0)
         if guides:
             if self._guide_rails:
+                # a line between two guides is a whole line, run out of view
+                drawn = [_axis_guide(a, np.subtract(b, a),
+                                     self.camera.distance * 4.0)
+                         if a in guides and b in guides
+                         else np.asarray((a, b), float)
+                         for a, b in self._guide_rails]
                 self._preview.update(rebased(
-                    np.asarray(self._guide_rails, np.float32).reshape(-1, 3),
+                    np.asarray(drawn, np.float32).reshape(-1, 3),
                     self._frame_anchor))
                 self._draw_lines(self._preview, mvp,
                                  (*theme.SELECTION_COLOR, 0.5), 1.0)

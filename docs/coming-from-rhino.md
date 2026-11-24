@@ -33,7 +33,7 @@ page maps your habits over and is honest about the gaps.
   mouse or by typing it — the way you place a point off the CPlane in Rhino.
 - **Tap ++ctrl++ for a guide.** SmartTrack's temporary points: tap ++ctrl++
   while picking and the cursor snaps to that spot and lines up with it along
-  the CPlane axes. With two or more, the lines between them snap too (Mid
+  the CPlane axes. With two or more, the lines through them snap too (Mid
   and Perp included) and show while the cursor is on one. Tap on a guide
   to remove it. They go when the command ends, and *Guides* on the osnap
   bar turns them off.

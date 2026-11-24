@@ -998,8 +998,8 @@ class SnapIndex:
         return point, [(self.guides[i], point) for i in held]
 
     def _guide_line_points(self, base_point) -> list:
-        """Mid of every line between two guides, and the foot of the
-        perpendicular from `base_point` where it falls on one."""
+        """Mid between every two guides, and the foot of the perpendicular
+        from `base_point` on the line through them."""
         if not self.tracking or len(self.guides) < 2:
             return []
         out = []
@@ -1015,11 +1015,9 @@ class SnapIndex:
                 out.append((tuple(float(c) for c in (a + b) / 2), "mid"))
                 if base is not None:
                     t = float((base - a) @ span) / length2
-                    if 0.0 <= t <= 1.0:
-                        foot = a + t * span
-                        if float(np.linalg.norm(foot - base)) > 1e-9:
-                            out.append((tuple(float(c) for c in foot),
-                                        "perp"))
+                    foot = a + t * span
+                    if float(np.linalg.norm(foot - base)) > 1e-9:
+                        out.append((tuple(float(c) for c in foot), "perp"))
         return out
 
     def guide_line_through(self, point):
@@ -1036,14 +1034,15 @@ class SnapIndex:
                 if length2 < 1e-24:
                     continue
                 t = float((p - a) @ span) / length2
-                if -1e-9 <= t <= 1 + 1e-9 and                         np.linalg.norm(a + t * span - p) < 1e-7:
+                if np.linalg.norm(a + t * span - p) < 1e-7:
                     return (self.guides[i], self.guides[j])
         return None
 
     def on_guide_line(self, camera, px: float, py: float, width: int,
                       height: int, radius_px: float = GUIDE_ALIGN_PX):
-        """The point on a line between two guides under the pixel, as
-        (point, (a, b)), or None. Every pair of guides makes a line."""
+        """The point on a line through two guides under the pixel, as
+        (point, (a, b)), or None. Every pair of guides makes a line, and
+        it runs on past both of them."""
         if not self.tracking or len(self.guides) < 2:
             return None
         from ..utils.math3d import ray_line_parameter
@@ -1062,7 +1061,7 @@ class SnapIndex:
                 t = ray_line_parameter(origin, direction, a, span)
                 if t is None:
                     continue
-                p = a + span / length * min(max(t, 0.0), length)
+                p = a + span / length * t
                 scr = camera.project(p[None, :], width, height)[0]
                 if scr[2] <= 0:
                     continue
