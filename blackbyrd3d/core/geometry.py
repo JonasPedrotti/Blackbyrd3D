@@ -11,6 +11,7 @@ import os
 import struct
 import tempfile
 import warnings
+import weakref
 
 from . import occ
 from .tolerance import tight, tol
@@ -5208,7 +5209,30 @@ def curve_length(shape) -> float:
     return occ.linear_properties(shape).Mass()
 
 
+# Areas known without integrating, from whoever built the shape: a mesh
+# turned into a Brep is a hundred thousand faces, and its area is the sum of
+# its triangles it was made from. Weak, so a shape takes its entry with it.
+_KNOWN_AREAS = weakref.WeakKeyDictionary()
+
+
+def know_area(shape, area: float):
+    try:
+        _KNOWN_AREAS[shape] = float(area)
+    except TypeError:
+        pass
+
+
+def known_area(shape) -> float | None:
+    try:
+        return _KNOWN_AREAS.get(shape)
+    except TypeError:
+        return None
+
+
 def surface_area(shape) -> float:
+    known = known_area(shape)
+    if known is not None:
+        return known
     from .mesh import MeshShape
     from .pointcloud import PointCloudShape
     if isinstance(shape, MeshShape):

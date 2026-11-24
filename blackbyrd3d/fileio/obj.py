@@ -135,6 +135,7 @@ def _shell_from_triangles(verts: np.ndarray, tris: list,
     keep = ((tris[:, 0] != tris[:, 1]) & (tris[:, 1] != tris[:, 2])
             & (tris[:, 0] != tris[:, 2]) & (lengths > 1e-12 * sides ** 2))
     tris, normals = tris[keep], normals[keep] / lengths[keep, None]
+    area = 0.5 * float(lengths[keep].sum())
     if not len(tris):
         return (None, None) if display else None
 
@@ -178,6 +179,7 @@ def _shell_from_triangles(verts: np.ndarray, tris: list,
         builder.Add(face, wire)
         builder.Add(shell, face)
     shell.Closed(_is_closed(pairs, edge_of))
+    geometry.know_area(shell, area)
     if not display:
         return shell
     return shell, _triangles_display(points, tris, normals, pairs, edge_of)

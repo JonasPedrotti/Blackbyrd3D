@@ -134,7 +134,9 @@ def test_a_big_shell_is_measured_off_the_interface_thread():
 
     try:
         g.surface_area = seen
-        obj = scene.add(brep_from_mesh(MeshShape(CUBE_V, CUBE_T)))
+        # moved, so its area is not the one the converter knew
+        obj = scene.add(g.translate(brep_from_mesh(MeshShape(CUBE_V, CUBE_T)),
+                                    (1, 0, 0)))
         sel.set([obj.id])
         deadline = time.monotonic() + 10
         while "Area" not in panel.measure_label.text():
@@ -148,3 +150,14 @@ def test_a_big_shell_is_measured_off_the_interface_thread():
         panel._measure_timer.stop()
         panel.deleteLater()
         QApplication.processEvents()
+
+
+def test_a_converted_shell_knows_its_area_at_once(monkeypatch):
+    from blackbyrd3d.core import occ
+    rng = np.random.default_rng(8)
+    v = rng.random((50, 3))
+    t = np.array([rng.choice(50, 3, replace=False) for _ in range(80)])
+    shell = brep_from_mesh(MeshShape(v, t))
+    measured = occ.surface_properties(shell).Mass()
+    monkeypatch.setattr(occ, "surface_properties", None)   # never asked
+    assert g.surface_area(shell) == pytest.approx(measured, rel=1e-9)

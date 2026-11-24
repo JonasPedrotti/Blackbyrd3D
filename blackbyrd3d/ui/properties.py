@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from collections import Counter
 from dataclasses import dataclass
+import sys
 from typing import NamedTuple
 
 from PySide6.QtCore import QEvent, QSignalBlocker, QSize, QTimer, Signal, Qt
@@ -997,6 +998,10 @@ class _WidthHoldingScroll(QScrollArea):
                               inner.minimumSizeHint().width()
                               + 2 * self.frameWidth() + bar))
         return hint
+
+
+# How often a background measurement hands the interpreter back, in seconds
+_MEASURING_SWITCH = 0.0005
 
 
 class PropertiesPanel(QWidget):
@@ -3170,6 +3175,8 @@ class PropertiesPanel(QWidget):
     def _many_faces(self, obj) -> bool:
         from ..core import occ
         shape = obj.shape
+        if obj.kind == "surface" and g.known_area(shape) is not None:
+            return False                 # nothing left to work out
         try:
             return (isinstance(shape, occ.TopoDS_Shape)
                     and occ.map_shapes(shape, occ.FACE).Extent()
@@ -3188,7 +3195,15 @@ class PropertiesPanel(QWidget):
                 max_workers=1, thread_name_prefix="byrd-measure")
 
         def work():
-            text = self._measured_now(obj)
+            # Python hands the lock between threads every 5 ms by default,
+            # and the interface thread wants it many times a frame: with
+            # this thread measuring, it stood still for seconds at a time.
+            interval = sys.getswitchinterval()
+            sys.setswitchinterval(min(interval, _MEASURING_SWITCH))
+            try:
+                text = self._measured_now(obj)
+            finally:
+                sys.setswitchinterval(interval)
             try:
                 self._measuredApart.emit(obj.id, revision, text)
             except RuntimeError:
