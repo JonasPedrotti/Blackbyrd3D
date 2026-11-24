@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+- **Ortho and grid snap in every pane.** The Ortho and Grid buttons and F8
+  and F9 now hold in all viewports, not only the first one.
+- **Backspace deletes the selection,** so the delete key on a Mac works.
+- **Cen on faces and closed curves, and `centroid`.** Cen finds the middle
+  of rectangles, surfaces and every face of a solid; `centroid` places a
+  point at an area or volume centroid.
+- **Relocate the gumball.** Right-click, Ctrl+click or double-click its
+  centre to move it anywhere; Ctrl+double-click resets it.
+
 ## 0.2.1
 
 - **Linux ARM AppImage.** Releases now include `Blackbyrd3D-aarch64.AppImage`
