@@ -56,6 +56,7 @@ body:
       description: Shown in Help → About, or `pip show blackbyrd3d`.
       options:
         # versions:start (kept up to date by .github/workflows/issue-form-versions.yml)
+        - "0.2.0"
         - "0.1.0"
         # versions:end
     validations:
