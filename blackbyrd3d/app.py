@@ -1979,6 +1979,15 @@ class MainWindow(QMainWindow):
 
     def _on_object_clicked(self, obj_id: str, modifiers, pane=None):
         req = self.processor.request
+        if isinstance(req, SelectReq) and req.want_face:
+            px = getattr(pane, "last_click_px", None)
+            hit = (pane.pick_subobject(*px, only="face")
+                   if px is not None else None)
+            if hit is None:
+                self.ctx.echo("Click on a face.")
+                return
+            self.processor.click_face(hit[0], hit[2])
+            return
         if isinstance(req, SelectReq):
             at = None
             px = getattr(pane, "last_click_px", None)

@@ -551,8 +551,8 @@ def test_subobject_filletedge_and_pushpull(env):
     xmax_idx = max(range(len(faces)),
                    key=lambda i: g.centroid(faces[i])[0])
     v0 = g.volume(shape)
-    sel.toggle_subobject(box.id, "face", xmax_idx)
     proc.run("pushpull")
+    proc.click_face(box.id, xmax_idx)
     proc.provide_text("5")
     v1 = g.volume(scene.all()[0].shape)
     assert v1 > v0 + 400          # roughly +500 minus the filleted strip
@@ -562,8 +562,8 @@ def test_subobject_filletedge_and_pushpull(env):
     faces = g.faces_of(shape)
     xmax_idx = max(range(len(faces)),
                    key=lambda i: g.centroid(faces[i])[0])
-    sel.toggle_subobject(box.id, "face", xmax_idx)
     proc.run("pushpull")
+    proc.click_face(box.id, xmax_idx)
     proc.provide_text("-3")
     v2 = g.volume(scene.all()[0].shape)
     assert v2 < v1

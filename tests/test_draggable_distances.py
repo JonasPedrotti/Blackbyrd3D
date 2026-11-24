@@ -167,8 +167,8 @@ def test_pushpull_drags_along_the_face_it_is_moving(env):
     obj = _box(scene)
     top = max(range(len(g.faces_of(obj.shape))),
               key=lambda i: g.face_point_normal(g.faces_of(obj.shape)[i])[0][2])
-    sel.subobjects = [(obj.id, "face", top)]
     proc.run("pushpull")
+    proc.click_face(obj.id, top)
     assert proc.request.axis_lock is not None, (
         "push/pull moves a face along its own normal — lock the drag to it")
     ghost = proc.preview_for((5, 5, 14))
@@ -182,8 +182,8 @@ def test_pushpull_inward_is_a_negative_drag(env):
     faces = g.faces_of(obj.shape)
     top = max(range(len(faces)),
               key=lambda i: g.face_point_normal(faces[i])[0][2])
-    sel.subobjects = [(obj.id, "face", top)]
     proc.run("pushpull")
+    proc.click_face(obj.id, top)
     proc.provide((5.0, 5.0, 7.0))
     assert not proc.busy
     assert g.volume(scene.get(obj.id).shape) == pytest.approx(700, rel=1e-3)
@@ -195,8 +195,8 @@ def test_pushpull_still_takes_typed_numbers(env):
     faces = g.faces_of(obj.shape)
     top = max(range(len(faces)),
               key=lambda i: g.face_point_normal(faces[i])[0][2])
-    sel.subobjects = [(obj.id, "face", top)]
     proc.run("pushpull")
+    proc.click_face(obj.id, top)
     proc.provide_text("4")
     assert not proc.busy
     assert g.volume(scene.get(obj.id).shape) == pytest.approx(1400, rel=1e-3)

@@ -6640,8 +6640,9 @@ class Viewport(QOpenGLWidget):
             return (oid, "vertex", i)
         return None
 
-    def pick_subobject(self, px: float, py: float):
-        """(obj_id, "vertex"|"edge"|"face", index) under the pixel, or None."""
+    def pick_subobject(self, px: float, py: float, only: str | None = None):
+        """(obj_id, "vertex"|"edge"|"face", index) under the pixel, or None.
+        `only="face"` looks past points and edges to the face."""
         w, h = self.width(), self.height()
         eye = self._eye()
         origin, direction = eye.ray_through(px, py, w, h)
@@ -6650,7 +6651,8 @@ class Viewport(QOpenGLWidget):
                       if self.scene.is_selectable(obj.id)]
         near_cursor = self._pick_candidates(selectable, px - r, py - r,
                                             px + r, py + r, w, h)
-        point = self._pick_point(near_cursor, px, py, w, h)
+        point = (None if only == "face"
+                 else self._pick_point(near_cursor, px, py, w, h))
         if point is not None:
             return point
         # then edges (they are the smaller target)
@@ -6658,7 +6660,7 @@ class Viewport(QOpenGLWidget):
         # which edge wins depends on how close the closest one came, and that
         # is not known until all the objects have been looked at.
         found = []
-        for obj in near_cursor:
+        for obj in ([] if only == "face" else near_cursor):
             mesh = obj.mesh
             if not len(mesh.local_edges):
                 continue
