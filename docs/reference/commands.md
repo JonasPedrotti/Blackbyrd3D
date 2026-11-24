@@ -273,7 +273,7 @@ Commands that need a file open a filtered chooser by default. Append
 | `filletedge` (`fe`) | Fillet edges. Ctrl+Shift-click edges first to fillet only those; the radius may be `start,end` or `u:r;u:r;…` for a variable law along the smooth chain, straight between points on request. |
 | `intersect` (`int`) | Intersect |
 | `mergeallcoplanarfaces` (`mergeallfaces`) | Fuse coplanar neighbouring faces of each selected polysurface. |
-| `pushpull` (`pp`, `moveface`) | SketchUp-style push/pull on a planar face. |
+| `pushpull` (`pp`, `moveface`) | SketchUp-style push/pull: click a face, then drag or type how far. |
 | `section` (`sec`) | Cut the selection with a plane drawn as a line across it. |
 
 ## Solids

@@ -489,18 +489,19 @@ def cmd_merge_all_coplanar_faces(ctx):
 
 @command("pushpull", aliases=("pp", "moveface"))
 def cmd_pushpull(ctx):
-    """SketchUp-style push/pull on a planar face.
-
-    Ctrl+Shift-click a face first, then run pushpull with a distance:
-    positive pushes the face outward, negative carves inward."""
-    faces = [(oid, idx) for (oid, kind, idx) in ctx.selection.subobjects
-             if kind == "face"]
-    if not faces:
-        ctx.echo("Ctrl+Shift-click a planar face first, then run pushpull.")
-        return
-        yield  # pragma: no cover
+    """SketchUp-style push/pull: click a face, then drag or type how far.
+    Positive pushes the face outward, negative carves inward."""
     from . import dragging
     from .base import PointReq
+    picked = yield SelectReq("Select surface to pushpull",
+                             kinds=("solid", "surface"), max_count=1,
+                             allow_preselected=False, want_face=True)
+    obj = picked[0]
+    idx = ctx.pick_faces.get(obj.id)
+    if idx is None:
+        ctx.echo("Click on the face to push or pull.")
+        return
+    faces = [(obj.id, idx)]
     # the face knows which way it goes, so the drag rides its own normal:
     # out of the solid adds material, into it carves
     first = ctx.scene.get(faces[0][0])

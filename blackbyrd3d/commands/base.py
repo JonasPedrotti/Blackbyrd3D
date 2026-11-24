@@ -245,6 +245,9 @@ class SelectReq(Req):
     # trim takes the part that point is on (#31). A viewport click supplies
     # it; a typed, scripted or listed pick cannot, and leaves it out.
     want_point: bool = False
+    # Ask for a face: a plain click takes the face under the cursor, no
+    # Ctrl+Shift needed, and its index lands in ctx.pick_faces.
+    want_face: bool = False
     # Leave the answer selected rather than letting go of it: what a
     # transform moves stays lit while you place it.
     keep: bool = False
@@ -359,6 +362,8 @@ class CommandContext:
         # object id -> the world point a click landed on it, for the current
         # selection prompt only (see SelectReq.want_point)
         self.pick_points: dict = {}
+        # object id -> the face index a click picked (see SelectReq.want_face)
+        self.pick_faces: dict = {}
         self.result_subobjects: list = []
         # set by the replay engine: the plane and aim a headless replay
         # answers with, standing in for the viewport that recorded them
@@ -1150,6 +1155,9 @@ class CommandProcessor:
         if isinstance(req, SelectReq):
             self._select_buffer = []
             self.ctx.pick_points = {}
+            self.ctx.pick_faces = {}
+            if req.want_face:
+                self.ctx.selection.clear()
             if (req.allow_preselected and self.ctx.selection.ids):
                 held = self.ctx.selection.objects()
                 pre = [o.id for o in held
@@ -1440,6 +1448,14 @@ class CommandProcessor:
             self.finish_selection()
         else:
             self._notify()
+
+    def click_face(self, obj_id: str, face_index: int):
+        """Pick a face for a selection prompt that wants one."""
+        req = self.request
+        if not isinstance(req, SelectReq) or not req.want_face:
+            return
+        self.ctx.pick_faces[obj_id] = int(face_index)
+        self.click_object(obj_id)
 
     def _select_text(self, text: str):
         req = self.request
