@@ -490,6 +490,7 @@ def _smooth_normals(verts: np.ndarray, tris: np.ndarray) -> np.ndarray:
 CURVE_ANGLE = math.radians(1.0)
 
 _BSPLINE_CURVE = GeomAbs_CurveType.GeomAbs_BSplineCurve
+_LINE = GeomAbs_CurveType.GeomAbs_Line
 
 
 def _polyline_of_degree_one(adaptor, bs) -> np.ndarray | None:
@@ -762,6 +763,74 @@ def _dot_discs(hatch, edge_count: int):
     return verts, norms, tris, segs, seg_ids
 
 
+def _triangle_faces_mesh(shape) -> DisplayMesh | None:
+    """The display mesh of a shape made only of flat, straight-edged
+    triangles, read straight off its vertices, or None for anything else.
+
+    A mesh turned into a Brep is a hundred thousand such faces, and
+    meshing and measuring each on its own took half a minute."""
+    from OCP.BRep import BRep_Tool
+    from OCP.Geom import Geom_Plane
+    from OCP.TopExp import TopExp
+
+    exp = TopExp_Explorer(shape, occ.FACE)
+    if not exp.More():
+        return None
+    corners, normals = [], []
+    reversed_kind = TopAbs_Orientation.TopAbs_REVERSED
+    while exp.More():
+        face = occ.to_face(exp.Current())
+        exp.Next()
+        plane = BRep_Tool.Surface_s(face)
+        if not isinstance(plane, Geom_Plane):
+            return None
+        points, count = [], 0
+        edges = TopExp_Explorer(face, occ.EDGE)
+        while edges.More():
+            edge = occ.to_edge(edges.Current())
+            edges.Next()
+            count += 1
+            if count > 3 or occ.edge_adaptor(edge).GetType() != _LINE:
+                return None
+            points.append(BRep_Tool.Pnt_s(TopExp.FirstVertex_s(edge, True))
+                          .Coord())
+        if count != 3:
+            return None
+        n = plane.Axis().Direction().Coord()
+        if face.Orientation() == reversed_kind:
+            n = (-n[0], -n[1], -n[2])
+        corners.append(points)
+        normals.append(n)
+
+    verts = np.asarray(corners, np.float64)                  # (F, 3, 3)
+    normals = np.asarray(normals, np.float64)
+    wound = np.cross(verts[:, 1] - verts[:, 0], verts[:, 2] - verts[:, 0])
+    backwards = np.einsum("ij,ij->i", wound, normals) < 0
+    verts[backwards] = verts[backwards][:, ::-1]
+    count = len(verts)
+
+    segments, seg_edge_ids = [], []
+    for edge_index, edge in enumerate(geometry.edges_of(shape)):
+        a = BRep_Tool.Pnt_s(TopExp.FirstVertex_s(edge)).Coord()
+        b = BRep_Tool.Pnt_s(TopExp.LastVertex_s(edge)).Coord()
+        segments.append((a, b))
+        seg_edge_ids.append(edge_index)
+
+    mesh = DisplayMesh()
+    mesh.place(vertices=verts.reshape(-1, 3),
+               edge_segments=np.asarray(segments, np.float64).reshape(-1, 2, 3)
+               if segments else None,
+               iso_segments=None, points=None)
+    mesh.normals = np.repeat(normals, 3, axis=0).astype(np.float32)
+    mesh.triangles = np.arange(count * 3, dtype=np.uint32).reshape(-1, 3)
+    mesh.curvature = np.zeros(count * 3, np.float32)
+    mesh.has_curvature = _CURVATURE
+    mesh.face_of_triangle = np.arange(count, dtype=np.int32)
+    if segments:
+        mesh.edge_of_segment = np.asarray(seg_edge_ids, np.int32)
+    return mesh
+
+
 def tessellate(shape, deflection: float | None = None) -> DisplayMesh:
     from .mesh import MeshShape, mesh_to_display
     from .pointcloud import PointCloudShape, cloud_to_display
@@ -789,6 +858,10 @@ def tessellate(shape, deflection: float | None = None) -> DisplayMesh:
     if isinstance(shape, DimensionShape):
         # its lines as they are, its figures filled like text
         shape = shape.drawn()
+    if outline is None and dots is None:
+        quick = _triangle_faces_mesh(shape)
+        if quick is not None:
+            return quick
     if geometry.shape_kind(shape) != "curve":
         BRepMesh_IncrementalMesh(shape, deflection, False, 0.35, True)
 
