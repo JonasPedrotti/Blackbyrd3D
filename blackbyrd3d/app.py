@@ -3643,6 +3643,17 @@ class MainWindow(QMainWindow):
             self.command_line.submit_input()
             ev.accept()
             return
+        # The Mac's delete key is Backspace to Qt, and laptops have no
+        # forward Delete, so Backspace deletes the selection too.
+        if (ev.key() == Qt.Key.Key_Backspace
+                and ev.modifiers() == Qt.KeyboardModifier.NoModifier
+                and not self.processor.busy
+                and not self.command_line.input.text()
+                and self.selection.ids
+                and getattr(self.active_viewport, "space", "model") == "model"):
+            self.run_command("delete")
+            ev.accept()
+            return
         if (text and text.isprintable()
                 and not ev.modifiers() & (
                     Qt.KeyboardModifier.ControlModifier
