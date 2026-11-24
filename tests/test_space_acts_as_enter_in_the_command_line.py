@@ -81,3 +81,55 @@ def test_space_is_a_space_when_a_command_asks_for_text():
         "Space must not have submitted the half-typed name"
     QTest.keyClick(w.command_line.input, Qt.Key.Key_Return)
     assert w.scene.layers.find_by_name("Ground floor") is not None
+
+
+# ------------------------------------------- with the viewport holding focus
+
+def _space_in_viewport(w):
+    w.viewport.setFocus()
+    QTest.keyClick(w.viewport, Qt.Key.Key_Space)
+
+
+def test_space_in_the_viewport_finishes_a_command():
+    w = _window()
+    w.processor.run("polyline")
+    for p in ("0,0,0", "10,0,0", "10,10,0"):
+        w.processor.provide_text(p)
+    assert w.processor.busy
+    _space_in_viewport(w)
+    assert not w.processor.busy, "Space should end the polyline like Enter"
+    assert len(w.scene.all()) == 1
+    assert w.command_line.input.text() == "", \
+        "no space character should land in the command line"
+
+
+def test_space_in_the_viewport_repeats_the_last_command():
+    w = _window()
+    _start_line_with_enter(w)
+    QTest.keyClick(w.command_line.input, Qt.Key.Key_Escape)
+    assert not w.processor.busy
+    _space_in_viewport(w)
+    assert w.processor.busy and w.processor.active.name == "line"
+    assert w.command_line.input.text() == ""
+
+
+def test_space_in_the_viewport_is_a_space_when_text_is_asked_for():
+    w = _window()
+    w.processor.run("layer")
+    w.processor.provide_text("New")
+    assert isinstance(w.processor.request, TextReq)
+    QTest.keyClicks(w.command_line.input, "Ground")
+    _space_in_viewport(w)
+    assert isinstance(w.processor.request, TextReq)
+    assert w.command_line.input.text() == "Ground "
+
+
+def test_enter_in_the_viewport_finishes_a_command():
+    w = _window()
+    w.processor.run("polyline")
+    for p in ("0,0,0", "10,0,0", "10,10,0"):
+        w.processor.provide_text(p)
+    w.viewport.setFocus()
+    QTest.keyClick(w.viewport, Qt.Key.Key_Return)
+    assert not w.processor.busy, "Enter should end the polyline"
+    assert len(w.scene.all()) == 1

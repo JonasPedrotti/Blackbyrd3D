@@ -15,6 +15,9 @@
   arrow sends the object or point to zero on that axis, on release.
 - **Units button in the status bar.** Click the units to pick new ones;
   with objects in the file it asks whether to scale them along.
+- **Space and Enter in the viewport** finish or repeat a command, as in the
+  command line.
+- **Double-clicked .wyrm files no longer crash** the app on launch.
 
 ## 0.1.0
 
