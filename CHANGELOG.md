@@ -11,6 +11,8 @@
   progress card. Joined faces now show as open or closed polysurface.
 - **Stacked bodies merge cleanly.** MergeAllCoplanarFaces removes the faces
   lying back to back between them, so their seams disappear.
+- **Typed coordinates on the gumball.** Typing `0,` while dragging a move
+  arrow sends the object or point to zero on that axis, on release.
 
 ## 0.1.0
 

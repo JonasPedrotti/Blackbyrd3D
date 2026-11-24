@@ -261,3 +261,33 @@ def test_the_point_can_still_be_dragged_by_itself(pane):
     pts = _points(vp, obj)
     assert pts[1][1] > 1.0, "the corner did not follow the mouse"
     assert _near(pts[0], CORNERS[0]) and _near(pts[2], CORNERS[2])
+
+
+def test_typing_a_coordinate_takes_the_point_there(pane):
+    vp, obj = pane
+    _click(vp, *_at(vp, obj, 2))
+    gb = _take(vp, ("move", 1))
+    for ch in "0", ",":
+        assert gb.type_char(ch)
+    assert gb.commit_typed()
+    pts = _points(vp, obj)
+    assert _near(pts[2], (10.0, 0.0, 0.0))
+    assert _near(pts[3], CORNERS[3])
+
+
+def test_letting_go_after_a_coordinate_commits_it(pane):
+    vp, obj = pane
+    _click(vp, *_at(vp, obj, 2))
+    anchor, axes = vp.gumball.anchor_and_axes()
+    size = vp.gumball._size_world(anchor)
+    px, py = _screen(vp, anchor + axes[1] * (SHAFT0 + CONE1) / 2 * size)
+    _press(vp, px, py)
+    _drag_to(vp, px, py - 30)
+    for ch in "0", ",":
+        assert vp.gumball.type_char(ch)
+    vp.mouseReleaseEvent(QMouseEvent(
+        QEvent.Type.MouseButtonRelease, QPointF(px, py - 30),
+        QPointF(px, py - 30), Qt.MouseButton.LeftButton,
+        Qt.MouseButton.NoButton, NONE))
+    assert vp.gumball.drag is None
+    assert _near(_points(vp, obj)[2], (10.0, 0.0, 0.0))

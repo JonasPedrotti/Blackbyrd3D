@@ -7421,14 +7421,17 @@ class Viewport(QOpenGLWidget):
         """Letting go of a handle: end the drag, or keep it live to type in.
 
         A click that never moved is someone asking to type an exact value, so
-        the handle stays armed and Enter commits it.
+        the handle stays armed and Enter commits it. A typed coordinate is
+        complete once its comma is in, so letting go commits it.
         """
         press = getattr(self, "_gumball_press", None)
         moved = (press is not None
                  and (ev.position() - press).manhattanLength() > 4)
         gb = self._live_gumball()
         d = gb.drag
-        if d["typed"] or (not moved and gb.accepts_typing()):
+        if d["typed"].endswith(",") and gb.commit_typed():
+            pass
+        elif d["typed"] or (not moved and gb.accepts_typing()):
             gb.arm()
         else:
             gb.end_drag()
@@ -8036,7 +8039,7 @@ class Viewport(QOpenGLWidget):
                 if gb.type_char("back"):
                     self.update()
                     return
-            elif ev.text() in "0123456789.-" and ev.text() \
+            elif ev.text() in "0123456789.-," and ev.text() \
                     and gb.accepts_typing():
                 gb.type_char(ev.text())
                 self.update()
