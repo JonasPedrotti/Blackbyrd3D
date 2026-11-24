@@ -1421,8 +1421,6 @@ class MainWindow(QMainWindow):
         self._action(m_help, "Command Reference", None, self.show_help_browser)
         self._action(m_help, "Check for Updates…", None,
                      self._check_updates_manual)
-        self._action(m_help, "Open .byrd and .wyrm Files with Blackbyrd3D",
-                     None, self._make_default_app)
         if sys.platform.startswith("linux") and os.environ.get("APPIMAGE"):
             self._action(m_help, "Remove Blackbyrd3D from the App Menu",
                          None, self._remove_from_desktop)
@@ -3374,11 +3372,6 @@ class MainWindow(QMainWindow):
     def _show_commands(self):
         names = ", ".join(c.name for c in cmd_pkg.all_commands())
         self.command_line.echo(f"Commands: {names}")
-
-    def _make_default_app(self):
-        from .utils import file_assoc
-        _, message = file_assoc.make_default()
-        self.command_line.echo(message)
 
     def _remove_from_desktop(self):
         from .utils import file_assoc
