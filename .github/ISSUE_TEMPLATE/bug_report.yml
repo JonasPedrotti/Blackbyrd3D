@@ -39,17 +39,6 @@ body:
       render: text
 
   - type: dropdown
-    id: install-method
-    attributes:
-      label: How did you install it?
-      options:
-        - AppImage
-        - pip install from source
-        - other (say below)
-    validations:
-      required: true
-
-  - type: dropdown
     id: version
     attributes:
       label: Blackbyrd3D version
