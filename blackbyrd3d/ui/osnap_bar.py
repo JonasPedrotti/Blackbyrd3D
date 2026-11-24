@@ -17,7 +17,7 @@ _TIPS = {
     "end": "Snap to curve endpoints",
     "point": "Snap to point objects and individual point-cloud samples",
     "mid": "Snap to curve midpoints",
-    "center": "Snap to circle/arc centers",
+    "center": "Snap to centers of circles, closed curves and faces",
     "quad": "Snap to circle quadrant points",
     "int": "Snap to curve-curve intersections",
     "appint": "Snap where two curves cross on screen without meeting",

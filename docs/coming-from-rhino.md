@@ -21,7 +21,9 @@ page maps your habits over and is honest about the gaps.
   _BothSides_, `box` _Center_, `sphere` _2Point_. Type the word (a prefix
   is enough) or click its chip beside the command line.
 - **Object snaps** — end, mid, cen, quad, int, perp, near — on a persistent
-  osnap bar, plus a construction plane (`cplane`). **Project** is there
+  osnap bar, plus a construction plane (`cplane`). Cen also finds the
+  middle of closed curves and of every face; `centroid` places a point at
+  an area or volume centroid. **Project** is there
   too, with a height of its own beside it instead of always the CPlane.
 - **++tab++ direction lock.** Aim, press ++tab++ to freeze that direction,
   type the distance. Object snaps keep working while it's held. The lock

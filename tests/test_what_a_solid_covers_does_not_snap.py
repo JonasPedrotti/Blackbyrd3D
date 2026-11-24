@@ -40,11 +40,12 @@ def _pick(vp, point):
 
 
 def test_an_end_behind_a_solid_does_not_snap(pane):
-    pane.scene.add(g.make_line((0, 10, 0), (20, 10, 0)))
-    assert _pick(pane, (0, 10, 0)) is None
-    hit = _pick(pane, (20, 10, 0))
+    # off the middle of the front face, which Cen offers
+    pane.scene.add(g.make_line((2, 10, 2), (20, 10, 2)))
+    assert _pick(pane, (2, 10, 2)) is None
+    hit = _pick(pane, (20, 10, 2))
     assert hit[1] == "end"
-    assert hit[0] == pytest.approx((20, 10, 0))
+    assert hit[0] == pytest.approx((20, 10, 2))
 
 
 def test_the_front_of_the_solid_and_what_lies_on_it_snap(pane):

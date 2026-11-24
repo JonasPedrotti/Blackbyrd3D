@@ -68,6 +68,7 @@ Commands that need a file open a filtered chooser by default. Append
 | `area` | Area |
 | `back` | Back |
 | `bottom` | Bottom |
+| `centroid` (`areacentroid`, `volumecentroid`) | Place a point at each object's centroid: the volume centroid of a solid, the area centroid of a surface or a closed planar curve. |
 | `clippingplane` (`clip`) | Place a rectangular clipping plane parallel to the CPlane through the first corner. |
 | `cplane` | Reposition the construction plane (drawing plane + grid). |
 | `curvature` | Curvature |
