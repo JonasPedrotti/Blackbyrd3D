@@ -10,6 +10,13 @@
   point at an area or volume centroid.
 - **Relocate the gumball.** Right-click, Ctrl+click or double-click its
   centre to move it anywhere; Ctrl+double-click resets it.
+- **Faces on surfaces stay put.** Moving a face of joined surfaces with
+  the gumball no longer deletes it; the faces beside it follow.
+- **Temporary guides.** Tap Ctrl while picking a point to drop a guide;
+  the cursor lines up with it, and the lines through two guides snap,
+  with Mid and Perp.
+- **Pushpull picks with a plain click.** It always asks for the face, and
+  a click on one goes straight to the distance.
 
 ## 0.2.1
 
