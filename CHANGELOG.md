@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.2.1
 
 - **Linux ARM AppImage.** Releases now include `Blackbyrd3D-aarch64.AppImage`
   for 64-bit ARM; E57 import is not available there yet.
