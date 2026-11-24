@@ -13,6 +13,8 @@
   lying back to back between them, so their seams disappear.
 - **Typed coordinates on the gumball.** Typing `0,` while dragging a move
   arrow sends the object or point to zero on that axis, on release.
+- **Units button in the status bar.** Click the units to pick new ones;
+  with objects in the file it asks whether to scale them along.
 
 ## 0.1.0
 

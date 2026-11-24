@@ -173,6 +173,7 @@ class MainWindow(QMainWindow):
         self._space_tab_row.setParent(self.viewport_area)
         from .ui.command_workspace import LastMessage, StatusLine
         self._status_line = StatusLine()
+        self._status_line.unitsChosen.connect(self._choose_units)
         self.osnap_bar.set_trailing(self._status_line)
         self.last_message = LastMessage(self.command_line,
                                         self.command_workspace.show_history)
@@ -3530,12 +3531,32 @@ class MainWindow(QMainWindow):
                     + ", ".join(sorted(self.selection.filter_kinds)))
         self.statusBar().showMessage(
             f"{n} object(s)  ·  {sel} selected  ·  layer: {layer}  ·  "
-            f"{mode}  ·  units: {self.scene.units}{filt}")
+            f"{mode}{filt}")
+        self._status_line.set_units(self.scene.units)
         path = getattr(self.ctx, "current_path", None)
         name = os.path.basename(path) if path else "untitled"
         star = "*" if getattr(self, "autosave", None) and self.dirty else ""
         self.setWindowTitle(f"{name}{star} — {APP_TITLE}")
         self._title_bar.set_document_title(f"{name}{star}")
+
+    def _choose_units(self, choice: str):
+        from .commands.view import set_units, units_factor
+        from .ui import units_prompt
+        if choice == self.scene.units:
+            return
+        rescale = False
+        if self.scene.all():
+            answer = units_prompt.ask_scale_for_units(
+                self, units_factor(self.scene.units, choice),
+                self.scene.units, choice)
+            if answer == units_prompt.CANCEL:
+                return
+            rescale = answer == units_prompt.SCALE
+        if self.processor.busy:
+            self.processor.cancel()
+        set_units(self.ctx, choice, rescale)
+        self._repaint_panes()
+        self._update_status()
 
     def _match_user_shortcut(self, ev) -> bool:
         try:
