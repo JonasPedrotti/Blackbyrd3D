@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.2.0
 
 - **Faster opening.** Display meshes are saved in `.byrd` files and
   viewports share their GPU buffers.
