@@ -297,6 +297,20 @@ def _integration(face, volume: bool):
     return face, 1e-8 if spans <= _FEW_SPANS else 1e-6
 
 
+_FACES_PER_CALL = 4000
+
+
+def _flat_and_plain(shape, surfaces) -> bool:
+    """Whether every face is a plane and every edge one smooth piece,
+    so _integration would leave each face to the default integration."""
+    from OCP.Geom import Geom_Plane
+    if not surfaces or not all(isinstance(s, Geom_Plane) for s in surfaces):
+        return False
+    edges = map_shapes(shape, EDGE)
+    return all(_one_piece(BRepAdaptor_Curve(TopoDS.Edge_s(edges.FindKey(i))))
+               for i in range(1, edges.Extent() + 1))
+
+
 def _middle(shape) -> gp_Pnt:
     """The mean of `shape`'s vertices, as BRepGProp's roughBaryCenter."""
     xyz, n = gp_XYZ(0, 0, 0), 0
@@ -316,10 +330,29 @@ def _integrated(shape, inertia) -> GProp_GProps:
     origin = gp_Pnt(0, 0, 0).Transformed(shape.Location().Transformation())
     props = GProp_GProps(origin)
     faces = _faces(shape)
-    if any(BRep_Tool.Surface_s(f) is None for f in faces):
+    surfaces = [BRep_Tool.Surface_s(f) for f in faces]
+    if any(s is None for s in surfaces):
         # a face with only a mesh, which BRepGProp measures from the mesh
         whole = BRepGProp.VolumeProperties_s if volume else BRepGProp.SurfaceProperties_s
         whole(shape, props)
+        return props
+    if not volume and _flat_and_plain(shape, surfaces):
+        # Every face would go to the default integration below anyway, so
+        # BRepGProp can have them, which on the hundred thousand triangles
+        # of a converted mesh took three seconds where the loop took ten. In
+        # batches, so a measurement running in the background lets the
+        # interface thread in between. Not for a volume: BRepGProp puts each
+        # batch's apex at its own middle, and an open piece's share of a
+        # volume depends on where that is.
+        builder = BRep_Builder()
+        for start in range(0, len(faces), _FACES_PER_CALL):
+            batch = TopoDS_Compound()
+            builder.MakeCompound(batch)
+            for face in faces[start:start + _FACES_PER_CALL]:
+                builder.Add(batch, face)
+            part = GProp_GProps(origin)
+            BRepGProp.SurfaceProperties_s(batch, part)
+            props.Add(part)
         return props
     at = _middle(shape)
     for face in faces:

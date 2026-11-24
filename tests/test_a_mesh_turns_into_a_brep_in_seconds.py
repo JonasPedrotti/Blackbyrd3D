@@ -99,3 +99,52 @@ def test_the_command_converts_without_a_window():
     assert not proc.busy
     assert scene.get(obj.id).kind == "surface"
     assert scene.get(obj.id).mesh_ready
+
+
+def test_a_flat_shell_measures_as_face_by_face_did(monkeypatch):
+    from blackbyrd3d.core import occ
+    rng = np.random.default_rng(5)
+    v = rng.random((200, 3)) * 10
+    t = np.array([rng.choice(200, 3, replace=False) for _ in range(9000)])
+    shell = brep_from_mesh(MeshShape(v, t))
+    quick = occ.surface_properties(shell)
+    monkeypatch.setattr(occ, "_flat_and_plain", lambda *a: False)
+    slow = occ.surface_properties(shell)
+    assert quick.Mass() == pytest.approx(slow.Mass(), rel=1e-12)
+    assert quick.CentreOfMass().Distance(slow.CentreOfMass()) < 1e-9
+
+
+def test_a_big_shell_is_measured_off_the_interface_thread():
+    import threading
+    import time
+    from PySide6.QtWidgets import QApplication
+    from blackbyrd3d.ui.properties import PropertiesPanel
+    QApplication.instance() or QApplication([])
+    scene = Scene()
+    sel = SelectionManager(scene)
+    panel = PropertiesPanel(scene, sel, History(scene))
+    panel.measure_delay_ms = 0
+    panel.measure_apart_faces = 10
+    threads = []
+    real = g.surface_area
+
+    def seen(shape):
+        threads.append(threading.current_thread())
+        return real(shape)
+
+    try:
+        g.surface_area = seen
+        obj = scene.add(brep_from_mesh(MeshShape(CUBE_V, CUBE_T)))
+        sel.set([obj.id])
+        deadline = time.monotonic() + 10
+        while "Area" not in panel.measure_label.text():
+            assert time.monotonic() < deadline, panel.measure_label.text()
+            QApplication.processEvents()
+            time.sleep(0.01)
+        assert "6.000" in panel.measure_label.text()
+        assert threads and threading.main_thread() not in threads
+    finally:
+        g.surface_area = real
+        panel._measure_timer.stop()
+        panel.deleteLater()
+        QApplication.processEvents()

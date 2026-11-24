@@ -1005,6 +1005,10 @@ class PropertiesPanel(QWidget):
     # none of what you pass over, short enough that resting on something
     # feels like it answered at once.
     measure_delay_ms = 150
+    # From this many faces up, the measuring happens on a thread of its own:
+    # a mesh turned into a Brep is a hundred thousand faces and seconds of
+    # work, which held the whole window still the first time it was picked.
+    measure_apart_faces = 1000
 
     modelTextChanged = Signal(str, str)
     textTypographyChanged = Signal(str, object)
@@ -1017,6 +1021,8 @@ class PropertiesPanel(QWidget):
     hatchPatternsRequested = Signal(str)
     # a button on the view page that picks in the model: the command to run
     viewCommandRequested = Signal(str)
+    # (object id, scene revision, text) from a measurement made on a thread
+    _measuredApart = Signal(str, object, str)
 
     def __init__(self, scene, selection, history, parent=None,
                  viewport_source=None, panes_source=None,
@@ -1040,6 +1046,9 @@ class PropertiesPanel(QWidget):
         self._measure_timer.setSingleShot(True)
         self._measure_timer.timeout.connect(self._measure_settled)
         self._measuring: tuple | None = None      # (object id, revision)
+        self._measure_pool = None
+        self._measuring_apart: set = set()        # (object id, revision)
+        self._measuredApart.connect(self._landed_apart)
         self._live_text_id = None
         self._text_checkpoint_id = None
         self._text_edit_selection_id = None
@@ -3153,7 +3162,49 @@ class PropertiesPanel(QWidget):
         current = self._selected()
         if current is None or current.id != obj_id:
             return                       # you have picked something else
+        if self._many_faces(obj):
+            self._measure_apart(obj, revision)
+            return
         self.measure_label.setText(self._remember(obj, revision))
+
+    def _many_faces(self, obj) -> bool:
+        from ..core import occ
+        shape = obj.shape
+        try:
+            return (isinstance(shape, occ.TopoDS_Shape)
+                    and occ.map_shapes(shape, occ.FACE).Extent()
+                    >= self.measure_apart_faces)
+        except Exception:                                  # noqa: BLE001
+            return False
+
+    def _measure_apart(self, obj, revision):
+        key = (obj.id, revision)
+        if key in self._measuring_apart:
+            return
+        self._measuring_apart.add(key)
+        if self._measure_pool is None:
+            from concurrent.futures import ThreadPoolExecutor
+            self._measure_pool = ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="byrd-measure")
+
+        def work():
+            text = self._measured_now(obj)
+            try:
+                self._measuredApart.emit(obj.id, revision, text)
+            except RuntimeError:
+                pass                     # the panel went while it measured
+        self._measure_pool.submit(work)
+
+    def _landed_apart(self, obj_id, revision, text):
+        self._measuring_apart.discard((obj_id, revision))
+        if getattr(self.scene, "revision", 0) != revision:
+            return                       # the drawing changed meanwhile
+        if len(self._measured) > 512:
+            self._measured.clear()
+        self._measured[obj_id] = (revision, text)
+        current = self._selected()
+        if current is not None and current.id == obj_id:
+            self.measure_label.setText(text)
 
     def _measured_now(self, obj) -> str:
         fmt = self.scene.format_length

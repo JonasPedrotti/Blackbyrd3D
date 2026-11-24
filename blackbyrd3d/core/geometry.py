@@ -851,16 +851,20 @@ def sweep_adds_nothing(shape, direction: Point) -> bool:
                  u[0] * d[1] - u[1] * d[0])
         return math.sqrt(sum(v * v for v in cross)) < 1e-9
     if kind == "surface":
-        faces = faces_of(shape)
-        if not faces:
+        # Face by face as they come, not faces_of: the gumball asks this
+        # while it paints, and a converted mesh has a hundred thousand faces
+        # where the first one usually answers.
+        exp = TopExp_Explorer(shape, occ.FACE)
+        if not exp.More():
             return False
-        for f in faces:
+        while exp.More():
             try:
-                n = face_normal(f)
+                n = face_normal(occ.to_face(exp.Current()))
             except GeometryError:
                 return False              # not planar: it has somewhere to go
             if abs(sum(n[i] * d[i] for i in range(3))) > 1e-9:
                 return False
+            exp.Next()
         return True
     return False
 
