@@ -28,9 +28,30 @@ SWATCH = 9                  # diameter of the colour dot, in pixels
 PAD_X = 11
 
 
-def kind_label(kind: str) -> str:
-    """What an object's kind is called in front of a person."""
+def kind_label(kind: str, shape=None) -> str:
+    """What an object's kind is called in front of a person. Given the
+    shape, a surface of several faces joined is called a polysurface, as
+    Rhino calls it: a mesh turned into a Brep is a hundred thousand of them,
+    and "Surface" said it was one."""
+    if kind == "surface" and _joined_faces(shape):
+        return ("Closed polysurface" if shape.Closed()
+                else "Open polysurface")
     return "Point cloud" if kind == "pointcloud" else kind.capitalize()
+
+
+def _joined_faces(shape) -> bool:
+    from OCP.TopAbs import TopAbs_ShapeEnum
+    from OCP.TopExp import TopExp_Explorer
+    from OCP.TopoDS import TopoDS_Shape
+    if not isinstance(shape, TopoDS_Shape) \
+            or shape.ShapeType() != TopAbs_ShapeEnum.TopAbs_SHELL:
+        return False
+    faces = TopExp_Explorer(shape, TopAbs_ShapeEnum.TopAbs_FACE)
+    for _ in range(2):
+        if not faces.More():
+            return False
+        faces.Next()
+    return True
 
 
 @dataclass(frozen=True)
@@ -54,7 +75,7 @@ def chooser_rows(scene, ids) -> list[ChoiceRow]:
         if obj is None:
             continue
         rows.append(ChoiceRow(obj_id=obj.id, name=obj.name,
-                              kind=kind_label(obj.kind),
+                              kind=kind_label(obj.kind, obj.shape),
                               color=scene.color_of(obj)))
     return rows
 

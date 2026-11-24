@@ -7115,8 +7115,9 @@ class Viewport(QOpenGLWidget):
         rows, by_id = [], {}
         for entry in stacked:
             obj = self.scene.get(entry[0])
+            whose = kind_label(obj.kind, obj.shape).lower()
             rows.append(ChoiceRow(obj_id=obj.id, name=obj.name,
-                                  kind=f"Point of {kind_label(obj.kind).lower()}",
+                                  kind=f"Point of {whose}",
                                   color=self.scene.color_of(obj)))
             by_id[obj.id] = entry
         self._press_pos = None
@@ -7159,10 +7160,10 @@ class Viewport(QOpenGLWidget):
             return True
         from .object_chooser import ChoiceRow, ObjectChooser, kind_label
         color = self.scene.color_of(obj)
+        whole = kind_label(obj.kind, obj.shape).lower()
         rows = [ChoiceRow(obj_id="part", name=_part_name(obj, kind),
                           kind=obj.name, color=color),
-                ChoiceRow(obj_id="whole",
-                          name=f"Whole {kind_label(obj.kind).lower()}",
+                ChoiceRow(obj_id="whole", name=f"Whole {whole}",
                           kind=obj.name, color=color)]
         self._press_pos = None
         menu = ObjectChooser(rows, self)
