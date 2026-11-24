@@ -102,9 +102,7 @@ fi
 
 # setuptools copies the packages it is told to build into build/lib and never
 # takes anything out again, but the wheel is zipped from whatever it finds
-# there. The package was renamed (serpentine3d -> blackbyrd3d) and the old tree stayed put, so
-# every wheel after the rename also shipped 73 files of dead code under the old
-# top-level name. Staging is pure copying for a pure-Python package; rebuilding
+# there, so a renamed or deleted package would ride along in every wheel. Staging is pure copying for a pure-Python package; rebuilding
 # it from scratch costs a second and removes the whole class of problem.
 rm -rf "$ROOT/build"
 
@@ -126,7 +124,7 @@ if [ -n "$BUILT" ]; then
     ( cd "$PROBE" && "$BUILT" --appimage-extract > /dev/null 2>&1 )
     SITE_PACKAGES="$PROBE/squashfs-root/opt/python$PYVER/lib/python$PYVER/site-packages"
     STOWAWAYS="$(
-        for PACKAGE in "$SITE_PACKAGES"/{serpentine,blackbyrd}*; do
+        for PACKAGE in "$SITE_PACKAGES"/blackbyrd*; do
             [ -f "$PACKAGE/__init__.py" ] || continue
             basename "$PACKAGE"
         done | sort -u | grep -vx 'blackbyrd3d' || true

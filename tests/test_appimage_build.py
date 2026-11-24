@@ -50,9 +50,8 @@ def test_clears_the_cache_before_the_build_runs_not_after():
 def test_clears_setuptools_staging_before_building():
     """setuptools copies the packages it is told to build into build/lib and
     never takes anything out again, but the wheel is zipped from whatever is
-    in there. The package was renamed serpentine3d -> blackbyrd3d and the old
-    tree stayed behind, so every wheel since shipped 73 files of dead code
-    under the old top-level name."""
+    in there, so a renamed or deleted package keeps riding along in every
+    wheel."""
     text = _text()
     purge = text.find('rm -rf "$ROOT/build"')
     build = text.find("build app --python-version")

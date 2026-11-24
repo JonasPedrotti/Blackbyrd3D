@@ -4,9 +4,7 @@ Both hand the repo root to pip to get a real (non-editable) install that
 PyInstaller can trace. That goes through the same setuptools staging directory
 as every other build, and setuptools never takes anything out of it — so a
 package that has been renamed or deleted keeps being installed into the build
-venv long after it stopped existing in the tree. The AppImage build shipped
-`serpentine` for a fortnight after the rename to `serpentine3d` for exactly
-this reason.
+venv long after it stopped existing in the tree.
 
 Neither spec sweeps whole packages in (`hiddenimports=[]`, no `collect_all`),
 so PyInstaller drops what nothing imports and the ghost never reached the

@@ -4,6 +4,8 @@
 
 - **Linux ARM AppImage.** Releases now include `Blackbyrd3D-aarch64.AppImage`
   for 64-bit ARM; E57 import is not available there yet.
+- **Linux uninstall leaves Serpentine3D alone.** Removing Blackbyrd3D from
+  the desktop no longer deletes a Serpentine3D launcher or AppImage.
 
 ## 0.2.0
 
