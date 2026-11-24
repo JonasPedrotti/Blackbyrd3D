@@ -96,14 +96,16 @@ def _deploy_fonts():
     database comes up empty and every family query misses — the monospace
     kind line resolves to a proportional face and the scripted-text tests
     get no glyph outlines at all. Qt asks shipped apps to deploy fonts;
-    the test's app deploys this machine's own fixed-pitch ones."""
+    the test's app deploys this machine's own fixed-pitch ones, and Arial
+    in all four styles for the lettering tests."""
     from PySide6.QtGui import QFontDatabase
     if QFontDatabase.families():
         return
     import os
     fonts_dir = os.path.join(os.environ.get("WINDIR", r"C:\Windows"),
                              "Fonts")
-    for name in ("consola.ttf", "consolab.ttf", "cour.ttf"):
+    for name in ("consola.ttf", "consolab.ttf", "cour.ttf",
+                 "arial.ttf", "arialbd.ttf", "ariali.ttf", "arialbi.ttf"):
         path = os.path.join(fonts_dir, name)
         if os.path.exists(path):
             QFontDatabase.addApplicationFont(path)
