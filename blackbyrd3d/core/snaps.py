@@ -217,6 +217,41 @@ def _static_snap_points(shape) -> list[tuple[tuple, str]]:
                         add(q[0], q[1], q[2], "quad")
         except Exception:
             continue
+    for c in _area_centers(shape):
+        add(*c, "center")
+    return out
+
+
+# Every face of a surface or solid offers its middle to Cen, while there
+# are few enough faces for that to stay quick.
+FACE_CENTERS_UP_TO = 500
+
+
+def _area_centers(shape) -> list[tuple]:
+    """Cen on what encloses an area: the middle of each face, and of the
+    region a closed planar curve bounds (a rectangle, a closed polyline)."""
+    kind = geometry.shape_kind(shape)
+    if kind == "curve":
+        try:
+            if not geometry.is_closed_curve(shape):
+                return []
+            region = geometry.planar_face(shape)
+        except Exception:                                  # noqa: BLE001
+            return []
+        faces = [region]
+    elif kind in ("surface", "solid"):
+        faces = geometry.faces_of(shape)
+        if len(faces) > FACE_CENTERS_UP_TO:
+            return []
+    else:
+        return []
+    out = []
+    for face in faces:
+        try:
+            out.append(geometry.pnt_tuple(
+                occ.surface_properties(face).CentreOfMass()))
+        except Exception:                                  # noqa: BLE001
+            continue
     return out
 
 
@@ -573,6 +608,10 @@ class SnapIndex:
         # this session only: every launch starts with it off, at 0.
         self.project_enabled = False
         self.project_z = 0.0
+        self.ortho = bool(config.get("ortho")) if config else False
+        self.grid_snap = bool(config.get("grid_snap")) if config else False
+        self.grid_snap_step = (float(config.get("grid_snap_step", default=1.0))
+                               if config else 1.0)
         if config is not None:
             osnaps = config.get("osnaps", default={}) or {}
             self.enabled = bool(osnaps.get("enabled", True))

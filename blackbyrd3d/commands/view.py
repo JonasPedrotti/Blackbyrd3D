@@ -2,6 +2,7 @@
 
 from ..core import clipping as _clipping
 from ..core import geometry as g
+from ..core import occ
 from .base import (
     FileReq, OptionReq, PointReq, SelectReq, TextReq, command, frame_sides,
 )
@@ -818,6 +819,35 @@ def cmd_volume(ctx):
     objs = yield SelectReq("Select solids", kinds=("solid",))
     total = sum(g.volume(o.shape) for o in objs)
     ctx.echo(f"Volume: {total:.4f} {ctx.scene.units}³")
+
+
+@command("centroid", aliases=("areacentroid", "volumecentroid"))
+def cmd_centroid(ctx):
+    """Place a point at each object's centroid: the volume centroid of a
+    solid, the area centroid of a surface or a closed planar curve."""
+    objs = yield SelectReq("Select solids, surfaces or closed planar curves",
+                           kinds=("solid", "surface", "curve"))
+    placed, skipped = 0, 0
+    for o in objs:
+        kind = g.shape_kind(o.shape)
+        try:
+            if kind == "solid":
+                at = g.pnt_tuple(occ.volume_properties(o.shape).CentreOfMass())
+            elif kind == "surface":
+                at = g.pnt_tuple(occ.surface_properties(o.shape).CentreOfMass())
+            else:
+                region = g.planar_face(o.shape)
+                at = g.pnt_tuple(occ.surface_properties(region).CentreOfMass())
+        except Exception:                                  # noqa: BLE001
+            skipped += 1
+            continue
+        ctx.add(g.make_point(at))
+        placed += 1
+        what = "Volume" if kind == "solid" else "Area"
+        ctx.echo(f"{what} centroid of {o.name}: "
+                 f"({at[0]:.4f}, {at[1]:.4f}, {at[2]:.4f})")
+    if skipped:
+        ctx.echo(f"Skipped {skipped}: an open or non-planar curve has no area.")
 
 
 @command("length", aliases=("len",), mutates=False)

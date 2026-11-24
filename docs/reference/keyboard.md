@@ -98,7 +98,7 @@ Nothing is bound out of the box.
 | ++ctrl+l++ / ++ctrl+shift+l++ | Lock selection / unlock all objects |
 | ++ctrl+t++ | Trim |
 | ++ctrl+j++ | Join |
-| ++delete++ | Delete selection |
+| ++delete++ / ++backspace++ | Delete selection (the delete key on a Mac) |
 | ++ctrl+p++ | Export the current sheet to PDF |
 | ++ctrl+comma++ | Settings |
 

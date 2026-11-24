@@ -21,7 +21,9 @@ page maps your habits over and is honest about the gaps.
   _BothSides_, `box` _Center_, `sphere` _2Point_. Type the word (a prefix
   is enough) or click its chip beside the command line.
 - **Object snaps** — end, mid, cen, quad, int, perp, near — on a persistent
-  osnap bar, plus a construction plane (`cplane`). **Project** is there
+  osnap bar, plus a construction plane (`cplane`). Cen also finds the
+  middle of closed curves and of every face; `centroid` places a point at
+  an area or volume centroid. **Project** is there
   too, with a height of its own beside it instead of always the CPlane.
 - **++tab++ direction lock.** Aim, press ++tab++ to freeze that direction,
   type the distance. Object snaps keep working while it's held. The lock
@@ -37,7 +39,11 @@ page maps your habits over and is honest about the gaps.
   `GumballAlignment`, or the small tag beside the gumball, chooses CPlane,
   Object, World or View. Object follows a line, a planar curve or surface,
   text, a hatch or a picture; solids and selections of several objects use
-  the CPlane. View follows the current viewport's view plane.
+  the CPlane. View follows the current viewport's view plane. Right-click
+  the gumball's centre to relocate it, or ++ctrl++-click or double-click
+  it to start at once: it follows the cursor, snaps, and stays where you
+  click until you reset it (++ctrl++ and a double-click) or pick something
+  else.
 - **Layers**, display modes (`wireframe` / `shaded` / `ghosted` / `rendered`
   / `technical`), and **linetypes** per layer or object.
 - **Surface isocurves and edges are yours to switch off**, as they are in
