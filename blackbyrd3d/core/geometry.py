@@ -521,10 +521,21 @@ def merge_coplanar_faces(shape) -> TopoDS_Shape:
     them so the box has its six faces again. It is a change of description,
     not of the solid, so the volume is left exactly where it was.
 
-    ShapeUpgrade_UnifySameDomain does both halves of the tidy-up: unify the
-    faces that share a surface, and unify the edges that share a curve so
-    the redundant seams do not linger as splits in the remaining faces.
+    A shape of planes and lines goes through core.coplanar, which does in
+    seconds what took a converted mesh a minute and a half here. Anything
+    else goes to ShapeUpgrade_UnifySameDomain, which does both halves of the
+    tidy-up: unify the faces that share a surface, and unify the edges that
+    share a curve so the redundant seams do not linger as splits.
     """
+    from .coplanar import merge_flat
+    merged = merge_flat(shape)
+    if merged is not None:
+        return merged.shape
+    return unify_same_domain(shape)
+
+
+def unify_same_domain(shape) -> TopoDS_Shape:
+    """merge_coplanar_faces the slow way, for faces of any surface."""
     from OCP.ShapeUpgrade import ShapeUpgrade_UnifySameDomain
     up = ShapeUpgrade_UnifySameDomain(shape, True, True, False)
     up.Build()
