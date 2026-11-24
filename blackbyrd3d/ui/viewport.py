@@ -6766,6 +6766,10 @@ class Viewport(QOpenGLWidget):
             editor.deleteLater()
 
     def mouseDoubleClickEvent(self, ev):
+        if (not self.point_mode and ev.button() == Qt.MouseButton.LeftButton
+                and self._double_click_gumball(ev)):
+            ev.accept()
+            return
         if (self.space != "model" and not self.point_mode
                 and ev.button() == Qt.MouseButton.LeftButton):
             pos = ev.position()
@@ -7008,6 +7012,10 @@ class Viewport(QOpenGLWidget):
         press on one means what it means anywhere else.
         """
         gb = self._live_gumball()
+        if getattr(gb, "relocating", False):
+            gb.finish_relocate(pos.x(), pos.y())
+            self.update()
+            return True
         handle = gb.hit_test(pos.x(), pos.y())
         if handle is None:
             return False
@@ -7017,9 +7025,39 @@ class Viewport(QOpenGLWidget):
         self.update()
         return True
 
-    def _move_gumball(self, pos, ev) -> bool:
-        """Whether the mouse move was the gumball's: a drag, or a hover."""
+    def _double_click_gumball(self, ev) -> bool:
+        """A double-click on the pivot relocates the gumball, with Ctrl it
+        resets it. The first click of a Ctrl double-click has already
+        started relocating, which the reset takes back."""
         gb = self._live_gumball()
+        if not hasattr(gb, "start_relocate"):
+            return False
+        pos = ev.position()
+        ctrl = bool(ev.modifiers() & Qt.KeyboardModifier.ControlModifier)
+        if ctrl and gb.relocating:
+            gb.cancel_relocate()
+            gb.reset_pivot()
+            self.update()
+            return True
+        if gb.relocating or gb.hit_test(pos.x(), pos.y()) != ("center", 0):
+            return False
+        if gb.drag is not None:
+            gb.cancel_drag()
+        if ctrl:
+            gb.reset_pivot()
+        else:
+            gb.start_relocate()
+        self.update()
+        return True
+
+    def _move_gumball(self, pos, ev) -> bool:
+        """Whether the mouse move was the gumball's: a drag, a hover, or a
+        relocated pivot following the cursor."""
+        gb = self._live_gumball()
+        if getattr(gb, "relocating", False):
+            gb.relocate_to(pos.x(), pos.y())
+            self.update()
+            return True
         if gb.drag is not None \
                 and ev.buttons() & Qt.MouseButton.LeftButton:
             label = gb.drag_to(pos.x(), pos.y(), ev.modifiers())
@@ -8086,6 +8124,10 @@ class Viewport(QOpenGLWidget):
                 and self._nudge(d):
             return
         if ev.key() == Qt.Key.Key_Escape:
+            if self.gumball.relocating:
+                self.gumball.cancel_relocate()
+                self.update()
+                return
             if self.gumball.drag is not None:
                 self.gumball.cancel_drag()
                 self.update()

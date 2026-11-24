@@ -108,6 +108,10 @@ class Gumball:
         self._spans: dict = {}         # (state, axes, lo, hi) per shape
         self._align = None             # only when there is no config to ask
         self._menu = None              # the alignment menu while it is open
+        # While the pivot follows the cursor: where it was before, so
+        # Escape can put it back (None for the default place).
+        self.relocating = False
+        self._pivot_before = None
 
     # ------------------------------------------------------------ settings
 
@@ -220,11 +224,121 @@ class Gumball:
             act.setData(value)
             group.addAction(act)
             menu.addAction(act)
-        menu.triggered.connect(lambda a: self.set_align(a.data()))
+        menu.addSeparator()
+        relocate = QAction("Relocate gumball", menu)
+        relocate.setData("relocate")
+        relocate.setEnabled(self._pivot_key() is not None)
+        menu.addAction(relocate)
+        reset = QAction("Reset gumball", menu)
+        reset.setData("reset")
+        reset.setEnabled(self._pivot() is not None)
+        menu.addAction(reset)
+        menu.triggered.connect(self._menu_chosen)
         menu.aboutToHide.connect(lambda: setattr(self, "_menu", None))
         self._menu = menu
         menu.popup(vp.mapToGlobal(QPoint(int(px), int(py))))
         return menu
+
+    def _menu_chosen(self, action):
+        value = action.data()
+        if value == "relocate":
+            self.start_relocate()
+        elif value == "reset":
+            self.reset_pivot()
+        else:
+            self.set_align(value)
+
+    # ------------------------------------------------------------- pivot
+
+    def _pivot_key(self):
+        """The objects a relocated pivot would belong to, or None where
+        the gumball sits on a held face, edge, point or segment."""
+        sel = self.vp.selection
+        if getattr(sel, "subobjects", None):
+            return None
+        ids = sel.ids
+        if not ids or self._tf_target() is not None                 or self._cv_target() is not None                 or self._segment_target() is not None:
+            return None
+        return frozenset(ids)
+
+    def _pivot(self):
+        """Where the gumball was relocated to for what is picked, or None."""
+        sel = self.vp.selection
+        pivot = getattr(sel, "gumball_pivot", None)
+        if pivot is None or pivot[0] != frozenset(sel.ids)                 or getattr(sel, "subobjects", None):
+            return None
+        return np.asarray(pivot[1], float)
+
+    def _set_pivot(self, at):
+        sel = self.vp.selection
+        sel.gumball_pivot = (None if at is None else
+                             (frozenset(sel.ids), tuple(float(c) for c in at)))
+        self._repaint_panes()
+
+    def start_relocate(self) -> bool:
+        """Let the gumball follow the cursor until a click sets it down."""
+        if self._pivot_key() is None or self.drag is not None:
+            return False
+        state = self.anchor_and_axes()
+        if state is None:
+            return False
+        self._pivot_before = self._pivot()
+        self._relocate_normal = self._center_normal(state[0])
+        self._set_pivot(state[0])
+        self.relocating = True
+        self._echo("Click where the gumball goes (Escape cancels).")
+        return True
+
+    def relocate_to(self, px, py) -> bool:
+        """Carry the pivot to the snap or plane point under the cursor."""
+        if not self.relocating:
+            return False
+        vp = self.vp
+        at = None
+        snaps = getattr(vp, "snaps", None)
+        if snaps is not None:
+            hider = getattr(vp, "snap_hider", None)
+            snap = snaps.find(vp._eye(), px, py, vp.width(), vp.height(),
+                              hidden=hider() if hider else None)
+            vp._active_snap = snap
+            if snap is not None:
+                at = np.asarray(snap[0], float)
+        if at is None:
+            pivot = self._pivot()
+            if pivot is None:
+                return False
+            origin, direction = vp._eye().ray_through(px, py, vp.width(),
+                                                      vp.height())
+            at = ray_plane_any(origin, direction, pivot,
+                               self._relocate_normal)
+            if at is None:
+                return False
+        self._set_pivot(at)
+        return True
+
+    def finish_relocate(self, px=None, py=None):
+        if px is not None:
+            self.relocate_to(px, py)
+        self.relocating = False
+        self._pivot_before = None
+        self.vp._active_snap = None
+        self._repaint_panes()
+
+    def cancel_relocate(self):
+        before = self._pivot_before
+        self.relocating = False
+        self._pivot_before = None
+        self.vp._active_snap = None
+        self._set_pivot(before)
+
+    def reset_pivot(self):
+        self._set_pivot(None)
+
+    def _echo(self, text):
+        window = getattr(self.vp, "window", lambda: None)()
+        line = getattr(window, "command_line", None)
+        if line is not None:
+            line.echo(text)
 
     def _foreign_axes(self):
         """The world, CPlane or view axes when asked for, else None."""
@@ -1074,6 +1188,11 @@ class Gumball:
             # over a whole drawing costs more than the measuring used to.
             boxes = np.array([o.bbox() for o in objs], float)
             anchor = (boxes[:, 0].min(axis=0) + boxes[:, 1].max(axis=0)) / 2
+            pivot = self._pivot()
+            if pivot is not None:
+                anchor = pivot
+                if self.drag is not None and                         self.drag["handle"][0] in ("move", "pad", "center"):
+                    anchor = pivot + np.asarray(self.drag["offset"], float)
         if self.align == "world" and self.vp._detail_eye() is None:
             return anchor, (np.array([1.0, 0.0, 0.0]),
                             np.array([0.0, 1.0, 0.0]),
@@ -1653,7 +1772,12 @@ class Gumball:
     # ----------------------------------------------------------- dragging
 
     def context_menu(self, px, py) -> bool:
-        """A right-click on the pivot offers the alignments."""
+        """A right-click on the pivot offers the alignments, and to
+        relocate or reset it (Ctrl and a click relocates at once). While
+        relocating, a right-click cancels."""
+        if self.relocating:
+            self.cancel_relocate()
+            return True
         if self.drag is not None or not self.active():
             return False
         if self.hit_test(px, py) != ("center", 0):
@@ -1671,6 +1795,9 @@ class Gumball:
         return normal
 
     def begin_drag(self, handle, px, py, modifiers) -> bool:
+        if handle == ("center", 0) and _ctrl_held(modifiers)                 and self._pivot_key() is not None:
+            # Ctrl and a click on the pivot: relocate it, no menu needed
+            return self.start_relocate()
         if handle == ("center", 0) and handle not in self.handles():
             # held faces and edges have no free move; the press is still
             # spent here so it does not pick what lies under the pivot
@@ -1844,7 +1971,10 @@ class Gumball:
                     new_objs.append(vp.scene.add(g.copy_shape(o.shape),
                                                  layer_id=o.layer_id))
                 copies = ([o.id for o in objs], [o.id for o in new_objs])
+                pivot = self._pivot()
                 vp.selection.set(copies[1])
+                if pivot is not None:
+                    self._set_pivot(pivot)
                 objs = new_objs
             originals = {o.id: o.shape for o in objs}
         self.drag = {
@@ -2710,6 +2840,10 @@ class Gumball:
             self.drag = None
             return
         if changed:
+            pivot = self._pivot()
+            if pivot is not None and d["handle"][0] in ("move", "pad",
+                                                        "center"):
+                self._set_pivot(pivot + np.asarray(d["offset"], float))
             if d.get("pp") and d.get("pp_planar", True):
                 self._resync_face(d)         # curved offsets keep their index
             elif d.get("edge_move"):

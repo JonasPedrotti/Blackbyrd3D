@@ -24,6 +24,10 @@ class SelectionManager:
         # draws them dimmed, so full gold still means "what Properties is
         # editing". Shared here for the reason `rebuilding` is.
         self.held = False
+        # Where the gumball was relocated to, as (ids, point), for these
+        # objects only: picking something else puts it back. Shared for
+        # the reason `rebuilding` is.
+        self.gumball_pivot = None
         self._listeners: list = []
         self.filter_kinds: set = set()   # e.g. {"curve"}; empty = any
         self.filter_active = False       # F6-style master toggle
@@ -46,6 +50,9 @@ class SelectionManager:
         cannot drift apart."""
         self._ids = list(ids)
         self._index = set(self._ids)
+        if (self.gumball_pivot is not None
+                and self.gumball_pivot[0] != frozenset(self._ids)):
+            self.gumball_pivot = None
 
     @property
     def ids(self) -> list[str]:

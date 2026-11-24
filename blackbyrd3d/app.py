@@ -1485,6 +1485,12 @@ class MainWindow(QMainWindow):
 
     def _cancel(self):
         self._pending_import_paths.clear()
+        relocating = [vp.gumball for vp in self.all_viewports()
+                      if getattr(vp.gumball, "relocating", False)]
+        if relocating:
+            for gb in relocating:
+                gb.cancel_relocate()
+            return
         if self.processor.busy:
             self.processor.cancel()
         elif self.scene.cv_enabled - self.scene.cv_auto:
