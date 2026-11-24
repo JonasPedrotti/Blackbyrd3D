@@ -573,6 +573,10 @@ class SnapIndex:
         # this session only: every launch starts with it off, at 0.
         self.project_enabled = False
         self.project_z = 0.0
+        self.ortho = bool(config.get("ortho")) if config else False
+        self.grid_snap = bool(config.get("grid_snap")) if config else False
+        self.grid_snap_step = (float(config.get("grid_snap_step", default=1.0))
+                               if config else 1.0)
         if config is not None:
             osnaps = config.get("osnaps", default={}) or {}
             self.enabled = bool(osnaps.get("enabled", True))

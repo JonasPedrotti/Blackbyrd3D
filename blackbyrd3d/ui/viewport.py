@@ -1569,6 +1569,32 @@ class Viewport(QOpenGLWidget):
     paperTextEditRequested = Signal(str)     # editable paper note, by id
     _tessDone = Signal()                    # a background mesh finished
 
+    # Ortho and the grid belong to the drawing like the object snaps do, so
+    # they live on the shared SnapIndex and every pane sees one switch.
+    @property
+    def ortho(self):
+        return self.snaps.ortho
+
+    @ortho.setter
+    def ortho(self, on):
+        self.snaps.ortho = bool(on)
+
+    @property
+    def grid_snap(self):
+        return self.snaps.grid_snap
+
+    @grid_snap.setter
+    def grid_snap(self, on):
+        self.snaps.grid_snap = bool(on)
+
+    @property
+    def grid_snap_step(self):
+        return self.snaps.grid_snap_step
+
+    @grid_snap_step.setter
+    def grid_snap_step(self, step):
+        self.snaps.grid_snap_step = float(step)
+
     def __init__(self, scene, selection, config=None, parent=None):
         super().__init__(parent)
         self.scene = scene
@@ -1659,11 +1685,6 @@ class Viewport(QOpenGLWidget):
         self.point_space = "model"
         self.last_click_px = None           # pixel of the last object click
         self.frame_aspect = None            # cinema frame guide (e.g. 2.39)
-        self.grid_snap = bool(config.get("grid_snap")) if config else False
-        self.grid_snap_step = (float(config.get("grid_snap_step",
-                                                default=1.0))
-                               if config else 1.0)
-        self.ortho = bool(config.get("ortho")) if config else False
         self.comb_enabled: set[str] = set() # curvature combs on curves
         self.draft_angle = 3.0              # draft analysis threshold (deg)
         self._cv_cache: dict = {}
