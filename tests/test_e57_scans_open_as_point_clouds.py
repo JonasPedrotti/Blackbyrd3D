@@ -9,9 +9,11 @@ from __future__ import annotations
 import math
 
 import numpy as np
-import pye57
 import pytest
-from pye57 import libe57
+
+# ARM Linux builds go without pye57 (see pyproject)
+pye57 = pytest.importorskip("pye57")
+from pye57 import libe57  # noqa: E402
 
 from blackbyrd3d.core import geometry as g
 from blackbyrd3d.core.scene import Scene

@@ -91,6 +91,7 @@ of their own.
 | Platform    | Download                                                                                                                           | Size        | Notes                                                                                                                                                               |
 | ----------- | ---------------------------------------------------------------------------------------------------------------------------------- | ----------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | **Linux**   | [Blackbyrd3D-x86_64.AppImage](https://github.com/JonasPedrotti/Blackbyrd3D/releases/latest/download/Blackbyrd3D-x86_64.AppImage)   | 269&nbsp;MB | Make it executable and run it. Nothing to install.                                                                                                                  |
+| **Linux ARM** | [Blackbyrd3D-aarch64.AppImage](https://github.com/JonasPedrotti/Blackbyrd3D/releases/latest/download/Blackbyrd3D-aarch64.AppImage) | -           | 64-bit ARM with glibc 2.39 or newer, such as Ubuntu 24.04 or Fedora 40. E57 import is not available there yet.                                                      |
 | **Windows** | [Blackbyrd3D-Setup-x86_64.exe](https://github.com/JonasPedrotti/Blackbyrd3D/releases/latest/download/Blackbyrd3D-Setup-x86_64.exe) | 119&nbsp;MB | Unsigned for now: choose **More info**, then **Run anyway**.                                                                                                        |
 | **macOS**   | [Blackbyrd3D-arm64.dmg](https://github.com/JonasPedrotti/Blackbyrd3D/releases/latest/download/Blackbyrd3D-arm64.dmg)   | 268&nbsp;MB | Apple Silicon, macOS 14 or newer. Not notarized yet: on first launch macOS blocks it, then open **System Settings > Privacy & Security** and click **Open Anyway**. |
 
@@ -100,6 +101,8 @@ On Linux, make the AppImage executable and start it:
 chmod +x Blackbyrd3D-x86_64.AppImage
 ./Blackbyrd3D-x86_64.AppImage
 ```
+
+On ARM, use `Blackbyrd3D-aarch64.AppImage` the same way.
 
 On a Wayland desktop it runs through XWayland, so panels can be torn off and
 docked again. Set `BYRD3D_WAYLAND=1` to run it on Wayland directly. Known

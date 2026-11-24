@@ -8,6 +8,7 @@ to install.
 | Platform | Download |
 |---|---|
 | **Linux** | [`Blackbyrd3D-x86_64.AppImage`](https://github.com/JonasPedrotti/Blackbyrd3D/releases/latest/download/Blackbyrd3D-x86_64.AppImage) — `chmod +x` and run |
+| **Linux ARM** (64-bit, glibc 2.39 or newer, such as Ubuntu 24.04 or Fedora 40) | [`Blackbyrd3D-aarch64.AppImage`](https://github.com/JonasPedrotti/Blackbyrd3D/releases/latest/download/Blackbyrd3D-aarch64.AppImage) - `chmod +x` and run. E57 import is not available there yet. |
 | **Windows** | [`Blackbyrd3D-Setup-x86_64.exe`](https://github.com/JonasPedrotti/Blackbyrd3D/releases/latest/download/Blackbyrd3D-Setup-x86_64.exe) — installer ([Privacy](../privacy.md)) |
 | **macOS** (Apple Silicon, macOS 14 or newer) | [`Blackbyrd3D-arm64.dmg`](https://github.com/JonasPedrotti/Blackbyrd3D/releases/latest/download/Blackbyrd3D-arm64.dmg) - drag to Applications, then on first launch **System Settings > Privacy & Security > Open Anyway** |
 

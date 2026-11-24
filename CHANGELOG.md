@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- **Linux ARM AppImage.** Releases now include `Blackbyrd3D-aarch64.AppImage`
+  for 64-bit ARM; E57 import is not available there yet.
+
 ## 0.2.0
 
 - **Faster opening.** Display meshes are saved in `.byrd` files and

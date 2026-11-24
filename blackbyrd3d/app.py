@@ -3407,7 +3407,8 @@ class MainWindow(QMainWindow):
         from .utils.updates import check_for_update
 
         def worker():
-            rel = check_for_update(__version__, platform.system())
+            rel = check_for_update(__version__, platform.system(),
+                                   platform.machine())
             if rel:
                 self.updateAvailable.emit(rel)
 
@@ -3442,7 +3443,7 @@ class MainWindow(QMainWindow):
         from . import __version__
         from .utils.updates import check_for_update
         rel = self._pending_update or check_for_update(
-            __version__, platform.system())
+            __version__, platform.system(), platform.machine())
         self._show_update_result(rel)
 
     def _show_update_result(self, rel):
