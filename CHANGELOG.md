@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+- **Faster opening.** Display meshes are saved in `.byrd` files and
+  viewports share their GPU buffers.
+- **macOS app no longer reported as damaged** after the last bundle change.
+- **MeshToBrep in seconds** behind a progress card, and picking the result
+  no longer freezes the window.
+- **MergeAllCoplanarFaces in seconds** on converted meshes, behind a
+  progress card. Joined faces now show as open or closed polysurface.
+
 ## 0.1.0
 
 - **Blackbyrd3D**, an open-source NURBS surface modeller for Linux, Windows
