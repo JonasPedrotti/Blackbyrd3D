@@ -15,6 +15,16 @@ Built on [Serpentine3D](https://github.com/chisomobanzi/Serpentine3D) by Chisomo
 
 <img src="assets/splash.png" alt="The Blackbyrd3D splash screen" width="560">
 
+<a href="docs/reference/file-formats.md"><img src="https://img.shields.io/badge/3DM-26272b?style=flat-square" alt="3DM"></a>
+<a href="docs/reference/file-formats.md"><img src="https://img.shields.io/badge/STEP-26272b?style=flat-square" alt="STEP"></a>
+<a href="docs/reference/file-formats.md"><img src="https://img.shields.io/badge/DXF-26272b?style=flat-square" alt="DXF"></a>
+<a href="docs/reference/file-formats.md"><img src="https://img.shields.io/badge/SVG-26272b?style=flat-square" alt="SVG"></a>
+<a href="docs/reference/file-formats.md"><img src="https://img.shields.io/badge/OBJ-26272b?style=flat-square" alt="OBJ"></a>
+<a href="docs/reference/file-formats.md"><img src="https://img.shields.io/badge/FBX-26272b?style=flat-square" alt="FBX"></a>
+<a href="docs/reference/file-formats.md"><img src="https://img.shields.io/badge/STL-26272b?style=flat-square" alt="STL"></a>
+<a href="docs/reference/file-formats.md"><img src="https://img.shields.io/badge/3MF-26272b?style=flat-square" alt="3MF"></a>
+<a href="docs/reference/file-formats.md"><img src="https://img.shields.io/badge/SERP-26272b?style=flat-square" alt="SERP"></a>
+
 </div>
 
 ## What it does

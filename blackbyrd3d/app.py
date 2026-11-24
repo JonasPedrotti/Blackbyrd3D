@@ -3626,6 +3626,18 @@ class MainWindow(QMainWindow):
                     field.insertPlainText(text)
                 ev.accept()
                 return
+        # Enter and Space from a viewport act as right-click does; Space
+        # stays a space when the prompt wants free text.
+        enter = ev.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter)
+        space = (ev.key() == Qt.Key.Key_Space
+                 and not self.command_line.text_pending)
+        if ((enter or space)
+                and ev.modifiers() & ~Qt.KeyboardModifier.KeypadModifier
+                == Qt.KeyboardModifier.NoModifier
+                and not self.command_line.input.hasFocus()):
+            self.command_line.submit_input()
+            ev.accept()
+            return
         if (text and text.isprintable()
                 and not ev.modifiers() & (
                     Qt.KeyboardModifier.ControlModifier
