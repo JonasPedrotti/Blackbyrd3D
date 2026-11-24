@@ -996,6 +996,39 @@ class SnapIndex:
         point = cplane.to_world(*landed)
         return point, [(self.guides[i], point) for i in held]
 
+    def on_guide_line(self, camera, px: float, py: float, width: int,
+                      height: int, radius_px: float = GUIDE_ALIGN_PX):
+        """The point on a line between two guides under the pixel, as
+        (point, (a, b)), or None. Every pair of guides makes a line."""
+        if not self.tracking or len(self.guides) < 2:
+            return None
+        from ..utils.math3d import ray_line_parameter
+        origin, direction = camera.ray_through(px, py, width, height)
+        origin = np.asarray(origin, float)
+        direction = np.asarray(direction, float)
+        pts = [np.asarray(g, float) for g in self.guides]
+        best, best_d2 = None, radius_px ** 2
+        for i in range(len(pts)):
+            for j in range(i + 1, len(pts)):
+                a, b = pts[i], pts[j]
+                span = b - a
+                length = float(np.linalg.norm(span))
+                if length < 1e-12:
+                    continue
+                t = ray_line_parameter(origin, direction, a, span)
+                if t is None:
+                    continue
+                p = a + span / length * min(max(t, 0.0), length)
+                scr = camera.project(p[None, :], width, height)[0]
+                if scr[2] <= 0:
+                    continue
+                d2 = (scr[0] - px) ** 2 + (scr[1] - py) ** 2
+                if d2 < best_d2:
+                    best_d2 = d2
+                    best = (tuple(float(c) for c in p),
+                            (self.guides[i], self.guides[j]))
+        return best
+
     def align_on_axis(self, camera, cursor, base, unit, px: float, py: float,
                       width: int, height: int,
                       radius_px: float = GUIDE_ALIGN_PX):
