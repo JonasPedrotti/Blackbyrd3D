@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-from PySide6.QtCore import QSize, Qt, QTimer
+from PySide6.QtCore import QPoint, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import QKeySequence, QShortcut
 from PySide6.QtWidgets import (
-    QFrame, QHBoxLayout, QLabel, QPushButton,
+    QFrame, QHBoxLayout, QLabel, QMenu, QPushButton, QToolButton,
     QSizePolicy, QSplitter, QStackedWidget, QVBoxLayout, QWidget,
 )
 
@@ -339,7 +339,10 @@ class CommandWorkspace(QWidget):
 
 class StatusLine(QWidget):
     """The window's status readout, at the right end of the osnap bar. It
-    answers the QStatusBar calls the app makes, so it stands in for one."""
+    answers the QStatusBar calls the app makes, so it stands in for one.
+    The document units sit at its end as a button that opens upward."""
+
+    unitsChosen = Signal(str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -358,6 +361,33 @@ class StatusLine(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(4)
         layout.addWidget(self._message)
+        self.units_button = QToolButton(self)
+        self.units_button.setAutoRaise(True)
+        self.units_button.setToolTip("Document units")
+        self.units_button.setStyleSheet(
+            "QToolButton { color: #9a9b9e; padding: 0 6px; border-radius: 3px }"
+            "QToolButton:hover { color: #e6e7e9; background: #34363b }")
+        self.units_button.clicked.connect(self._open_units_menu)
+        layout.addWidget(self.units_button)
+        self._units = ""
+
+    def set_units(self, units: str):
+        self._units = units
+        self.units_button.setText(f"units: {units} ▴")
+
+    def _open_units_menu(self):
+        from ..utils.units import UNIT_LABELS, UNITS
+        menu = QMenu(self)
+        for unit in UNITS:
+            act = menu.addAction(f"{unit}  ({UNIT_LABELS[unit]})")
+            act.setCheckable(True)
+            act.setChecked(unit == self._units)
+            act.triggered.connect(
+                lambda checked=False, u=unit: self.unitsChosen.emit(u))
+        button = self.units_button
+        corner = button.mapToGlobal(QPoint(button.width(), 0))
+        size = menu.sizeHint()
+        menu.exec(corner - QPoint(size.width(), size.height()))
 
     def _show(self, text):
         self._message.setText(text)

@@ -749,7 +749,7 @@ def cmd_pointsoff(ctx):
 def cmd_units(ctx):
     """Set document units; optionally rescale the model to keep real size."""
     from .base import OptionReq
-    from ..utils.units import TO_MM, UNIT_LABELS, UNITS
+    from ..utils.units import UNIT_LABELS
     current = ctx.scene.units
     choice = yield OptionReq(
         f"Document units (currently {UNIT_LABELS[current]})",
@@ -757,12 +757,24 @@ def cmd_units(ctx):
     if choice == current:
         ctx.echo(f"Units unchanged ({UNIT_LABELS[current]}).")
         return
-    factor = TO_MM[current] / TO_MM[choice]
+    factor = units_factor(current, choice)
     rescale = "No"
     if ctx.scene.all():
         rescale = yield OptionReq(
             f"Scale model by {factor:g} so objects keep their real size?",
             options=["Yes", "No"], default="Yes")
+    set_units(ctx, choice, rescale == "Yes")
+
+
+def units_factor(current: str, choice: str) -> float:
+    from ..utils.units import TO_MM
+    return TO_MM[current] / TO_MM[choice]
+
+
+def set_units(ctx, choice: str, rescale: bool):
+    """Switch the document to `choice`, scaling the model along if asked."""
+    from ..utils.units import UNIT_LABELS
+    factor = units_factor(ctx.scene.units, choice)
     # Before anything changes, so that one undo puts the units back with the
     # model and the sheets. Taken after the units had changed, undo left the
     # new units on the old model; and without a rescale there was none.
@@ -774,15 +786,15 @@ def cmd_units(ctx):
                                  if lettered_in_builtin_styles(ctx.scene)
                                  else None)
     ctx.scene.units = choice
-    if rescale == "Yes":
+    if rescale:
         for o in ctx.scene.all():
             ctx.scene.replace_shape(
                 o.id, g.scale(o.shape, (0, 0, 0), factor))
     for lay in ctx.scene.layouts:
-        lay.convert_units(factor, rescaled=rescale == "Yes")
+        lay.convert_units(factor, rescaled=rescale)
     ctx.scene.notify()
     ctx.echo(f"Document units: {UNIT_LABELS[choice]}."
-             + (" Model rescaled." if rescale == "Yes" else ""))
+             + (" Model rescaled." if rescale else ""))
 
 
 @command("distance", aliases=("dist",), mutates=False)

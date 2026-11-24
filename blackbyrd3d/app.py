@@ -124,6 +124,7 @@ class MainWindow(QMainWindow):
         self._panel_width = None
         self._settling = False
         self._settled_width = None
+        self._on_settled: list = []
         self.aux_viewports: list = []           # Top/Front/Right in quad mode
         self.aux_docks: list = []               # their dock wrappers
         self.dock_viewports: list = []          # user-created dockable panes
@@ -173,6 +174,7 @@ class MainWindow(QMainWindow):
         self._space_tab_row.setParent(self.viewport_area)
         from .ui.command_workspace import LastMessage, StatusLine
         self._status_line = StatusLine()
+        self._status_line.unitsChosen.connect(self._choose_units)
         self.osnap_bar.set_trailing(self._status_line)
         self.last_message = LastMessage(self.command_line,
                                         self.command_workspace.show_history)
@@ -558,6 +560,16 @@ class MainWindow(QMainWindow):
         if getattr(self, "_lists_height_due", False):
             self._lists_height_due = False
             self._put_lists_under_layer_page()
+        waiting, self._on_settled = self._on_settled, []
+        for fn in waiting:
+            fn()
+
+    def when_settled(self, fn):
+        """Run `fn` once the window has stopped moving, now if it has."""
+        if self._settling:
+            self._on_settled.append(fn)
+        else:
+            QTimer.singleShot(0, self, fn)
 
     def _hold_panel_width(self):
         if self._panel_width:
@@ -3531,12 +3543,32 @@ class MainWindow(QMainWindow):
                     + ", ".join(sorted(self.selection.filter_kinds)))
         self.statusBar().showMessage(
             f"{n} object(s)  ·  {sel} selected  ·  layer: {layer}  ·  "
-            f"{mode}  ·  units: {self.scene.units}{filt}")
+            f"{mode}{filt}")
+        self._status_line.set_units(self.scene.units)
         path = getattr(self.ctx, "current_path", None)
         name = os.path.basename(path) if path else "untitled"
         star = "*" if getattr(self, "autosave", None) and self.dirty else ""
         self.setWindowTitle(f"{name}{star} — {APP_TITLE}")
         self._title_bar.set_document_title(f"{name}{star}")
+
+    def _choose_units(self, choice: str):
+        from .commands.view import set_units, units_factor
+        from .ui import units_prompt
+        if choice == self.scene.units:
+            return
+        rescale = False
+        if self.scene.all():
+            answer = units_prompt.ask_scale_for_units(
+                self, units_factor(self.scene.units, choice),
+                self.scene.units, choice)
+            if answer == units_prompt.CANCEL:
+                return
+            rescale = answer == units_prompt.SCALE
+        if self.processor.busy:
+            self.processor.cancel()
+        set_units(self.ctx, choice, rescale)
+        self._repaint_panes()
+        self._update_status()
 
     def _match_user_shortcut(self, ev) -> bool:
         try:
@@ -3606,6 +3638,18 @@ class MainWindow(QMainWindow):
                     field.insertPlainText(text)
                 ev.accept()
                 return
+        # Enter and Space from a viewport act as right-click does; Space
+        # stays a space when the prompt wants free text.
+        enter = ev.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter)
+        space = (ev.key() == Qt.Key.Key_Space
+                 and not self.command_line.text_pending)
+        if ((enter or space)
+                and ev.modifiers() & ~Qt.KeyboardModifier.KeypadModifier
+                == Qt.KeyboardModifier.NoModifier
+                and not self.command_line.input.hasFocus()):
+            self.command_line.submit_input()
+            ev.accept()
+            return
         if (text and text.isprintable()
                 and not ev.modifiers() & (
                     Qt.KeyboardModifier.ControlModifier
@@ -4005,7 +4049,9 @@ def _open_launch_args(window, args: list[str]):
     for arg in args:
         if (not arg.startswith("-") and os.path.exists(arg)
                 and arg.lower().endswith(".wyrm")):
-            window.show_wyrm().open_path(arg)
+            # Restoring the Wyrm dock while the opening window is still
+            # being sized can crash Qt or leave the dock shrunk for good.
+            window.when_settled(lambda: window.show_wyrm().open_path(arg))
             break
         if not arg.startswith("-") and os.path.exists(arg):
             try:

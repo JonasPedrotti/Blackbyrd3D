@@ -5,7 +5,8 @@ import importlib.util
 import sys
 from pathlib import Path
 
-from PyInstaller.utils.hooks import collect_data_files, collect_dynamic_libs
+from PyInstaller.utils.hooks import (collect_data_files, collect_dynamic_libs,
+                                     copy_metadata)
 
 sys.path.insert(0, str(Path(SPECPATH).parent))
 from prune_bundle import vtk_libraries_needed  # noqa: E402
@@ -32,8 +33,10 @@ a = Analysis(
     ["byrd3d_entry.py"],
     pathex=[],
     binaries=vtk_bins + e57_bins,
+    # the metadata is where the bundled app reads its own version
     datas=collect_data_files("blackbyrd3d", includes=["examples/*.byrd",
-                                                      "examples/*.wyrm"]),
+                                                      "examples/*.wyrm"])
+          + copy_metadata("blackbyrd3d"),
     hiddenimports=[],
     # A hook here replaces contrib's hook of the same name: hook-OpenGL.py
     # leaves out the DLLs PyOpenGL never loads on this Python.

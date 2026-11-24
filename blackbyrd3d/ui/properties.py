@@ -1672,7 +1672,8 @@ class PropertiesPanel(QWidget):
         if papers:
             # said out loud, because a curve on the paper and a curve in the
             # model look the same and are not the same thing at all
-            kinds = [kind_label(g.shape_kind(o.shape)) for o in papers]
+            kinds = [kind_label(g.shape_kind(o.shape), o.shape)
+                     for o in papers]
             n = len(papers)
             if n == 1:
                 return said("Object", papers[0].name, f"{kinds[0]} on paper")
@@ -1705,9 +1706,9 @@ class PropertiesPanel(QWidget):
             obj = objs[0]
             kind = ("Editable text" if isinstance(obj.shape, TextShape)
                     else "Dimension" if isinstance(obj.shape, DimensionShape)
-                    else kind_label(obj.kind))
+                    else kind_label(obj.kind, obj.shape))
             return said("Object", obj.name, f"{kind} {where}")
-        kinds = [kind_label(o.kind) for o in objs]
+        kinds = [kind_label(o.kind, o.shape) for o in objs]
         return said("Objects", f"{n} objects selected",
                     f"{_kinds_text(kinds)} {where}", f"{n} objects")
 
@@ -3198,10 +3199,15 @@ class PropertiesPanel(QWidget):
             # Python hands the lock between threads every 5 ms by default,
             # and the interface thread wants it many times a frame: with
             # this thread measuring, it stood still for seconds at a time.
+            from ..core import occ
             interval = sys.getswitchinterval()
             sys.setswitchinterval(min(interval, _MEASURING_SWITCH))
             try:
-                text = self._measured_now(obj)
+                with occ.wanted_while(lambda: getattr(
+                        self.scene, "revision", 0) == revision):
+                    text = self._measured_now(obj)
+            except occ.Superseded:
+                text = ""                # the drawing changed; dropped below
             finally:
                 sys.setswitchinterval(interval)
             try:
@@ -3222,6 +3228,7 @@ class PropertiesPanel(QWidget):
             self.measure_label.setText(text)
 
     def _measured_now(self, obj) -> str:
+        from ..core.occ import Superseded
         fmt = self.scene.format_length
         u = self.scene.units
         try:
@@ -3236,6 +3243,8 @@ class PropertiesPanel(QWidget):
                 return cloud_measures(obj, fmt)
             if obj.kind == "hatch":
                 return f"Area: {g.surface_area(obj.shape):.3f} {u}²"
+        except Superseded:
+            raise
         except Exception:
             pass
         return "—"

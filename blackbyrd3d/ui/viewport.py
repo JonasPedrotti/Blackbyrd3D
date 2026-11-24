@@ -7115,8 +7115,9 @@ class Viewport(QOpenGLWidget):
         rows, by_id = [], {}
         for entry in stacked:
             obj = self.scene.get(entry[0])
+            whose = kind_label(obj.kind, obj.shape).lower()
             rows.append(ChoiceRow(obj_id=obj.id, name=obj.name,
-                                  kind=f"Point of {kind_label(obj.kind).lower()}",
+                                  kind=f"Point of {whose}",
                                   color=self.scene.color_of(obj)))
             by_id[obj.id] = entry
         self._press_pos = None
@@ -7159,10 +7160,10 @@ class Viewport(QOpenGLWidget):
             return True
         from .object_chooser import ChoiceRow, ObjectChooser, kind_label
         color = self.scene.color_of(obj)
+        whole = kind_label(obj.kind, obj.shape).lower()
         rows = [ChoiceRow(obj_id="part", name=_part_name(obj, kind),
                           kind=obj.name, color=color),
-                ChoiceRow(obj_id="whole",
-                          name=f"Whole {kind_label(obj.kind).lower()}",
+                ChoiceRow(obj_id="whole", name=f"Whole {whole}",
                           kind=obj.name, color=color)]
         self._press_pos = None
         menu = ObjectChooser(rows, self)
@@ -7420,14 +7421,17 @@ class Viewport(QOpenGLWidget):
         """Letting go of a handle: end the drag, or keep it live to type in.
 
         A click that never moved is someone asking to type an exact value, so
-        the handle stays armed and Enter commits it.
+        the handle stays armed and Enter commits it. A typed coordinate is
+        complete once its comma is in, so letting go commits it.
         """
         press = getattr(self, "_gumball_press", None)
         moved = (press is not None
                  and (ev.position() - press).manhattanLength() > 4)
         gb = self._live_gumball()
         d = gb.drag
-        if d["typed"] or (not moved and gb.accepts_typing()):
+        if d["typed"].endswith(",") and gb.commit_typed():
+            pass
+        elif d["typed"] or (not moved and gb.accepts_typing()):
             gb.arm()
         else:
             gb.end_drag()
@@ -8035,7 +8039,7 @@ class Viewport(QOpenGLWidget):
                 if gb.type_char("back"):
                     self.update()
                     return
-            elif ev.text() in "0123456789.-" and ev.text() \
+            elif ev.text() in "0123456789.-," and ev.text() \
                     and gb.accepts_typing():
                 gb.type_char(ev.text())
                 self.update()

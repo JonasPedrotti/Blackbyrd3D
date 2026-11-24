@@ -176,6 +176,23 @@ def test_a_kind_reads_as_words():
     assert kind_label("curve") == "Curve"
 
 
+def test_joined_faces_read_as_a_polysurface():
+    import numpy as np
+
+    from blackbyrd3d.fileio.obj import _shell_from_triangles
+    from blackbyrd3d.ui.object_chooser import kind_label
+
+    v = np.array([[0, 0, 0], [1, 0, 0], [0, 1, 0], [0, 0, 1]], float)
+    sheet = _shell_from_triangles(v, [(0, 2, 1), (0, 1, 3)])
+    closed = _shell_from_triangles(v, [(0, 2, 1), (0, 1, 3), (1, 2, 3),
+                                       (0, 3, 2)])
+    one = g.faces_of(g.make_box((0, 0, 0), 1, 1, 1))[0]
+    assert kind_label("surface", sheet) == "Open polysurface"
+    assert kind_label("surface", closed) == "Closed polysurface"
+    assert kind_label("surface", one) == "Surface"
+    assert kind_label("surface") == "Surface"
+
+
 def test_an_object_that_has_gone_is_left_out():
     """The scene can change under an open chooser, and a row for something
     that is no longer there would pick nothing."""

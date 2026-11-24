@@ -31,7 +31,7 @@ jobs:
         uses: actions/upload-artifact@v6
         with:
           name: Blackbyrd3D-macOS-arm64
-          path: packaging/macos/Blackbyrd3D-*-arm64.dmg
+          path: packaging/macos/Blackbyrd3D-arm64.dmg
           if-no-files-found: error
       - name: Attach to release
         if: github.event_name == 'release'
@@ -40,7 +40,7 @@ jobs:
         run: |
           tag="${{ github.event.release.tag_name }}"
           assets=$(gh release view "$tag" --json assets --jq '.assets[].name')
-          for path in packaging/macos/Blackbyrd3D-*-arm64.dmg; do
+          for path in packaging/macos/Blackbyrd3D-arm64.dmg; do
             if grep -Fxq "$(basename "$path")" <<< "$assets"; then
               echo 'Keeping the disk image already prepared in the draft release.'
             else

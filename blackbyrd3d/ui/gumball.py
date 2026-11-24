@@ -1546,6 +1546,8 @@ class Gumball:
             unit = {"move": "", "rot": "°", "scale": "×"}.get(kind, "")
             prompt = {"move": "distance", "rot": "angle",
                       "scale": "factor"}.get(kind, "")
+            if d["typed"].endswith(","):
+                prompt = "coordinate"
             text = f"{prompt}: {d['typed']}{unit}"
         elif d.get("armed"):
             prompt = {"move": "distance", "rot": "angle",
@@ -2210,22 +2212,37 @@ class Gumball:
             return False
         if ch == "back":
             d["typed"] = d["typed"][:-1]
+        elif d["typed"].endswith(","):
+            return False
         elif ch in "0123456789.-":
+            d["typed"] += ch
+        elif ch == "," and self._takes_coordinate():
             d["typed"] += ch
         else:
             return False
         self._preview_typed()
         return True
 
+    def _takes_coordinate(self) -> bool:
+        """A move arrow also takes "N," : go to coordinate N on its axis."""
+        d = self.drag
+        return d["handle"][0] == "move" and not d.get("extrude")
+
     def _parse_typed(self):
         d = self.drag
         s = d["typed"]
+        absolute = s.endswith(",")
+        if absolute:
+            s = s[:-1]
         if s in ("", "-", ".", "-.", "+"):
             return None
         try:
             val = float(s)
         except ValueError:
             return None
+        if absolute:
+            axis = np.asarray(d["axes"][d["handle"][1]], float)
+            return val - float(np.dot(np.asarray(d["anchor"], float), axis))
         # a positive length runs the way the arrow is being dragged
         if d["handle"][0] in ("move", "ext") and not d.get("fillet"):
             val *= d.get("drag_sign", 1.0)

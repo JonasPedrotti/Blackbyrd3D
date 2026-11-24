@@ -215,3 +215,42 @@ def test_gumball_scale_across_axes_no_crash():
         tessellate(obj.shape)                 # what the viewport does
         assert not _has_null_surface(obj.shape)
     assert g.volume(scene.get(box.id).shape) > 0
+
+
+def test_typed_coordinate_moves_to_it_on_the_axis():
+    """"0," takes the gumball's origin to zero on the dragged axis only."""
+    vp, scene, sel = _vp()
+    box = scene.add(g.make_box((3, 4, 5), 2, 2, 2))
+    sel.set([box.id])
+    _begin(vp, "move", 0)
+    for ch in "0", ",":
+        assert vp.gumball.type_char(ch)
+    assert vp.gumball.readout()[0].startswith("coordinate")
+    assert not vp.gumball.type_char("5")          # nothing after the comma
+    assert vp.gumball.commit_typed()
+    mn, mx = g.bbox(scene.get(box.id).shape)
+    assert (mn[0] + mx[0]) / 2 == pytest.approx(0, abs=1e-6)
+    assert mn[1] == pytest.approx(4) and mn[2] == pytest.approx(5)
+
+
+def test_typed_coordinate_ignores_the_drag_side():
+    vp, scene, sel = _vp()
+    box = scene.add(g.make_box((-1, -1, -1), 2, 2, 2))
+    sel.set([box.id])
+    _begin(vp, "move", 2)
+    vp.gumball.drag["drag_sign"] = -1.0
+    for ch in "7", ",":
+        vp.gumball.type_char(ch)
+    vp.gumball.commit_typed()
+    mn, mx = g.bbox(scene.get(box.id).shape)
+    assert (mn[2] + mx[2]) / 2 == pytest.approx(7)
+
+
+def test_rotate_takes_no_coordinate():
+    vp, scene, sel = _vp()
+    box = scene.add(g.make_box((0, 0, 0), 2, 2, 2))
+    sel.set([box.id])
+    _begin(vp, "rot", 2)
+    vp.gumball.type_char("9")
+    assert not vp.gumball.type_char(",")
+    vp.gumball.cancel_drag()

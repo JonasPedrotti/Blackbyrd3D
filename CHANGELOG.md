@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.2.0
+
+- **Faster opening.** Display meshes are saved in `.byrd` files and
+  viewports share their GPU buffers.
+- **macOS app no longer reported as damaged** after the last bundle change.
+- **MeshToBrep in seconds** behind a progress card, and picking the result
+  no longer freezes the window.
+- **MergeAllCoplanarFaces in seconds** on converted meshes, behind a
+  progress card. Joined faces now show as open or closed polysurface.
+- **Stacked bodies merge cleanly.** MergeAllCoplanarFaces removes the faces
+  lying back to back between them, so their seams disappear.
+- **Typed coordinates on the gumball.** Typing `0,` while dragging a move
+  arrow sends the object or point to zero on that axis, on release.
+- **Units button in the status bar.** Click the units to pick new ones;
+  with objects in the file it asks whether to scale them along.
+- **Space and Enter in the viewport** finish or repeat a command, as in the
+  command line.
+- **Double-clicked .wyrm files no longer crash** the app on launch.
+
 ## 0.1.0
 
 - **Blackbyrd3D**, an open-source NURBS surface modeller for Linux, Windows

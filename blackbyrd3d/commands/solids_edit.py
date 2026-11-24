@@ -445,15 +445,40 @@ def cmd_merge_all_coplanar_faces(ctx):
     """
     objs = yield SelectReq("Select solids or surfaces to merge coplanar faces",
                            kinds=("solid", "surface", "compound"))
+    from ..core.coplanar import merge_flat, merged_display
+    from ..fileio.progress import Cancelled
     removed = 0
     touched = []
-    for o in objs:
-        before = len(g.faces_of(o.shape))
-        merged = g.merge_coplanar_faces(o.shape)
-        after = len(g.faces_of(merged))
-        if after < before:
-            touched.append(ctx.scene.replace_shape(o.id, merged))
-            removed += before - after
+    with ctx.progress("Merging coplanar faces", title="Merging") as progress:
+        try:
+            for i, o in enumerate(objs):
+                share = progress.part(i / len(objs), (i + 1) / len(objs),
+                                      o.name)
+                merged = merge_flat(o.shape, share)
+                if merged is None:
+                    share.tick(0.5, "Merging")
+                    shape = g.unify_same_domain(o.shape)
+                    before = len(g.faces_of(o.shape))
+                    after = len(g.faces_of(shape))
+                    mesh = None
+                else:
+                    shape = merged.shape
+                    before, after = merged.faces_before, merged.faces_after
+                    # the faces are where they were, so the picture is
+                    mesh = (merged_display(o.mesh, merged)
+                            if after < before else None)
+                if after >= before:
+                    continue
+                area = g.known_area(o.shape)
+                if area is not None:
+                    g.know_area(shape, area)
+                share.tick(1.0, "Preparing the display")
+                made = ctx.scene.replace_shape(o.id, shape, mesh=mesh)
+                made.mesh
+                touched.append(made)
+                removed += before - after
+        except Cancelled:
+            ctx.echo("Stopped.")
     if not touched:
         ctx.echo("No coplanar faces to merge.")
         return

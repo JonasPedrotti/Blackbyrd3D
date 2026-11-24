@@ -3,7 +3,7 @@
 # Run from this directory in a venv that has blackbyrd3d installed:
 #   ./build-dmg.sh [path/to/venv/bin/python]
 #
-# Produces:  Blackbyrd3D-<version>-arm64.dmg
+# Produces:  Blackbyrd3D-arm64.dmg
 #
 # The .app is only ad-hoc signed, not notarized. Gatekeeper still blocks
 # the first launch; see the README for "Open Anyway" / notarization follow-up.
@@ -16,10 +16,9 @@ cd "$(dirname "$0")"
 DEFAULT_PY="../../.venv/bin/python"
 [ -x "$DEFAULT_PY" ] || DEFAULT_PY="python3"
 PY="${1:-$DEFAULT_PY}"
-VERSION="0.1.0"
 APPNAME="Blackbyrd3D"
 ARCH="$(uname -m)"
-DMG="${APPNAME}-${VERSION}-${ARCH}.dmg"
+DMG="${APPNAME}-${ARCH}.dmg"
 
 echo "=== ensure pip (uv-created venvs ship without it) ==="
 if ! "$PY" -m pip --version >/dev/null 2>&1; then

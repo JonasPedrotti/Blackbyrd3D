@@ -1,18 +1,10 @@
-"""One version number, written in nine places.
+"""One version number, written in one place.
 
-Nothing computes the version from `__version__`: the macOS PyInstaller
-spec, the dmg builder and three sets of download links each carry their own
-copy, because none of them can import Python at the time they need it. (The
-Windows build is the exception: its exe takes the version from
-pyproject.toml and the Inno script reads it back out of that exe.) So a
-release is a hand edit across nine files, and the ones
-that go wrong are the quiet ones — a splash screen still claiming the last
-version, or a download link pointing at a `.dmg` the new release does not
-contain, which reads as a 404 to whoever clicks it.
-
-This test does not check that the version is *right*. It checks that every
-copy says the same thing, which is the part a person doing it by hand gets
-wrong.
+pyproject.toml declares it and everything else derives it: the app reads it
+back (blackbyrd3d.__version__), the Windows exe and the macOS bundle read it
+at build time, and the download links name no version at all. Only uv.lock
+keeps a copy, which `uv lock` rewrites; CI installs with --locked, so a bump
+without it fails there, on the release commit, the worst moment to find out.
 """
 
 import os
@@ -20,69 +12,55 @@ import re
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-# Each file with the pattern that finds its version strings. Every pattern
-# must match at least once — a file that gets restructured out from under
-# one of these should fail the test, not silently stop being checked.
-V = r"(\d+(?:\.\d+)+)"          # never trailing punctuation: "0.5.3." is prose
 
-DECLARED = {
-    "pyproject.toml": rf'^version = "{V}"',
-    "blackbyrd3d/__init__.py": rf'^__version__ = "{V}"',
-    "blackbyrd3d/ui/splash.py": rf'version: str = "{V}"',
-    "packaging/macos/byrd3d.spec":
-        rf'(?:^\s*version|CFBundleShortVersionString"|CFBundleVersion")'
-        rf'\s*[=:]\s*"{V}"',
-    "packaging/macos/build-dmg.sh": rf'^VERSION="{V}"',
-    # the lock pins the project's own version alongside its dependencies,
-    # and CI installs with --locked, so a bump that skips it fails the
-    # build rather than shipping something wrong — but it fails it on the
-    # release commit, which is the worst moment to find out
-    "uv.lock": rf'name = "blackbyrd3d"\nversion = "{V}"',
-    # the download links have the version baked into the file name, so they
-    # rot into 404s rather than into a stale-but-working page
-    "README.md": rf'Blackbyrd3D-{V}-arm64\.dmg',
-    "docs/getstarted/install.md": rf'Blackbyrd3D-{V}-arm64\.dmg',
-}
+def _read(rel: str) -> str:
+    return open(os.path.join(ROOT, rel), encoding="utf-8").read()
 
 
-def _found(rel: str, pattern: str) -> list[str]:
-    text = open(os.path.join(ROOT, rel), encoding="utf-8").read()
-    hits = re.findall(pattern, text, re.MULTILINE)
-    # alternation groups come back as tuples; keep whichever branch matched
-    flat = []
-    for h in hits:
-        flat.extend([p for p in ([h] if isinstance(h, str) else h) if p])
-    return flat
+def _declared() -> str:
+    found = re.search(r'^version = "([^"]+)"$', _read("pyproject.toml"),
+                      re.MULTILINE)
+    assert found, "pyproject.toml declares no version"
+    return found.group(1)
 
 
-def test_every_file_that_names_the_version_agrees():
+def test_the_app_reports_the_declared_version():
     from blackbyrd3d import __version__
-    wrong = {}
-    for rel, pattern in DECLARED.items():
-        hits = _found(rel, pattern)
-        assert hits, (
-            f"{rel}: nothing matched /{pattern}/ — either the version moved "
-            f"or this file stopped being checked. Fix the pattern.")
-        odd = sorted({h for h in hits if h != __version__})
-        if odd:
-            wrong[rel] = odd
-    assert not wrong, (
-        f"blackbyrd3d.__version__ is {__version__!r}, but:\n"
-        + "\n".join(f"  {rel}: {v}" for rel, v in sorted(wrong.items()))
-        + "\n\nEvery copy has to move together, including the .dmg download "
-          "links — a link naming a file the release does not contain is a "
-          "404 for whoever clicks it.")
+    assert __version__ == _declared()
+
+
+def test_the_lock_file_follows_the_version():
+    found = re.search(r'^name = "blackbyrd3d"\nversion = "([^"]+)"$',
+                      _read("uv.lock"), re.MULTILINE)
+    assert found, "uv.lock does not pin blackbyrd3d"
+    assert found.group(1) == _declared(), (
+        "uv.lock still names the old version: run `uv lock` after changing "
+        "the version in pyproject.toml")
+
+
+def test_no_file_keeps_a_copy_of_the_version():
+    """A copy goes stale at the next release without anyone noticing."""
+    copies = {
+        "blackbyrd3d/__init__.py": r'__version__ = "\d',
+        "blackbyrd3d/ui/splash.py": r'version: str = "\d',
+        "packaging/macos/byrd3d.spec": r'(?:^\s*version|CFBundle\w*Version")\s*[=:]\s*"\d',
+        "packaging/macos/build-dmg.sh": r'^VERSION="',
+        "README.md": r'Blackbyrd3D-\d[\d.]*-arm64\.dmg',
+        "docs/getstarted/install.md": r'Blackbyrd3D-\d[\d.]*-arm64\.dmg',
+    }
+    stale = [rel for rel, pattern in copies.items()
+             if re.search(pattern, _read(rel), re.MULTILINE)]
+    assert not stale, f"these files write the version out by hand: {stale}"
 
 
 def test_the_changelog_leads_with_the_version_being_shipped():
     """The top section is either the release itself or work queued behind
     it; either way an entry for a version we are past is a mistake."""
-    from blackbyrd3d import __version__
-    heads = [ln.strip() for ln in
-             open(os.path.join(ROOT, "CHANGELOG.md"), encoding="utf-8")
+    version = _declared()
+    heads = [ln.strip() for ln in _read("CHANGELOG.md").splitlines()
              if ln.startswith("## ")]
     assert heads, "the changelog has no version headings at all"
     top = heads[0]
-    assert __version__ in top or "Unreleased" in top, (
+    assert version in top or "Unreleased" in top, (
         f"the changelog opens with {top!r}, which is neither "
-        f"{__version__!r} nor an Unreleased section")
+        f"{version!r} nor an Unreleased section")
