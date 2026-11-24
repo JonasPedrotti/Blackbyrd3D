@@ -32,6 +32,8 @@ into missing tools.
 - Fill in the core modelling commands that are still missing.
 - More drafting tools: dimensions, annotations and layout.
 - Better import and export for common file formats.
+- A project website, on GitHub Pages or its own domain, once enough people
+  show interest in Blackbyrd3D. GitHub stars are a good signal for that.
 
 ## 3. Wyrm
 

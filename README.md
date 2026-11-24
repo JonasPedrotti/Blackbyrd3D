@@ -78,10 +78,10 @@ of their own.
 
 ## Download
 
-| Platform    | Download                                                                                                                           | Size        | Notes                                                                                        |
-| ----------- | ---------------------------------------------------------------------------------------------------------------------------------- | ----------- | -------------------------------------------------------------------------------------------- |
-| **Linux**   | [Blackbyrd3D-x86_64.AppImage](https://github.com/JonasPedrotti/Blackbyrd3D/releases/latest/download/Blackbyrd3D-x86_64.AppImage)   | 269&nbsp;MB | Make it executable and run it. Nothing to install.                                           |
-| **Windows** | [Blackbyrd3D-Setup-x86_64.exe](https://github.com/JonasPedrotti/Blackbyrd3D/releases/latest/download/Blackbyrd3D-Setup-x86_64.exe) | 119&nbsp;MB | Unsigned for now: choose **More info**, then **Run anyway**.                                 |
+| Platform    | Download                                                                                                                           | Size        | Notes                                                                                                                                                               |
+| ----------- | ---------------------------------------------------------------------------------------------------------------------------------- | ----------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Linux**   | [Blackbyrd3D-x86_64.AppImage](https://github.com/JonasPedrotti/Blackbyrd3D/releases/latest/download/Blackbyrd3D-x86_64.AppImage)   | 269&nbsp;MB | Make it executable and run it. Nothing to install.                                                                                                                  |
+| **Windows** | [Blackbyrd3D-Setup-x86_64.exe](https://github.com/JonasPedrotti/Blackbyrd3D/releases/latest/download/Blackbyrd3D-Setup-x86_64.exe) | 119&nbsp;MB | Unsigned for now: choose **More info**, then **Run anyway**.                                                                                                        |
 | **macOS**   | [Blackbyrd3D-0.1.0-arm64.dmg](https://github.com/JonasPedrotti/Blackbyrd3D/releases/latest/download/Blackbyrd3D-0.1.0-arm64.dmg)   | 268&nbsp;MB | Apple Silicon, macOS 14 or newer. Not notarized yet: on first launch macOS blocks it, then open **System Settings > Privacy & Security** and click **Open Anyway**. |
 
 On Linux, make the AppImage executable and start it:
@@ -134,7 +134,7 @@ What each step means: [ROADMAP.md](ROADMAP.md).
 
 ## Is this AI slop?
 
-Fair question, so a straight answer: yes, Blackbyrd3D is written with a lot
+Fair question, so a straight answer: Blackbyrd3D is indeed written with a lot
 of help from AI. Pretending otherwise would be dishonest.
 
 But there is vibe coding and there is using AI as a tool. One is prompting until
