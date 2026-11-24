@@ -9,6 +9,8 @@
   no longer freezes the window.
 - **MergeAllCoplanarFaces in seconds** on converted meshes, behind a
   progress card. Joined faces now show as open or closed polysurface.
+- **Stacked bodies merge cleanly.** MergeAllCoplanarFaces removes the faces
+  lying back to back between them, so their seams disappear.
 
 ## 0.1.0
 

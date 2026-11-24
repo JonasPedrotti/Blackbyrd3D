@@ -247,3 +247,59 @@ def test_the_command_on_a_mesh_converted_with_meshtobrep(env):
     assert len(g.faces_of(done.shape)) == 1
     assert len(g.edges_of(done.shape)) == 4
     assert g.surface_area(done.shape) == pytest.approx(4.0)
+
+
+CUBE_V = np.array([[0, 0, 0], [1, 0, 0], [1, 1, 0], [0, 1, 0],
+                   [0, 0, 1], [1, 0, 1], [1, 1, 1], [0, 1, 1]], float)
+CUBE_T = np.array([[0, 2, 1], [0, 3, 2], [4, 5, 6], [4, 6, 7],
+                   [0, 1, 5], [0, 5, 4], [2, 3, 7], [2, 7, 6],
+                   [1, 2, 6], [1, 6, 5], [3, 0, 4], [3, 4, 7]])
+
+
+def _stacked_cubes():
+    """Two unit cubes, one on the other, as an exported model has them:
+    the lower one's top and the upper one's bottom lie on each other."""
+    v = np.vstack([CUBE_V, CUBE_V + (0, 0, 1)])
+    return _shell_from_triangles(v, np.vstack([CUBE_T, CUBE_T + 8]))
+
+
+def test_stacked_bodies_lose_the_faces_between_them():
+    shell = _stacked_cubes()
+    assert len(g.faces_of(shell)) == 24
+    merged = coplanar.merge_flat(shell)
+    assert len(g.faces_of(merged.shape)) == 6, "one 1 x 1 x 2 block"
+    assert len(g.edges_of(merged.shape)) == 12
+    assert merged.shape.Closed()
+    assert g.is_valid(merged.shape)
+    assert g.surface_area(merged.shape) == pytest.approx(10.0)
+
+
+def test_a_face_drawn_twice_is_kept_once():
+    v = np.array([[0, 0, 0], [1, 0, 0], [1, 1, 0], [0, 1, 0]], float)
+    shell = _shell_from_triangles(v, [(0, 1, 2), (0, 2, 3), (0, 1, 2)])
+    merged = coplanar.merge_flat(shell)
+    assert len(g.faces_of(merged.shape)) == 1
+    assert g.surface_area(merged.shape) == pytest.approx(1.0)
+
+
+def test_the_display_leaves_out_the_faces_between_bodies():
+    shell = _stacked_cubes()
+    before = T.tessellate(shell)
+    merged = coplanar.merge_flat(shell)
+    shown = coplanar.merged_display(before, merged)
+    assert len(shown.triangles) == len(before.triangles) - 4
+    assert sorted(set(shown.face_of_triangle.tolist())) == list(range(6))
+    p = shown.vertices[shown.triangles]
+    w = np.cross(p[:, 1] - p[:, 0], p[:, 2] - p[:, 0])
+    assert 0.5 * np.linalg.norm(w, axis=1).sum() == pytest.approx(10.0)
+
+
+def test_bodies_stacked_off_centre_keep_all_their_faces():
+    """The upper cube sits half off the lower one, so their faces only
+    partly cover each other: nothing goes, each cube is six faces."""
+    v = np.vstack([CUBE_V, CUBE_V + (0.5, 0, 1)])
+    shell = _shell_from_triangles(v, np.vstack([CUBE_T, CUBE_T + 8]))
+    merged = coplanar.merge_flat(shell)
+    assert len(g.faces_of(merged.shape)) == 12
+    assert g.surface_area(merged.shape) == pytest.approx(12.0)
+    assert (merged.face_map >= 0).all()

@@ -29,8 +29,8 @@ ANGLE = 0.5
 class Merged:
     shape: object
     # old face number -> new face number, and old edge number -> new edge
-    # number or -1 for an edge that went, both in TopExp_Explorer order,
-    # which is how a display mesh counts them
+    # number, -1 for one that went, both in TopExp_Explorer order, which is
+    # how a display mesh counts them
     face_map: np.ndarray
     edge_map: np.ndarray
     faces_before: int
@@ -49,10 +49,10 @@ def merge_flat(shape, progress=None, tolerance: float | None = None,
     from ..fileio.progress import Progress
     from .tolerance import tol
     progress = progress or Progress()
+    linear = tol() if tolerance is None else tolerance
+    square = float(np.cos(np.radians(angle)))
     try:
-        return _merge(shape, progress,
-                      tol() if tolerance is None else tolerance,
-                      float(np.cos(np.radians(angle))))
+        return _merge(shape, progress, linear, square)
     except _Unmergeable:
         return None
 
@@ -148,8 +148,10 @@ def _merge(shape, progress, linear, square):
     normals = newell / area[:, None]
 
     progress(0.62, "Finding coplanar faces")
-    counts = np.bincount(he, minlength=ne)
-    order = np.argsort(he, kind="stable")
+    doubled = _doubled(start, runs, normals)
+    kept = np.nonzero(~doubled[hf])[0]
+    counts = np.bincount(he[kept], minlength=ne)
+    order = kept[np.argsort(he[kept], kind="stable")]
     firsts = np.searchsorted(he[order], np.arange(ne))
     pair = np.nonzero(counts == 2)[0]
     ha, hb2 = order[firsts[pair]], order[firsts[pair] + 1]
@@ -188,26 +190,33 @@ def _merge(shape, progress, linear, square):
     progress(0.68, "Tracing the merged faces")
     rows = np.nonzero((sizes[owner] > 1) & ~interior[he])[0]
     loops, dropped = {}, []
+    # beside faces that went, a face can be left folding back on itself
+    beside = set(np.unique(owner[kept][np.isin(he[kept],
+                                               he[doubled[hf]])]).tolist())
     traced = _split(rows, owner[rows])
     for i, (g, own) in enumerate(traced.items()):
         if not i % 500:
             progress(0.66 + 0.12 * i / len(traced), "Tracing the merged faces")
         found = _loops(own, he, hb, start, stop, plane_n[g], where)
+        if found is not None and g in beside \
+                and not _simple(found, plane_n[g], where, linear):
+            found = None
         if found is None:
             dropped.append(g)
         else:
             loops[g] = found
     if dropped:
-        # pinched: those faces stay as they are
+        # pinched or folded: those faces stay as they are
         out = np.isin(label, dropped)
         interior[pair[inside & out[fa]]] = False
         label[out] = np.nonzero(out)[0]
         owner = label[hf]
 
     chains, chain_of, gone = _edge_chains(ne, nv, ends, where, vslack,
-                                          interior, he, hf, label)
+                                          interior, he[kept], hf[kept],
+                                          label)
     if chains:
-        touched = np.unique(owner[chain_of[he] >= 0])
+        touched = np.unique(owner[kept][chain_of[he[kept]] >= 0])
         for g in touched.tolist():
             if g in loops:
                 continue
@@ -216,7 +225,7 @@ def _merge(shape, progress, linear, square):
             if found is None:
                 raise _Unmergeable
             loops[g] = found
-    if not loops:
+    if not loops and not doubled.any():
         return Merged(shape, np.arange(nf), np.arange(ne), nf, nf)
     members_of = _split(np.arange(nf), label)
 
@@ -277,6 +286,8 @@ def _merge(shape, progress, linear, square):
         reshape.Replace(faces[lead], face)
         for m in members[1:].tolist():
             reshape.Remove(faces[m])
+    for f in np.nonzero(doubled)[0].tolist():
+        reshape.Remove(faces[f])
     progress.tick(0.9, "Putting the shape back together")
     result = reshape.Apply(shape)
     _keep_closed(shape, result)
@@ -300,7 +311,7 @@ def _merge(shape, progress, linear, square):
                 raise _Unmergeable
             face_map[members_of[groups_made[at - 1]]] = j
         j += 1
-    if (face_map < 0).any():
+    if (face_map[~doubled] < 0).any():
         raise _Unmergeable
 
     new_edges = occ.map_shapes(result, occ.EDGE)
@@ -322,8 +333,31 @@ def _merge(shape, progress, linear, square):
             edge_map[runs_of[c - 1]] = i
     # twice each face's area, holes wound the other way and taken off
     from . import geometry
-    geometry.know_area(result, 0.5 * float(area.sum()))
+    geometry.know_area(result, 0.5 * float(area[~doubled].sum()))
     return Merged(result, face_map, edge_map, nf, j)
+
+
+def _doubled(start, runs, normals) -> np.ndarray:
+    """Faces lying on another face corner for corner. Back to back they are
+    where two bodies stacked on each other touch, inside the whole, and
+    both go; facing the same way one is a copy, and one of them stays."""
+    out = np.zeros(len(runs) - 1, bool)
+    alike = {}
+    corners, rl = start.tolist(), runs.tolist()
+    for f in range(len(rl) - 1):
+        alike.setdefault(tuple(sorted(corners[rl[f]:rl[f + 1]])), []) \
+            .append(f)
+    for faces in alike.values():
+        if len(faces) < 2:
+            continue
+        ref = normals[faces[0]]
+        up = [f for f in faces if normals[f] @ ref > 0]
+        down = [f for f in faces if normals[f] @ ref <= 0]
+        left = up[len(down):] or down[len(up):]
+        out[faces] = True
+        if left:
+            out[left[0]] = False
+    return out
 
 
 def _grow(n, a, b, area, normals, origins, corners, runs, slack, square):
@@ -508,14 +542,64 @@ def _loops(rows, he, hb, start, stop, normal, where):
             for loop in ordered]
 
 
+def _simple(loops, normal, where, linear) -> bool:
+    """Whether the loops, laid flat on their plane, keep clear of each
+    other and of themselves: no two sides cross, touch or run along each
+    other except where one ends and the next begins."""
+    starts = np.array([s for loop in loops for _e, _b, s in loop])
+    nexts = np.array([loop[(k + 1) % len(loop)][2] for loop in loops
+                      for k in range(len(loop))])
+    u = np.cross(normal, [1.0, 0.0, 0.0])
+    if np.linalg.norm(u) < 0.5:
+        u = np.cross(normal, [0.0, 1.0, 0.0])
+    u /= np.linalg.norm(u)
+    v = np.cross(normal, u)
+    p = np.stack([where[starts] @ u, where[starts] @ v], axis=1)
+    q = np.stack([where[nexts] @ u, where[nexts] @ v], axis=1)
+    n = len(p)
+    i, j = np.triu_indices(n, 1)
+    # sides that share a corner meet there by right
+    meet = (starts[i] == starts[j]) | (starts[i] == nexts[j]) \
+        | (nexts[i] == starts[j]) | (nexts[i] == nexts[j])
+    i, j = i[~meet], j[~meet]
+    if not len(i):
+        return True
+    d = q - p
+    length = np.maximum(np.linalg.norm(d, axis=1), 1e-300)
+
+    def side(a, b, at):
+        """Signed distance of `at` from the line of side a, in its units."""
+        return (d[a, 0] * (at[:, 1] - p[a, 1])
+                - d[a, 1] * (at[:, 0] - p[a, 0])) / length[a]
+
+    def sign(x):
+        return np.where(x > linear, 1, np.where(x < -linear, -1, 0))
+
+    o1, o2 = sign(side(i, j, p[j])), sign(side(i, j, q[j]))
+    o3, o4 = sign(side(j, i, p[i])), sign(side(j, i, q[i]))
+    if ((o1 * o2 < 0) & (o3 * o4 < 0)).any():
+        return False                      # two sides cross
+
+    def within(a, at):
+        """Whether `at`, on side a's line, lies between its ends."""
+        t = ((at[:, 0] - p[a, 0]) * d[a, 0]
+             + (at[:, 1] - p[a, 1]) * d[a, 1]) / length[a]
+        return (t > -linear) & (t < length[a] + linear)
+
+    touch = ((o1 == 0) & within(i, p[j])) | ((o2 == 0) & within(i, q[j])) \
+        | ((o3 == 0) & within(j, p[i])) | ((o4 == 0) & within(j, q[i]))
+    return not touch.any()
+
+
 def _edge_chains(ne, nv, ends, where, vslack, interior, he, hf, label):
     """Runs of edges that are one straight line between the same faces,
     meeting at corners nothing else comes to: ([(end, end)] per run,
     run of each edge or -1, which corners go)."""
     chain_of = np.full(ne, -1, np.int64)
     gone = np.zeros(nv, bool)
-    alive = np.nonzero(~interior)[0]
     counts = np.bincount(he, minlength=ne)
+    # an edge only faces that went had is gone with them
+    alive = np.nonzero(~interior & (counts > 0))[0]
     # the faces either side of an edge, as the merged faces number them
     lo = np.full(ne, -1, np.int64)
     hi = np.full(ne, -1, np.int64)
@@ -607,12 +691,16 @@ def merged_display(mesh, merged: Merged):
     out._far = mesh.far
     out.local = mesh.local
     out.normals = mesh.normals
-    out.triangles = mesh.triangles
     out.curvature = mesh.curvature
     out.has_curvature = mesh.has_curvature
     out.local_isos = mesh.local_isos
     out.local_points = mesh.local_points
-    out.face_of_triangle = merged.face_map[faces].astype(np.int32)
+    # the triangles of faces that went, inside two bodies, go with them
+    renamed = merged.face_map[faces]
+    shown = renamed >= 0
+    out.triangles = (mesh.triangles if shown.all()
+                     else mesh.triangles[shown])
+    out.face_of_triangle = renamed[shown].astype(np.int32)
     renumbered = merged.edge_map[lines]
     kept = np.nonzero(renumbered >= 0)[0]
     kept = kept[np.argsort(renumbered[kept], kind="stable")]
