@@ -456,12 +456,12 @@ def mesh_from_brep(shape) -> MeshShape:
     return MeshShape(dm.vertices.astype(float), dm.triangles)
 
 
-def brep_from_mesh(mesh: MeshShape):
-    """Sew a mesh into a BREP shell (slow for big meshes)."""
+def brep_from_mesh(mesh: MeshShape, progress=None):
+    """A mesh as a BREP shell of flat triangular faces."""
     from ..fileio.obj import _shell_from_triangles
     from . import geometry
-    shape = _shell_from_triangles(mesh.vertices,
-                                  [tuple(t) for t in mesh.triangles])
+    shape = _shell_from_triangles(mesh.vertices, mesh.triangles,
+                                  progress=progress)
     if shape is None:
         raise geometry.GeometryError("Mesh could not be converted")
     return shape

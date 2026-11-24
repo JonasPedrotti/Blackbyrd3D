@@ -295,16 +295,26 @@ def cmd_pointcloud(ctx):
 
 @command("meshtobrep")
 def cmd_meshtobrep(ctx):
-    """Convert mesh objects into exact BREP shells (slow for big meshes)."""
+    """Convert mesh objects into BREP shells of flat triangles."""
     objs = yield SelectReq("Select meshes to convert", kinds=("mesh",))
     from ..core.mesh import brep_from_mesh
+    from ..fileio.progress import Cancelled
     done = 0
-    for o in objs:
+    with ctx.progress("Converting to BREP", title="Converting") as progress:
         try:
-            ctx.scene.replace_shape(o.id, brep_from_mesh(o.shape))
-            done += 1
-        except g.GeometryError as exc:
-            ctx.echo(f"{o.name}: {exc}")
+            for i, o in enumerate(objs):
+                share = progress.part(i / len(objs), (i + 1) / len(objs),
+                                      o.name)
+                try:
+                    shape = brep_from_mesh(o.shape, share.part(0.0, 0.7))
+                except g.GeometryError as exc:
+                    ctx.echo(f"{o.name}: {exc}")
+                    continue
+                share.tick(0.7, "Preparing the display")
+                ctx.scene.replace_shape(o.id, shape).mesh
+                done += 1
+        except Cancelled:
+            ctx.echo("Stopped.")
     ctx.echo(f"Converted {done} mesh(es) to BREP.")
 
 

@@ -15,6 +15,7 @@ clicks, or the MCP bridge — the command code never knows the difference.
 
 from __future__ import annotations
 
+import contextlib
 import math
 from dataclasses import dataclass, field
 from typing import Callable
@@ -368,6 +369,34 @@ class CommandContext:
         # every point it asks for after that is on the paper, wherever the
         # click lands (#129).
         self.paper_points = False
+
+    @contextlib.contextmanager
+    def progress(self, heading: str, title: str = "Working"):
+        """A Progress reporter behind the card an import shows, so a long
+        command is seen to move and can be stopped. Inert without a window."""
+        from ..fileio.progress import Progress, throttled
+        window = self.window
+        if window is None:
+            yield Progress(label=heading)
+            return
+        from PySide6.QtWidgets import QApplication
+        from ..ui.progress_card import ProgressCard
+        card = ProgressCard(window, heading, title=title)
+
+        def report(fraction, message):
+            card.setLabelText(message)
+            card.setValue(int(fraction * 100))
+            QApplication.processEvents()
+            return not card.wasCanceled()
+
+        journal = getattr(window, "journal", None)
+        paused = (journal.pause() if journal is not None
+                  else contextlib.nullcontext())
+        try:
+            with paused:
+                yield Progress(throttled(report), heading)
+        finally:
+            card.finish()
 
     def held_control_points(self) -> dict:
         """{obj_id: [index, ...]} — the control points the selection holds.

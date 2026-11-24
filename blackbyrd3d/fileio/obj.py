@@ -103,26 +103,84 @@ def import_obj(path: str, as_mesh: bool = True) -> list:
     return out
 
 
-def _shell_from_triangles(verts: np.ndarray, tris: list) -> object | None:
-    from ..core.occ import (
-        BRepBuilderAPI_MakePolygon, BRepBuilderAPI_MakeFace,
-        BRepBuilderAPI_Sewing, gp_Pnt,
-    )
-    sew = BRepBuilderAPI_Sewing(1e-6)
-    count = 0
-    for (a, b, c) in tris:
-        pa, pb, pc = (gp_Pnt(*verts[i]) for i in (a, b, c))
-        if pa.Distance(pb) < 1e-12 or pb.Distance(pc) < 1e-12 \
-                or pa.Distance(pc) < 1e-12:
-            continue
-        poly = BRepBuilderAPI_MakePolygon(pa, pb, pc, True)
-        if not poly.IsDone():
-            continue
-        face = BRepBuilderAPI_MakeFace(poly.Wire(), True)
-        if face.IsDone():
-            sew.Add(face.Face())
-            count += 1
-    if count == 0:
+def _shell_from_triangles(verts: np.ndarray, tris: list,
+                          tolerance: float = 1e-6,
+                          progress=None) -> object | None:
+    """One shell of planar faces, built with shared vertices and edges.
+
+    Points closer than `tolerance` are welded first, so neighbouring
+    triangles share their edges without sewing, which took minutes on
+    meshes of a hundred thousand triangles."""
+    from OCP.BRep import BRep_Builder
+    from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeEdge
+    from OCP.TopoDS import TopoDS_Face, TopoDS_Shell, TopoDS_Vertex, TopoDS_Wire
+    from OCP.Geom import Geom_Plane
+    from OCP.gp import gp_Dir, gp_Pnt
+
+    verts = np.asarray(verts, float).reshape(-1, 3)
+    tris = np.asarray(tris, np.int64).reshape(-1, 3)
+    if not len(tris) or not len(verts):
         return None
-    sew.Perform()
-    return sew.SewedShape()
+    keys = np.round(verts / tolerance).astype(np.int64)
+    _, first, weld = np.unique(keys, axis=0, return_index=True,
+                               return_inverse=True)
+    points = verts[first]
+    tris = weld.reshape(-1)[tris]
+
+    p = points[tris]
+    normals = np.cross(p[:, 1] - p[:, 0], p[:, 2] - p[:, 0])
+    lengths = np.linalg.norm(normals, axis=1)
+    sides = np.linalg.norm(p - np.roll(p, -1, axis=1), axis=2).max(axis=1)
+    keep = ((tris[:, 0] != tris[:, 1]) & (tris[:, 1] != tris[:, 2])
+            & (tris[:, 0] != tris[:, 2]) & (lengths > 1e-12 * sides ** 2))
+    tris, normals = tris[keep], normals[keep] / lengths[keep, None]
+    if not len(tris):
+        return None
+
+    ends = np.stack([tris, np.roll(tris, -1, axis=1)], axis=2)  # (M,3,2)
+    lo, hi = ends.min(axis=2), ends.max(axis=2)
+    pairs, edge_of = np.unique(np.stack([lo, hi], axis=2).reshape(-1, 2),
+                               axis=0, return_inverse=True)
+    edge_of = edge_of.reshape(-1, 3)
+    flipped = ends[:, :, 0] != lo
+
+    builder = BRep_Builder()
+    vertices = [None] * len(points)
+    for i in np.unique(pairs):
+        v = vertices[i] = TopoDS_Vertex()
+        builder.MakeVertex(v, gp_Pnt(*points[i]), tolerance)
+    report = progress or (lambda fraction, message="": None)
+    total = len(pairs) + len(tris)
+    edges = []
+    for k, (a, b) in enumerate(pairs.tolist()):
+        if not k % 2000:
+            report(k / total, "Building edges")
+        edges.append(BRepBuilderAPI_MakeEdge(vertices[a], vertices[b]).Edge())
+    reversed_edges = [e.Reversed() for e in edges]
+
+    shell = TopoDS_Shell()
+    builder.MakeShell(shell)
+    for k, (t, ids, flip, n) in enumerate(zip(
+            tris.tolist(), edge_of.tolist(), flipped.tolist(),
+            normals.tolist())):
+        if not k % 2000:
+            report((len(pairs) + k) / total, "Building faces")
+        wire = TopoDS_Wire()
+        builder.MakeWire(wire)
+        for k in range(3):
+            builder.Add(wire, reversed_edges[ids[k]] if flip[k]
+                        else edges[ids[k]])
+        wire.Closed(True)
+        face = TopoDS_Face()
+        builder.MakeFace(face, Geom_Plane(gp_Pnt(*points[t[0]]),
+                                          gp_Dir(*n)), tolerance)
+        builder.Add(face, wire)
+        builder.Add(shell, face)
+    shell.Closed(_is_closed(pairs, edge_of))
+    return shell
+
+
+def _is_closed(pairs: np.ndarray, edge_of: np.ndarray) -> bool:
+    """Whether every edge is shared by exactly two triangles."""
+    counts = np.bincount(edge_of.reshape(-1), minlength=len(pairs))
+    return bool(len(counts)) and bool((counts == 2).all())
