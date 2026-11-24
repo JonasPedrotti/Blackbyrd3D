@@ -79,6 +79,12 @@ class OsnapBar(QWidget):
         self._ortho.setChecked(viewport.ortho)
         self._ortho.toggled.connect(self._ortho_toggled)
         layout.addWidget(self._ortho)
+        self._track = self._button(
+            "Guides", "While picking a point, tap Ctrl to drop a temporary "
+            "guide to snap and line up to. Tap it again to remove it")
+        self._track.setChecked(viewport.snaps.tracking)
+        self._track.toggled.connect(self._track_toggled)
+        layout.addWidget(self._track)
         self._project = self._button(
             "Project", "Put every picked point at the height beside it")
         self._project.setChecked(viewport.snaps.project_enabled)
@@ -170,6 +176,13 @@ class OsnapBar(QWidget):
         if self.config:
             self.config.set("ortho", on)
 
+    def _track_toggled(self, on: bool):
+        self.viewport.snaps.tracking = on
+        if not on:
+            self.viewport.snaps.guides.clear()
+        if self.config:
+            self.config.set("smart_track", on)
+
     def _project_toggled(self, on: bool):
         self.viewport.snaps.project_enabled = on
         self._project_z.setEnabled(on)
@@ -192,5 +205,6 @@ class OsnapBar(QWidget):
             btn.setChecked(self.viewport.snaps.types.get(t, False))
         self._grid.setChecked(self.viewport.grid_snap)
         self._ortho.setChecked(self.viewport.ortho)
+        self._track.setChecked(self.viewport.snaps.tracking)
         self._project.setChecked(self.viewport.snaps.project_enabled)
         self._project_z.setValue(self.viewport.snaps.project_z)
