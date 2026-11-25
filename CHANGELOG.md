@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.4.0
 
 - **A tidier installer.** Its pages match its title bar, the text sits in
   the middle of each page and the window is lower.
