@@ -290,7 +290,8 @@ class AmbientOcclusion:
         GL.glBindTexture(GL.GL_TEXTURE_2D, 0)
         GL.glBindVertexArray(0)
         GL.glUseProgram(0)
-        GL.glBlendFunc(GL.GL_SRC_ALPHA, GL.GL_ONE_MINUS_SRC_ALPHA)
+        GL.glBlendFuncSeparate(GL.GL_SRC_ALPHA, GL.GL_ONE_MINUS_SRC_ALPHA,
+                               GL.GL_ONE, GL.GL_ONE_MINUS_SRC_ALPHA)
         GL.glDepthMask(True)
         GL.glEnable(GL.GL_DEPTH_TEST)
 

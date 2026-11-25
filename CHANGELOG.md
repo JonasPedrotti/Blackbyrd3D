@@ -16,6 +16,8 @@
 - **Snap names instead of snap icons.** The snap kind (End, Mid, Cen,
   Perp ...) shows above the distance readout, the pick radius is a bit
   larger, Cen's much larger, and Perp reaches every side of a polyline.
+- **Smooth lines.** Curves, edges, isocurves and the grid are anti-aliased
+  instead of stepped, and no pale fringe shows beside edges anymore.
 
 ## 0.3.0
 
