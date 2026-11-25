@@ -61,6 +61,7 @@ nav:
       - Command workspace: explanation/command-workspace.md
   - Coming from Rhino: coming-from-rhino.md
   - Privacy: privacy.md
+  - Code signing: code-signing.md
 
 markdown_extensions:
   - admonition

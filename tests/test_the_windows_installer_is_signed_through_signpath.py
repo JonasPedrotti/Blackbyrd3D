@@ -288,3 +288,18 @@ def test_the_policy_is_published_and_linked():
     assert "[Privacy](docs/privacy.md)" in readme
     install = (ROOT / "docs" / "getstarted" / "install.md").read_text(encoding="utf-8")
     assert "[Privacy](../privacy.md)" in install
+
+
+def test_the_code_signing_policy_is_published_and_linked():
+    """SignPath Foundation asks for a public policy: its credit line, who
+    commits, reviews and approves, and the privacy policy."""
+    page = (ROOT / "docs" / "code-signing.md").read_text(encoding="utf-8")
+    credit = " ".join(page.split())
+    assert ("Free code signing provided by [SignPath.io](https://about.signpath.io), "
+            "certificate by [SignPath Foundation](https://signpath.org).") in credit
+    assert "Committers and reviewers" in page and "Approvers" in page
+    assert "(privacy.md)" in page
+    mkdocs = (ROOT / "mkdocs.yml").read_text(encoding="utf-8")
+    assert "Code signing: code-signing.md" in mkdocs
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    assert "[Code signing](docs/code-signing.md)" in readme
