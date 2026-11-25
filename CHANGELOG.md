@@ -17,6 +17,12 @@
   with Mid and Perp.
 - **Pushpull picks with a plain click.** It always asks for the face, and
   a click on one goes straight to the distance.
+- **An installer in the app's colours.** The Windows installer is dark like
+  Blackbyrd3D, with the bird on its first and last page.
+- **Default app from the installer.** A ticked box makes Blackbyrd3D open
+  .byrd and .wyrm files on Windows.
+- **The update check says it ran.** After launch the status bar says the
+  app is up to date, or that GitHub could not be reached.
 
 ## 0.2.1
 

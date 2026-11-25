@@ -75,6 +75,8 @@ def test_check_now_runs_the_manual_check(dlg):
 class _Main(QMainWindow):
     _on_update_available = MainWindow._on_update_available
     _open_update_notice = MainWindow._open_update_notice
+    _on_update_none = MainWindow._on_update_none
+    UPDATE_NOTE_MS = MainWindow.UPDATE_NOTE_MS
 
     def __init__(self):
         super().__init__()
@@ -116,3 +118,48 @@ def test_installer_applies_a_ticked_task_to_an_existing_file():
     assert "'\"check_updates\": true'" in iss
     assert "'\"check_updates\": false'" in iss
     assert "SaveStringToFile(CfgPath, Json" in iss
+
+
+def test_a_check_that_finds_nothing_says_so():
+    """A ticked check that found nothing newer looked exactly like one that
+    never ran, so it read as the installer's choice being ignored."""
+    from blackbyrd3d import __version__
+    win = _Main()
+    win._on_update_none(True)
+    assert win._update_note.text() == f"Blackbyrd3D {__version__} is up to date"
+    assert not win._update_note.isHidden()
+    win._on_update_none(False)
+    assert "Could not reach GitHub" in win._update_note.text()
+
+
+def test_the_launch_check_reports_back_either_way(monkeypatch):
+    """start_update_check emits one of its two signals, never neither."""
+    import threading
+
+    from blackbyrd3d.utils import updates
+    got = []
+
+    class _Fake:
+        cfg = Config(path="nonexistent-settings.json")
+        updateAvailable = type("S", (), {"emit": lambda self, r: got.append(("new", r))})()
+        updateUpToDate = type("S", (), {"emit": lambda self, ok: got.append(("none", ok))})()
+
+    class _Now(threading.Thread):
+        def start(self):
+            self.run()
+    monkeypatch.setattr(threading, "Thread", _Now)
+    monkeypatch.delenv("BYRD3D_NO_UPDATE_CHECK", raising=False)
+    from PySide6.QtWidgets import QApplication
+    monkeypatch.setattr(QApplication, "platformName", staticmethod(lambda: "windows"))
+
+    monkeypatch.setattr(updates, "_fetch", lambda: '{"tag_name": "v0.0.1"}')
+    MainWindow.start_update_check(_Fake())
+    assert got == [("none", True)]
+
+    got.clear()
+
+    def offline():
+        raise OSError("offline")
+    monkeypatch.setattr(updates, "_fetch", offline)
+    MainWindow.start_update_check(_Fake())
+    assert got == [("none", False)]

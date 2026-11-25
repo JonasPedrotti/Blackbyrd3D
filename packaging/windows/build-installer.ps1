@@ -35,6 +35,9 @@ if (-not (Test-Path $iscc)) { $iscc = "$env:ProgramFiles\Inno Setup 6\ISCC.exe" 
 # winget installs it for the current user only
 if (-not (Test-Path $iscc)) { $iscc = "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe" }
 if (-not (Test-Path $iscc)) { throw "Inno Setup 6 not found - install from jrsoftware.org" }
+# the wizard's pictures, drawn from the app's own marks
+& $Python make_wizard_images.py
+if ($LASTEXITCODE -ne 0) { throw "Could not draw the wizard images" }
 & $iscc installer.iss
 if ($LASTEXITCODE -ne 0) { throw "ISCC failed" }
 
