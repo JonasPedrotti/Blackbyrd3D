@@ -44,6 +44,9 @@ class _Bucket:
         self.uploads.append(np.asarray(pts, float))
         self.count = len(pts)
 
+    def wide(self):
+        return self
+
 
 @pytest.fixture
 def view(monkeypatch):
@@ -175,7 +178,7 @@ def test_the_grid_fold_happens_in_float64(view):
     mvp64 = np.eye(4) @ np.diag([1.0, 1.0, 1.0, 1.0])
     mvp64[0, 3] = -float(FAR[0])          # a camera looking at the plane
     view._draw_grid(mvp64)
-    held = view._mvp_state.get(view._line_prog)
+    held = view._mvp_state.get(view._thick_prog)
     truth = (mvp64 @ view.cplane.basis_matrix()).astype(np.float32)
     assert held is not None and np.array_equal(held, truth)
     assert abs(float(held[0, 3])) < 1.0, \

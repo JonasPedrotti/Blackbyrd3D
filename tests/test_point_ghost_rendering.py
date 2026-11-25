@@ -35,6 +35,11 @@ class _DrawStream:
         assert first + count <= len(self.vertices), "draw exceeds the uploaded buffer"
         self.draws.append((mode, self.vertices[first:first + count].copy()))
 
+    def glDrawElements(self, mode, count, *args):
+        # lines go up as segment quads; what they stand for is the segments
+        assert count > 0
+        self.draws.append((self.GL_LINES, self.wide_vertices.copy()))
+
 
 class _RecordingBatch:
     """A dynamic buffer without GPU handles; no drawing logic lives here."""
@@ -48,6 +53,10 @@ class _RecordingBatch:
     def update(self, vertices):
         self.stream.vertices = np.asarray(vertices).copy()
         self.count = len(vertices)
+
+    def wide(self):
+        self.stream.wide_vertices = self.stream.vertices
+        return self
 
 
 @pytest.fixture

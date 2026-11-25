@@ -25,6 +25,7 @@ class _GL:
         self.ranges = []
         self.events = []
         self.names = {}
+        self.program = 0
 
     def __getattr__(self, name):
         if name.startswith("GL_"):
@@ -34,9 +35,14 @@ class _GL:
                 self.ranges.append((near, far))
                 self.events.append(("range", far))
             return depth_range
+        if name == "glUseProgram":
+            def use(prog):
+                self.program = prog
+            return use
         if name == "glDrawElements":
             def draw(mode, *a):
-                if mode == self.GL_TRIANGLES:
+                # a curve's quads are triangles too, through its own program
+                if mode == self.GL_TRIANGLES and self.program == 11:
                     self.events.append(("triangles", None))
             return draw
         return lambda *a, **k: 0

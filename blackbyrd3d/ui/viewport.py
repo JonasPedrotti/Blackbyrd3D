@@ -460,25 +460,78 @@ layout(location=0) in vec3 pos;      // this end of the segment
 layout(location=1) in vec3 other;    // the far end
 layout(location=2) in float side;    // +1 / -1 across the line
 uniform mat4 uMVP;
-uniform vec2 uViewport;              // pixels
+uniform vec2 uViewport;              // in the pixels uWidthPx is given in
 uniform float uWidthPx;
+uniform float uPixel;                // one pixel of the picture, in those
 uniform int uClipCount;
 uniform vec4 uClips[4];
 out float gl_ClipDistance[4];
+noperspective out float vAcross;     // picture pixels off the centre line
+const float NEAR_W = 1e-5;
 void main() {
-    for (int i = 0; i < uClipCount; ++i)
-        gl_ClipDistance[i] = dot(uClips[i], vec4(pos, 1.0));
-
     vec4 p = uMVP * vec4(pos, 1.0);
     vec4 q = uMVP * vec4(other, 1.0);
+    vec3 at = pos;
+    // An end behind the eye has no place on screen, so it slides along
+    // the segment to just in front; GL_LINES had the card clip for it.
+    if (p.w < NEAR_W && q.w < NEAR_W) {
+        gl_Position = vec4(0.0, 0.0, 2.0, 1.0);
+        vAcross = 0.0;
+        for (int i = 0; i < uClipCount; ++i)
+            gl_ClipDistance[i] = -1.0;
+        return;
+    }
+    vec4 p0 = p;
+    if (p.w < NEAR_W) {
+        float t = (NEAR_W - p.w) / (q.w - p.w);
+        p = mix(p, q, t);
+        at = mix(pos, other, t);
+    }
+    if (q.w < NEAR_W)
+        q = mix(q, p0, (NEAR_W - q.w) / (p0.w - q.w));
+    for (int i = 0; i < uClipCount; ++i)
+        gl_ClipDistance[i] = dot(uClips[i], vec4(at, 1.0));
+
     vec2 half_vp = uViewport * 0.5;
     vec2 sp = p.xy / p.w * half_vp;
     vec2 sq = q.xy / q.w * half_vp;
     vec2 dir = sq - sp;
     float len = length(dir);
-    vec2 n = len > 1e-4 ? vec2(-dir.y, dir.x) / len : vec2(1.0, 0.0);
-    sp += n * side * uWidthPx * 0.5;
+    vec2 u = len > 1e-6 ? dir / len : vec2(1.0, 0.0);
+    vec2 n = vec2(-u.y, u.x);
+    // the line and a pixel of fringe each side for the fragment shader to
+    // fade over, and half a pixel past each end so a bend has no notch
+    float half_w = 0.5 * max(uWidthPx, uPixel) + uPixel;
+    sp += n * side * half_w - u * 0.5 * uPixel;
+    // n turns round at the far end (_thick_arrays puts it at corners 2
+    // and 3), so the far end's sides count the other way
+    float end = (gl_VertexID & 2) == 0 ? 1.0 : -1.0;
+    vAcross = side * end * half_w / uPixel;
     gl_Position = vec4(sp / half_vp * p.w, p.z, p.w);
+}
+"""
+
+# Coverage of a box-filtered line, so an edge fades over a pixel instead
+# of stepping. A faint pixel is written a little deeper than a solid one:
+# where two segments of a polyline overlap at a bend, the stronger of the
+# two wins the depth test rather than whichever came first. The bias stays
+# well under CURVE_DEPTH_NUDGE, so a curve's fringe still lies over the
+# face it is drawn on.
+THICK_FRAG = """
+#version 330 core
+uniform vec4 uColor;
+uniform float uWidthPx;
+uniform float uPixel;
+noperspective in float vAcross;
+out vec4 frag;
+void main() {
+    float w = uWidthPx / uPixel;
+    float cover = clamp(0.5 * max(w, 1.0) + 0.5 - abs(vAcross), 0.0, 1.0)
+                  * min(w, 1.0);
+    if (cover <= 0.0)
+        discard;
+    frag = vec4(uColor.rgb, uColor.a * cover);
+    gl_FragDepth = gl_FragCoord.z + (1.0 - cover) * 2e-7;
 }
 """
 
@@ -646,6 +699,14 @@ def _back_to_front(centres, valid, eye):
     if len(centres) and valid.any():
         keys[valid] = -np.linalg.norm(centres[valid] - eye, axis=1)
     return np.argsort(keys, kind="stable")
+
+
+def _blend_over():
+    """Colour over what is there, and the picture's alpha kept opaque: Qt
+    lays the pane over the window by it, and a line's faded edge that
+    thinned it let the window show through as a pale fringe."""
+    GL.glBlendFuncSeparate(GL.GL_SRC_ALPHA, GL.GL_ONE_MINUS_SRC_ALPHA,
+                           GL.GL_ONE, GL.GL_ONE_MINUS_SRC_ALPHA)
 
 
 def _thick_arrays(segments):
@@ -1199,6 +1260,7 @@ class _MeshBuffers:
         self.line_vbo = self.line_count = 0
         self.thick_vbo = self.thick_ebo = self.thick_count = 0
         self.iso_vbo = self.iso_count = 0
+        self.iso_thick_vbo = self.iso_thick_ebo = self.iso_thick_count = 0
         self.cloud_vbo = self.cloud_count = 0
         self.cloud_levels = None         # cumulative counts per LOD level
         self.cloud_colored = False       # points brought their own colour
@@ -1247,6 +1309,10 @@ class _MeshBuffers:
                    else rebased(mesh.local_isos, self.anchor)).reshape(-1, 3)
             self.iso_vbo = self._upload(GL.GL_ARRAY_BUFFER, pts)
             self.iso_count = len(pts)
+            flat, idx = _thick_arrays(pts.reshape(-1, 2, 3))
+            self.iso_thick_vbo = self._upload(GL.GL_ARRAY_BUFFER, flat)
+            self.iso_thick_ebo = self._upload(GL.GL_ELEMENT_ARRAY_BUFFER, idx)
+            self.iso_thick_count = len(idx)
 
     def _upload(self, target, data) -> int:
         buf = GL.glGenBuffers(1)
@@ -1289,7 +1355,8 @@ class _GpuObject:
 
     _BUILT_LATER = frozenset({"buffers", "tri_vao", "line_vao", "line_count",
                               "thick_vao", "thick_count", "iso_vao",
-                              "iso_count", "cloud_vao"})
+                              "iso_count", "iso_thick_vao",
+                              "iso_thick_count", "cloud_vao"})
 
     def __init__(self, mesh, dash=None, dash_key=None, share_id=None,
                  lazy=False):
@@ -1351,6 +1418,7 @@ class _GpuObject:
         self.line_vao = self.line_count = 0
         self.thick_vao = self.thick_count = 0
         self.iso_vao = self.iso_count = 0
+        self.iso_thick_vao = self.iso_thick_count = 0
         self.cloud_vao = self.cloud_count = 0
         self.cloud_levels = buf.cloud_levels
         self.cloud_colored = buf.cloud_colored
@@ -1374,6 +1442,9 @@ class _GpuObject:
         if buf.iso_count:
             self.iso_vao = self._vertex_array(buf.iso_vbo, _POINT_ATTRS)
             self.iso_count = buf.iso_count
+            self.iso_thick_vao = self._vertex_array(
+                buf.iso_thick_vbo, _WIDE_ATTRS, ebo=buf.iso_thick_ebo)
+            self.iso_thick_count = buf.iso_thick_count
         GL.glBindVertexArray(0)
 
     @staticmethod
@@ -1415,6 +1486,7 @@ class _GpuObject:
             return
         for vao in (self.tri_vao, self.line_vao, self.iso_vao,
                     getattr(self, "thick_vao", 0),
+                    getattr(self, "iso_thick_vao", 0),
                     getattr(self, "cloud_vao", 0)):
             if vao:
                 GL.glDeleteVertexArrays(1, [vao])
@@ -1432,7 +1504,7 @@ class _GpuObject:
             self._unbuilt = None
             return
         self.tri_vao = self.line_vao = self.iso_vao = self.thick_vao = 0
-        self.cloud_vao = 0
+        self.iso_thick_vao = self.cloud_vao = 0
         gpu_share.release(self._share_key)
 
 
@@ -1512,6 +1584,9 @@ class _LineBatch:
         GL.glVertexAttribPointer(0, 3, GL.GL_FLOAT, False, 0,
                                  ctypes.c_void_p(0))
         GL.glBindVertexArray(0)
+        self._points = data
+        self._wide = None               # the same segments as quads
+        self._wide_stale = True
 
     def update(self, points: np.ndarray):
         data = points.astype(np.float32)
@@ -1519,10 +1594,25 @@ class _LineBatch:
         GL.glBufferData(GL.GL_ARRAY_BUFFER, max(data.nbytes, 12), data,
                         GL.GL_DYNAMIC_DRAW)
         self.count = len(data)
+        self._points = data
+        self._wide_stale = True
+
+    def wide(self) -> "_ThickBatch":
+        """The points as segment quads for the smooth line shader, made
+        only when asked: the preview batch also carries triangles."""
+        if self._wide is None:
+            self._wide = _ThickBatch()
+        if self._wide_stale:
+            self._wide.update(self._points[:self.count // 2 * 2]
+                              .reshape(-1, 2, 3))
+            self._wide_stale = False
+        return self._wide
 
     def release(self):
         GL.glDeleteVertexArrays(1, [self.vao])
         GL.glDeleteBuffers(1, [self.vbo])
+        if self._wide is not None:
+            self._wide.release()
 
 
 class _ThickBatch:
@@ -1775,6 +1865,7 @@ class Viewport(QOpenGLWidget):
         # the status bar can say when a scan is being shown thinned
         self.cloud_lod = None
         self._max_line_width = 1.0          # real cap read back in initializeGL
+        self._pane_ratio = 1.0              # read again every frame
         self._uloc_cache: dict = {}
         # what the GL context is already set to, so the draw loop can stop
         # re-sending it. _reset_gl_state() drops all of it.
@@ -1851,7 +1942,7 @@ class Viewport(QOpenGLWidget):
         self._ao_failed = False
         self._mesh_prog = _compile(MESH_VERT, MESH_FRAG)
         self._line_prog = _compile(LINE_VERT, LINE_FRAG)
-        self._thick_prog = _compile(THICK_VERT, LINE_FRAG)
+        self._thick_prog = _compile(THICK_VERT, THICK_FRAG)
         self._point_prog = _compile(POINT_VERT, POINT_FRAG)
         self._marker_prog = _compile(MARKER_VERT, MARKER_FRAG)
         self._bg_prog = _compile(BG_VERT, BG_FRAG)
@@ -1909,7 +2000,7 @@ class Viewport(QOpenGLWidget):
         GL.glEnable(GL.GL_DEPTH_TEST)
         GL.glEnable(GL.GL_MULTISAMPLE)
         GL.glEnable(GL.GL_BLEND)
-        GL.glBlendFunc(GL.GL_SRC_ALPHA, GL.GL_ONE_MINUS_SRC_ALPHA)
+        _blend_over()
         # the point shader sets gl_PointSize; a core profile needs telling
         try:
             GL.glEnable(GL.GL_PROGRAM_POINT_SIZE)
@@ -1971,6 +2062,7 @@ class Viewport(QOpenGLWidget):
         if self._paint_failed:
             return              # said why once; not once per repaint
         try:
+            self._pane_ratio = self.devicePixelRatioF()
             self._paint_frame()
         except Exception:                                       # noqa: BLE001
             self._paint_failed = True
@@ -1989,7 +2081,7 @@ class Viewport(QOpenGLWidget):
         # back — re-assert what every frame relies on.
         self._reset_gl_state()
         GL.glEnable(GL.GL_BLEND)
-        GL.glBlendFunc(GL.GL_SRC_ALPHA, GL.GL_ONE_MINUS_SRC_ALPHA)
+        _blend_over()
         GL.glEnable(GL.GL_DEPTH_TEST)
         GL.glDepthFunc(GL.GL_LESS)          # a parallel view changes both
         GL.glDisable(GL.GL_DEPTH_CLAMP)     # for its overlays, below
@@ -2003,7 +2095,7 @@ class Viewport(QOpenGLWidget):
             painter.beginNativePainting()
             GL.glEnable(GL.GL_DEPTH_TEST)
             GL.glEnable(GL.GL_BLEND)
-            GL.glBlendFunc(GL.GL_SRC_ALPHA, GL.GL_ONE_MINUS_SRC_ALPHA)
+            _blend_over()
             self._sync_gpu()
             self.layout_view.paint()
             self._draw_pending(self.layout_view._paper_mvp())
@@ -2200,7 +2292,7 @@ class Viewport(QOpenGLWidget):
             GL.glBindFramebuffer(GL.GL_FRAMEBUFFER, target)
             GL.glViewport(*viewport)
             GL.glEnable(GL.GL_BLEND)
-            GL.glBlendFunc(GL.GL_SRC_ALPHA, GL.GL_ONE_MINUS_SRC_ALPHA)
+            _blend_over()
             GL.glEnable(GL.GL_DEPTH_TEST)
             GL.glDepthMask(True)
         GL.glBindVertexArray(0)
@@ -2544,20 +2636,15 @@ class Viewport(QOpenGLWidget):
         if hidden_segs:
             allh = np.concatenate(hidden_segs).reshape(-1, 3)
             self._preview.update(allh.astype(np.float32))
-            self._set_line_uniforms(mvp2d, (0.45, 0.45, 0.5, 1.0))
-            self._line_width(1.0)
-            GL.glBindVertexArray(self._preview.vao)
-            GL.glDrawArrays(GL.GL_LINES, 0, len(allh))
+            self._draw_lines(self._preview, mvp2d, (0.45, 0.45, 0.5, 1.0))
         vis_segs = []
         for poly in data["visible"]:
             vis_segs.append(np.stack([poly[:-1], poly[1:]], axis=1))
         if vis_segs:
             allv = np.concatenate(vis_segs).reshape(-1, 3)
             self._preview.update(allv.astype(np.float32))
-            self._set_line_uniforms(mvp2d, (0.08, 0.08, 0.1, 1.0))
-            self._line_width(1.6)
-            GL.glBindVertexArray(self._preview.vao)
-            GL.glDrawArrays(GL.GL_LINES, 0, len(allv))
+            self._draw_lines(self._preview, mvp2d, (0.08, 0.08, 0.1, 1.0),
+                             1.6)
         GL.glEnable(GL.GL_DEPTH_TEST)
 
     def _cull(self, mvp, objects: list) -> list:
@@ -2721,12 +2808,10 @@ class Viewport(QOpenGLWidget):
         self._bound_color[prog] = c
 
     def _draw_lines(self, batch: _LineBatch, mvp, color, width=1.0):
-        if not batch or batch.count == 0:
+        if not batch or batch.count < 2:
             return
-        self._set_line_uniforms(mvp, color)
-        self._line_width(width)
-        GL.glBindVertexArray(batch.vao)
-        GL.glDrawArrays(GL.GL_LINES, 0, batch.count)
+        wide = batch.wide()
+        self._draw_wide(wide.vao, wide.count, mvp, color, width)
 
     def _texture_for(self, path: str, image_data: bytes | None = None):
         if image_data is None:
@@ -3481,11 +3566,8 @@ class Viewport(QOpenGLWidget):
                 pend = entry[1] if entry is not None else None
                 if pend is not None and len(pend):
                     self._preview.update(pend)
-                    self._set_line_uniforms(
-                        flat, (*self.scene.color_of(obj), 0.5))
-                    self._line_width(1.0)
-                    GL.glBindVertexArray(self._preview.vao)
-                    GL.glDrawArrays(GL.GL_LINES, 0, len(pend))
+                    self._draw_lines(self._preview, flat,
+                                     (*self.scene.color_of(obj), 0.5))
                 continue
             if gpu.tri_count:
                 self._nudge_curves(False)
@@ -3715,10 +3797,7 @@ class Viewport(QOpenGLWidget):
                 else:
                     iso_color = (color[0] * 0.30, color[1] * 0.30,
                                  color[2] * 0.30, 0.8)
-                self._set_line_uniforms(omvp, iso_color)
-                self._line_width(1.0)
-                GL.glBindVertexArray(gpu.iso_vao)
-                GL.glDrawArrays(GL.GL_LINES, 0, gpu.iso_count)
+                self._draw_isos(gpu, omvp, iso_color)
             if len(obj.mesh.points) and not obj.annotation:
                 self._draw_point_markers(
                     omvp, obj.mesh.points,
@@ -3897,10 +3976,7 @@ class Viewport(QOpenGLWidget):
             self._draw_edges(gpu, mvp, edge, width,
                              rank=getattr(batch, "rank", 0))
         if gpu.iso_count and show_isos:
-            self._set_line_uniforms(mvp, iso)
-            self._line_width(1.0)
-            GL.glBindVertexArray(gpu.iso_vao)
-            GL.glDrawArrays(GL.GL_LINES, 0, gpu.iso_count)
+            self._draw_isos(gpu, mvp, iso)
 
     def _draw_section_caps(self, mvp, view, clips, objects, locked_layers,
                            mode):
@@ -4233,10 +4309,8 @@ class Viewport(QOpenGLWidget):
             mn, mx = obj.bbox()
             segs = rebased(_bbox_segments(mn, mx), gpu.anchor)
             self._preview.update(segs)
-            self._set_line_uniforms(mvp, (*self._selection_color(obj.id), 1.0))
-            self._line_width(1.0)
-            GL.glBindVertexArray(self._preview.vao)
-            GL.glDrawArrays(GL.GL_LINES, 0, len(segs))
+            self._draw_lines(self._preview, mvp,
+                             (*self._selection_color(obj.id), 1.0))
 
     def _draw_ground_shadow(self, mvp, objects):
         """Flatten object triangles onto z=0 as a soft dark stamp."""
@@ -4273,7 +4347,7 @@ class Viewport(QOpenGLWidget):
             GL.glDrawElements(GL.GL_TRIANGLES, gpu.tri_count,
                               GL.GL_UNSIGNED_INT, ctypes.c_void_p(0))
         GL.glDepthMask(True)
-        GL.glBlendFunc(GL.GL_SRC_ALPHA, GL.GL_ONE_MINUS_SRC_ALPHA)
+        _blend_over()
 
     def _draw_text_background(self, text, mvp, anchor, light: bool):
         """The patch of drawing colour text sits on, hiding what lies
@@ -4316,21 +4390,36 @@ class Viewport(QOpenGLWidget):
         if not len(segments):
             return
         self._preview_thick.update(np.asarray(segments, np.float32))
+        self._draw_wide(self._preview_thick.vao, self._preview_thick.count,
+                        mvp, color, width)
+
+    def _draw_wide(self, vao, count, mvp, color, width: float):
+        """Segment quads through the smooth line shader: `width` pixels
+        wide, faded over a pixel at the edges rather than stepped."""
         prog = self._thick_prog
         self._use(prog)
+        # asarray, not astype: astype copies even when the dtype already
+        # matches, and a fresh array every object defeated _set_mvp entirely
         self._set_mvp(prog, np.asarray(mvp, np.float32))
         self._set_uniform(prog, "uViewport", GL.glUniform2f,
                           *self._target_size())
         self._set_uniform(prog, "uWidthPx", GL.glUniform1f, float(width))
+        self._set_uniform(prog, "uPixel", GL.glUniform1f, self._pixel_size())
         self._set_color4(prog, color)
-        GL.glBindVertexArray(self._preview_thick.vao)
-        GL.glDrawElements(GL.GL_TRIANGLES, self._preview_thick.count,
-                          GL.GL_UNSIGNED_INT, ctypes.c_void_p(0))
+        GL.glBindVertexArray(vao)
+        GL.glDrawElements(GL.GL_TRIANGLES, count, GL.GL_UNSIGNED_INT,
+                          ctypes.c_void_p(0))
+
+    def _pixel_size(self) -> float:
+        """One pixel of the picture in the pixels widths are given in."""
+        ratio = (self._target.ratio if self._target is not None
+                 else self._pane_ratio)
+        return 1.0 / ratio if ratio > 0 else 1.0
 
     def _draw_edges(self, gpu, mvp, color, width: float,
                     hatch: bool = False, rank: int = 0):
-        """Object edges at a given pixel width. Wide lines fall back to a
-        screen-space quad shader where GL_LINES are capped (llvmpipe).
+        """Object edges at a given pixel width, through the screen-space
+        quad shader: smooth, and as wide as asked on any driver.
 
         A curve, whose lines are all there is of it, is drawn a hair
         nearer than it is: lying exactly on a mesh's edge or a face's, the
@@ -4400,25 +4489,23 @@ class Viewport(QOpenGLWidget):
         self._curves_nudged = amount
 
     def _draw_edge_lines(self, gpu, mvp, color, width: float):
-        if width <= self._max_line_width + 0.25 or not gpu.thick_count:
-            self._set_line_uniforms(mvp, color)
-            self._line_width(width)
-            GL.glBindVertexArray(gpu.line_vao)
-            GL.glDrawArrays(GL.GL_LINES, 0, gpu.line_count)
+        if gpu.thick_count:
+            self._draw_wide(gpu.thick_vao, gpu.thick_count, mvp, color, width)
             return
-        prog = self._thick_prog
-        self._use(prog)
-        # asarray, not astype: astype copies even when the dtype already
-        # matches, and a fresh array every object defeated _set_mvp entirely —
-        # this is the path llvmpipe takes for every wide line it draws.
-        self._set_mvp(prog, np.asarray(mvp, np.float32))
-        self._set_uniform(prog, "uViewport", GL.glUniform2f,
-                          *self._target_size())
-        self._set_uniform(prog, "uWidthPx", GL.glUniform1f, float(width))
-        self._set_color4(prog, color)
-        GL.glBindVertexArray(gpu.thick_vao)
-        GL.glDrawElements(GL.GL_TRIANGLES, gpu.thick_count,
-                          GL.GL_UNSIGNED_INT, ctypes.c_void_p(0))
+        self._set_line_uniforms(mvp, color)
+        self._line_width(width)
+        GL.glBindVertexArray(gpu.line_vao)
+        GL.glDrawArrays(GL.GL_LINES, 0, gpu.line_count)
+
+    def _draw_isos(self, gpu, mvp, color):
+        if gpu.iso_thick_count:
+            self._draw_wide(gpu.iso_thick_vao, gpu.iso_thick_count, mvp,
+                            color, 1.0)
+            return
+        self._set_line_uniforms(mvp, color)
+        self._line_width(1.0)
+        GL.glBindVertexArray(gpu.iso_vao)
+        GL.glDrawArrays(GL.GL_LINES, 0, gpu.iso_count)
 
     def _drawing_through(self):
         """The detail the running command is drawing through, or None.
@@ -4784,10 +4871,7 @@ class Viewport(QOpenGLWidget):
                     arr = rebased(np.concatenate(segs),
                                   self._frame_anchor)
                     self._preview.update(arr)
-                    self._set_line_uniforms(mvp, color)
-                    self._line_width(width)
-                    GL.glBindVertexArray(self._preview.vao)
-                    GL.glDrawArrays(GL.GL_LINES, 0, len(arr))
+                    self._draw_lines(self._preview, mvp, color, width)
         GL.glEnable(GL.GL_DEPTH_TEST)
 
     def _draw_shown_edges(self, mvp):
@@ -4968,11 +5052,8 @@ class Viewport(QOpenGLWidget):
         segs.append(np.array([ndc(cx, cy - cross), ndc(cx, cy + cross)]))
         pts = np.concatenate(segs).astype(np.float32)
         self._preview.update(pts)
-        self._set_line_uniforms(np.eye(4, dtype=np.float32),
-                                (0.95, 0.85, 0.55, 0.9))
-        self._line_width(1.4)
-        GL.glBindVertexArray(self._preview.vao)
-        GL.glDrawArrays(GL.GL_LINES, 0, len(pts))
+        self._draw_lines(self._preview, np.eye(4, dtype=np.float32),
+                         (0.95, 0.85, 0.55, 0.9), 1.4)
         GL.glEnable(GL.GL_DEPTH_TEST)
 
     def _draw_axis_triad(self, view, w, h):
@@ -4995,12 +5076,8 @@ class Viewport(QOpenGLWidget):
         identity = np.eye(4, dtype=np.float32)
         for seg, color in zip(segs, colors):
             self._preview.update(seg.astype(np.float32))
-            self._set_line_uniforms(identity, color)
-            self._line_width(2.0)
-            GL.glBindVertexArray(self._preview.vao)
-            GL.glDrawArrays(GL.GL_LINES, 0, 2)
+            self._draw_lines(self._preview, identity, color, 2.0)
         GL.glEnable(GL.GL_DEPTH_TEST)
-        self._line_width(1.0)
 
     # ------------------------------------------------------------- public API
 
@@ -5242,11 +5319,7 @@ class Viewport(QOpenGLWidget):
         if segs is not None:
             segs = rebased(segs, self._frame_anchor)
             self._preview.update(segs)
-            self._set_line_uniforms(mvp, (*gold, 0.85))
-            self._line_width(1.6)
-            GL.glBindVertexArray(self._preview.vao)
-            GL.glDrawArrays(GL.GL_LINES, 0, len(segs))
-            self._line_width(1.0)
+            self._draw_lines(self._preview, mvp, (*gold, 0.85), 1.6)
         if not flat:
             for text in getattr(self, "_ghost_texts", ()):
                 corners = rebased(text.frame_box(), self._frame_anchor)
@@ -5876,7 +5949,7 @@ class Viewport(QOpenGLWidget):
             GL.glViewport(0, 0, px_w, px_h)
             self._reset_gl_state()
             GL.glEnable(GL.GL_BLEND)
-            GL.glBlendFunc(GL.GL_SRC_ALPHA, GL.GL_ONE_MINUS_SRC_ALPHA)
+            _blend_over()
             GL.glEnable(GL.GL_DEPTH_TEST)
             self._paint_background(px_w, px_h)
             self._sync_gpu()
