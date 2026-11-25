@@ -71,6 +71,11 @@ Name: "fileassoc"; \
   Description: "Make Blackbyrd3D the &default app for .byrd and .wyrm files"; \
   GroupDescription: "Options:"
 
+[InstallDelete]
+; An update copies over the old install, so files a newer build no longer
+; ships stayed behind. A stale blackbyrd3d-*.dist-info made 0.3.0 report 0.2.1.
+Type: filesandordirs; Name: "{app}\_internal"
+
 [Files]
 Source: "dist\byrd3d\*"; DestDir: "{app}"; \
   Flags: ignoreversion recursesubdirs createallsubdirs

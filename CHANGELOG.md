@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- **Updates show the right version.** The Windows installer removes the
+  files of the previous install first, so an updated app no longer calls
+  itself the old version and keeps offering the update.
+
 ## 0.4.0
 
 - **A tidier installer.** Its pages match its title bar, the text sits in
