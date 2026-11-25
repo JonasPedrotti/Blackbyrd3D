@@ -50,7 +50,7 @@ Built on [Serpentine3D](https://github.com/chisomobanzi/Serpentine3D) by Chisomo
 ## How it differs from Serpentine3D
 
 Blackbyrd3D started from Serpentine3D and has changed a fair bit, with
-ten thousands lines of code added or rewritten across some 700 files:
+tens of thousands of lines of code added or rewritten across some 700 files:
 
 - **Interface.** A reworked UI with new icons, new popups and better
   workflows.
@@ -98,8 +98,8 @@ of their own.
 On Linux, make the AppImage executable and start it:
 
 ```bash
-chmod +x Blackbyrd3D-x86_64.AppImage
-./Blackbyrd3D-x86_64.AppImage
+chmod +x Blackbyrd3D-x86_64.AppImage   # allow it to run, once
+./Blackbyrd3D-x86_64.AppImage          # start it
 ```
 
 On ARM, use `Blackbyrd3D-aarch64.AppImage` the same way.
@@ -164,25 +164,40 @@ one, please [open an issue](https://github.com/JonasPedrotti/Blackbyrd3D/issues)
 
 ## Build from source
 
+You need Python 3.10 or later and Git. The geometry kernel comes as a pip
+package (`cadquery-ocp`), so there is nothing to compile and no conda or
+system packages to install.
+
+Linux and macOS:
+
 ```bash
-git clone https://github.com/JonasPedrotti/Blackbyrd3D && cd Blackbyrd3D
-python3 -m venv .venv && .venv/bin/pip install -e ".[dev]"
-.venv/bin/byrd3d        # the app
-.venv/bin/pytest -n 8   # the tests
+git clone https://github.com/JonasPedrotti/Blackbyrd3D
+cd Blackbyrd3D
+python3 -m venv .venv                # a Python environment just for Blackbyrd3D
+.venv/bin/pip install -e ".[dev]"    # the app and its test tools
+.venv/bin/byrd3d                     # start the app
 ```
 
-How to run the tests and how CI runs them: [CONTRIBUTING.md](CONTRIBUTING.md#running-the-tests).
+Windows (PowerShell):
 
-Python 3.10 or later. The kernel installs as pip wheels (`cadquery-ocp`), with
-no conda and no system packages, on Linux, Windows and macOS alike.
+```powershell
+git clone https://github.com/JonasPedrotti/Blackbyrd3D
+cd Blackbyrd3D
+py -m venv .venv                       # a Python environment just for Blackbyrd3D
+.venv\Scripts\pip install -e ".[dev]"  # the app and its test tools
+.venv\Scripts\byrd3d                   # start the app
+```
+
+How to run the tests, and how CI runs them:
+[CONTRIBUTING.md](CONTRIBUTING.md#running-the-tests).
 
 ## Support
 
 Blackbyrd3D is free and always will be: no subscription, no licence server, no
 "upgrade to Pro".
 
-Bug reports, sample files and documentation fixes help the most
-see [CONTRIBUTING.md](CONTRIBUTING.md), and
+Bug reports, sample files and documentation fixes help the most. See
+[CONTRIBUTING.md](CONTRIBUTING.md) for how to help, and
 [Not here yet](docs/coming-from-rhino.md#not-here-yet) for what is missing.
 
 MIT licensed.

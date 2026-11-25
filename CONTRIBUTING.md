@@ -1,40 +1,60 @@
 # Contributing to Blackbyrd3D
 
-Thanks for looking under the hood. Bug reports, commands, and file-format
-work are all welcome — this project aims to be a serious NURBS modeller
-for Linux, and it gets there faster with more hands.
+Thanks for looking under the hood. Bug reports, commands and file-format
+work are all welcome. This project aims to be a serious NURBS modeller for
+Linux, Windows and macOS, and it gets there faster with more hands.
 
 ## Dev setup
+
+You need Python 3.10 or later and Git. The heavy dependency is
+`cadquery-ocp` (OpenCASCADE 7.9 as prebuilt Python bindings). It is a large
+download, but there is nothing to compile.
+
+Linux and macOS:
 
 ```bash
 git clone https://github.com/JonasPedrotti/Blackbyrd3D.git
 cd Blackbyrd3D
-python3 -m venv .venv
-.venv/bin/pip install -e ".[dev]"
-.venv/bin/byrd3d                # run the app
+python3 -m venv .venv                # a Python environment just for Blackbyrd3D
+.venv/bin/pip install -e ".[dev]"    # the app in editable mode, plus the test tools
+.venv/bin/byrd3d                     # start the app
 ```
 
-Python ≥ 3.10. The heavy dependency is `cadquery-ocp` (OpenCASCADE 7.9
-prebuilt as pybind11 bindings) — it's a large wheel, but there is nothing
-to compile.
+Windows (PowerShell):
+
+```powershell
+git clone https://github.com/JonasPedrotti/Blackbyrd3D.git
+cd Blackbyrd3D
+py -m venv .venv                       # a Python environment just for Blackbyrd3D
+.venv\Scripts\pip install -e ".[dev]"  # the app in editable mode, plus the test tools
+.venv\Scripts\byrd3d                   # start the app
+```
+
+"Editable" means your changes to the source take effect the next time you
+start the app, without installing again.
 
 ## Running the tests
 
-The `dev` extra brings `pytest` and `pytest-xdist`. From the repository root:
+The `dev` extra brings `pytest` and `pytest-xdist`. Run these from the
+repository root.
+
+Linux and macOS:
 
 ```bash
-# Linux / macOS
-.venv/bin/pytest -n 8                                  # the whole suite, eight at a time
-.venv/bin/pytest tests/test_rhino_text_comes_in_as_editable_text.py   # one file
-.venv/bin/pytest tests -k fillet                       # every test with "fillet" in its name
+.venv/bin/pytest -n 8                                                  # the whole suite, eight tests at a time
+.venv/bin/pytest tests/test_rhino_text_comes_in_as_editable_text.py   # one test file
+.venv/bin/pytest tests -k fillet                                       # every test with "fillet" in its name
 ```
+
+Windows (PowerShell):
 
 ```powershell
-# Windows
-.venv\Scripts\python -m pytest -n 8
+.venv\Scripts\pytest -n 8                                                  # the whole suite, eight tests at a time
+.venv\Scripts\pytest tests\test_rhino_text_comes_in_as_editable_text.py   # one test file
+.venv\Scripts\pytest tests -k fillet                                       # every test with "fillet" in its name
 ```
 
-The suite has about 6,800 tests and takes around two minutes with eight
+The suite has about 7,000 tests and takes a few minutes with eight
 workers. Each test brings its own settings, journal and autosave
 directories, so `-n` can run them side by side.
 
@@ -62,10 +82,10 @@ regression.
 
 The workflows live in `.github/workflows/`.
 
-| Workflow            | Runs                                   | What it does                                                        |
-| ------------------- | -------------------------------------- | ------------------------------------------------------------------- |
-| `ci.yml`            | on every push to `main` and every PR   | Installs with `uv sync --extra dev --locked`, runs `pytest -n auto` headless on Ubuntu, then a `byrd3d-batch` smoke test (box, fillet, STEP and glTF export). |
-| `tests-windows.yml` | by hand                                | The same suite on Windows, catching what only breaks there (encodings, paths, fonts). |
+| Workflow            | Runs                                    | What it does |
+| ------------------- | --------------------------------------- | ------------ |
+| `ci.yml`            | on every push to `main` and every PR    | Installs with `uv sync --extra dev --locked`, runs `pytest -n auto` headless on Ubuntu, then a `byrd3d-batch` smoke test (box, fillet, STEP and glTF export). |
+| `tests-windows.yml` | by hand                                 | The same suite on Windows, catching what only breaks there (encodings, paths, fonts). |
 | `build-*.yml`       | when a release is published, or by hand | Builds the Windows installer, macOS disk image or Linux AppImage after a short startup test and attaches it to the release. |
 
 CI skips commits that only touch Markdown, `docs/` or `assets/`, and a
@@ -73,10 +93,10 @@ newer push to the same branch cancels the run still going. PRs need it
 green.
 
 To start a workflow by hand, open it on GitHub under **Actions** and choose
-**Run workflow**, or use the command line:
+**Run workflow**, or use the [GitHub CLI](https://cli.github.com):
 
 ```bash
-gh workflow run tests-windows.yml   # the suite on Windows
+gh workflow run tests-windows.yml   # start the suite on Windows
 gh run watch                        # follow the run in the terminal
 ```
 
@@ -89,58 +109,66 @@ machine.
 
 ```
 blackbyrd3d/
-├── core/          # kernel layer: geometry builders, tessellation,
-│                  #   scene graph, layers, selection, undo history
-├── commands/      # generator-based interactive commands
-├── ui/            # Qt: GL viewport, command line, panels
-├── fileio/        # .byrd / STEP / OBJ / glTF / DXF / SVG / USD
-└── mcp_server/    # stdio MCP server -> RPC bridge
+├── core/          # the geometry layer: shapes, meshing for display,
+│   │              #   scene, layers, selection, undo history
+│   └── wyrm/      # the node graph engine behind Wyrm
+├── commands/      # every command you can type, one module per topic
+├── ui/            # Qt: the viewports, command line, panels and dialogs
+│   └── wyrm/      # Wyrm's node editor
+├── fileio/        # reading and writing files: .byrd, 3DM, STEP, DXF, SVG, ...
+├── ai/            # the assistant and its providers
+└── mcp_server/    # lets an MCP client (an AI app) drive a running session
 ```
 
 Two rules keep the layers clean:
 
 1. **All OCP/OpenCASCADE imports stay in `core/`** (mostly
    `core/geometry.py`). Commands and UI talk to shapes only through the
-   `core` API — this is what keeps commands testable without a display
-   and the kernel swappable in principle.
-2. **Commands never touch Qt.** A command is a Python generator that
-   yields typed requests (`PointReq`, `NumberReq`, `SelectReq`, …) and
-   receives the answer back — the same code serves viewport clicks,
-   typed input, macros, and MCP calls.
+   `core` API. That keeps commands testable without a display, and the
+   kernel replaceable in principle.
+2. **Commands never touch Qt.** A command is a Python generator: it
+   `yield`s a request such as `PointReq`, `NumberReq` or `SelectReq`, and
+   gets the answer back as the value of that `yield`. The same code then
+   serves clicks in the viewport, typed input, macros and MCP calls.
 
 ## Adding a command
 
-The generator protocol in one example:
+A complete command, in a new or existing module under
+`blackbyrd3d/commands/`:
 
 ```python
-from .base import PointReq, NumberReq, command
+from .base import NumberReq, PointReq, command
 from ..core import geometry as g
 
-@command("tube", aliases=("tu",))
+
+@command("tube", aliases=("tu",))      # typed as "tube" or "tu"
 def cmd_tube(ctx):
+    # Each yield asks the user, and pauses here until they answer.
     centre = yield PointReq("Centre of tube")
     radius = yield NumberReq("Radius", default=5.0)
+
+    # make_cylinder(base point, radius, height) builds the solid,
+    # scene.add puts it in the model.
     ctx.scene.add(g.make_cylinder(centre, radius, radius * 4), name="Tube")
-    ctx.echo("Tube created.")
+    ctx.echo("Tube created.")             # a line in the command history
 ```
 
-Registering it (import the module in `commands/__init__.py`) gets you
-prompts, osnaps, undo, aliasing, macro support, and MCP exposure for
-free. Look at `commands/curves.py` and `commands/transform.py` for
-fuller examples — previews (`preview_fn`), option chips (`choices`),
-and reference-point input are all shown there.
+A new module also needs an import in `commands/__init__.py`. That is all:
+prompts, object snaps, undo, aliases, macros and MCP access come with it.
+`commands/curves.py` and `commands/transform.py` show more, such as a live
+preview while picking (`preview_fn`), clickable options (`choices`) and
+reference points.
 
-If the command exists in Rhino, keep its name and prompt order —
-matching existing muscle memory is a design goal, not an accident.
+If the command exists in Rhino, keep its name and prompt order. Matching
+existing muscle memory is a design goal, not an accident.
 
 ## Pull requests
 
 - Keep PRs focused; separate refactors from behaviour changes.
-- Match the surrounding style (the codebase is plain PEP 8, no
-  formatter is enforced).
+- Match the surrounding style (plain PEP 8; no formatter is enforced).
 - Describe *what a user can now do*, not just what the code does.
-- Screenshots or a short capture for anything visual — there's a
-  built-in `viewcapturetofile` command that helps.
+- Add screenshots or a short capture for anything visual. The built-in
+  `viewcapturetofile` command helps.
 
-Not sure whether an idea fits? Open an issue or a discussion first —
-cheap to talk, expensive to rewrite.
+Not sure whether an idea fits? Open an issue or a discussion first. It is
+cheap to talk and expensive to rewrite.

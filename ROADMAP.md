@@ -6,7 +6,7 @@ priorities can shift as the project grows.
 If you run into problems, please open an
 [Issue](https://github.com/JonasPedrotti/Blackbyrd3D/issues/new/choose).
 I read every issue, and I try
-to prioritize them: crashes and lost work first, then bugs that block real
+to prioritise them: crashes and lost work first, then bugs that block real
 work, then everything else.
 
 ## 1. Solid basics
