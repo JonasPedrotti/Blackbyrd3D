@@ -47,11 +47,11 @@ PrivilegesRequiredOverridesAllowed=dialog
 OutputBaseFilename=Blackbyrd3D-Setup-x86_64
 Compression=lzma2
 SolidCompression=yes
-; Dressed like the app's own popups: their card grey behind every page and
-; under the title bar, the splash beside the first and last page, its mark
-; in the corner of the rest
+; Dressed like the app: the dark style's title bar grey behind every page so
+; window and page are one colour, the splash beside the first and last page,
+; its mark in the corner of the rest
 WizardStyle=modern dark hidebevels includetitlebar
-WizardBackColor=#2e2f34
+WizardBackColor=#2b2b2b
 WizardSmallImageBackColor=none
 WizardImageFile=wizard\wizard-*x*.png
 WizardSmallImageFile=wizard\wizard-small-*.png

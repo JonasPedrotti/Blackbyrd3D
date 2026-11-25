@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- **One grey in the installer.** Its pages now match its title bar.
+
 ## 0.3.0
 
 - **Ortho and grid snap in every pane.** The Ortho and Grid buttons and F8

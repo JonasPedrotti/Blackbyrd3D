@@ -41,7 +41,7 @@ def test_the_app_learns_the_installer_already_asked():
 
 def test_the_wizard_is_dark_like_the_app():
     assert re.search(r"(?m)^WizardStyle=.*\bdark\b", ISS)
-    assert "WizardBackColor=#2e2f34" in ISS
+    assert "WizardBackColor=#2b2b2b" in ISS
     assert "WizardImageFile=wizard\\" in ISS
     assert "WizardSmallImageFile=wizard\\" in ISS
 

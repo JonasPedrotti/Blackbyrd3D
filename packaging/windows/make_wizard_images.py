@@ -24,8 +24,9 @@ from PySide6.QtGui import (  # noqa: E402
 from blackbyrd3d.ui import brand  # noqa: E402
 from blackbyrd3d.ui.splash import paint_mark, paint_wordmark  # noqa: E402
 
-# the app's popup cards, which installer.iss sets behind every page too
-CARD = QColor("#2e2f34")
+# the title bar grey of the wizard's dark style, which installer.iss sets
+# behind every page too, so window and page are one colour
+CARD = QColor("#2b2b2b")
 
 # Inno Setup's image areas at 100% to 250% DPI
 LARGE = [(202, 386), (269, 515), (336, 643), (403, 772), (430, 824),
