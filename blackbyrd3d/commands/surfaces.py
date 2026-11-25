@@ -119,6 +119,8 @@ def _extrude_direction(ctx, objs):
 
 @command("extrude", aliases=("ext", "extrudecrv", "extrudesrf"))
 def cmd_extrude(ctx):
+    """Extrude curves or surfaces straight out, by dragging or typing a
+    distance; Cap, BothSides and KeepOriginal options."""
     from ..core.text import TextShape
     curves = yield SelectReq("Select curves or surfaces to extrude",
                              kinds=("curve", "surface"))
@@ -187,6 +189,7 @@ def cmd_extrude(ctx):
 
 @command("revolve", aliases=("rev",))
 def cmd_revolve(ctx):
+    """Revolve a curve around an axis by an angle."""
     curves = yield SelectReq("Select curve to revolve", kinds=("curve",),
                              max_count=1)
     p1 = yield PointReq("Start of revolve axis")
@@ -204,6 +207,8 @@ def cmd_revolve(ctx):
 
 @command("loft")
 def cmd_loft(ctx):
+    """Surface through two or more profile curves in order; Style Normal or
+    Ruled."""
     curves = yield SelectReq("Select 2 or more profile curves in order",
                              kinds=("curve",), min_count=2,
                              choices={"Style": ["Normal", "Ruled"]})
@@ -218,6 +223,7 @@ def cmd_loft(ctx):
 
 @command("planarsrf", aliases=("planar", "planesrf"))
 def cmd_planar(ctx):
+    """Planar surfaces from closed planar curves."""
     curves = yield SelectReq("Select closed planar curves", kinds=("curve",))
     made = []
     for c in curves:
@@ -230,6 +236,7 @@ def cmd_planar(ctx):
 
 @command("sweep1", aliases=("sweep",))
 def cmd_sweep1(ctx):
+    """Sweep a profile curve along one rail."""
     rails = yield SelectReq("Select rail curve", kinds=("curve",), max_count=1)
     profiles = yield SelectReq("Select profile curve", kinds=("curve",),
                                max_count=1, allow_preselected=False)
@@ -240,6 +247,7 @@ def cmd_sweep1(ctx):
 
 @command("offsetsrf")
 def cmd_offsetsrf(ctx):
+    """Offset surfaces along their normal, by dragging or typing a distance."""
     objs = yield SelectReq("Select surfaces to offset",
                            kinds=("surface", "solid"))
 
@@ -341,6 +349,7 @@ def cmd_shell(ctx):
 
 @command("sweep2")
 def cmd_sweep2(ctx):
+    """Sweep a profile curve along two rails."""
     rail1 = yield SelectReq("Select first rail", kinds=("curve",),
                             max_count=1)
     rail2 = yield SelectReq("Select second rail", kinds=("curve",),

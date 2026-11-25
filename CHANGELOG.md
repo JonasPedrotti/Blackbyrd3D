@@ -11,6 +11,8 @@
 - **SpaceMouse on Windows and macOS (experimental).** Windows reads the
   device directly, macOS through the 3Dconnexion driver; neither has been
   tried on real hardware yet.
+- **Full command list.** The documentation site now describes every
+  command, and so do `help` and F1 in the app.
 
 ## 0.3.0
 

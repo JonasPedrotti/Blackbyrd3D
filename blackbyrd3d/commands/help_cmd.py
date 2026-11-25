@@ -17,7 +17,7 @@ _SECTIONS = {
 
 def _doc_of(cd) -> str:
     doc = (cd.fn.__doc__ or "").strip()
-    return doc.splitlines()[0] if doc else cd.label
+    return " ".join(doc.split("\n\n")[0].split()) if doc else cd.label
 
 
 def _section_of(cd) -> str:
@@ -25,10 +25,13 @@ def _section_of(cd) -> str:
     return _SECTIONS.get(mod, mod.capitalize())
 
 
-def command_reference() -> dict[str, list]:
-    """{section: [(name, aliases, doc), ...]} for UI help browsers."""
+def command_reference(builtin_only: bool = False) -> dict[str, list]:
+    """{section: [(name, aliases, doc), ...]} for UI help browsers.
+    builtin_only leaves out commands from plugins."""
     out: dict[str, list] = {}
     for cd in all_commands():
+        if builtin_only and not cd.fn.__module__.startswith(__package__):
+            continue
         out.setdefault(_section_of(cd), []).append(
             (cd.name, cd.aliases, _doc_of(cd)))
     return {k: out[k] for k in sorted(out)}

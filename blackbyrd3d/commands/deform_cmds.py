@@ -20,6 +20,7 @@ def _apply(ctx, objs, fn, label):
 
 @command("twist")
 def cmd_twist(ctx):
+    """Twist objects around an axis by a total angle."""
     objs = yield SelectReq("Select objects to twist")
     base = yield PointReq("Twist axis base")
     top = yield PointReq("Twist axis top", rubber_from=base)
@@ -35,6 +36,7 @@ def cmd_twist(ctx):
 
 @command("taper")
 def cmd_taper(ctx):
+    """Taper objects along an axis, scaling the far end by a factor."""
     objs = yield SelectReq("Select objects to taper")
     base = yield PointReq("Taper axis base")
     top = yield PointReq("Taper axis top", rubber_from=base)
@@ -50,6 +52,7 @@ def cmd_taper(ctx):
 
 @command("bend")
 def cmd_bend(ctx):
+    """Bend objects along a spine by an angle."""
     objs = yield SelectReq("Select objects to bend")
     base = yield PointReq("Bend spine start")
     end = yield PointReq("Bend spine end", rubber_from=base)
@@ -65,6 +68,7 @@ def cmd_bend(ctx):
 
 @command("flow", aliases=("flowalongcrv",))
 def cmd_flow(ctx):
+    """Flow objects from a base line onto a target curve."""
     objs = yield SelectReq("Select objects to flow")
     rails = yield SelectReq("Select the target curve", kinds=("curve",),
                             max_count=1, allow_preselected=False)
@@ -81,6 +85,8 @@ def cmd_flow(ctx):
 
 @command("extend")
 def cmd_extend(ctx):
+    """Lengthen curves at the end, the start or both, by dragging or typing a
+    length."""
     objs = yield SelectReq("Select curves to extend", kinds=("curve",))
     side = yield OptionReq("Which end", options=["End", "Start", "Both"],
                            default="End")
@@ -138,6 +144,8 @@ def cmd_extend(ctx):
 
 @command("matchcrv", aliases=("match",))
 def cmd_matchcrv(ctx):
+    """Change a curve's end so it meets another curve with Position or Tangent
+    continuity."""
     a = yield SelectReq("Select curve to change", kinds=("curve",),
                         max_count=1)
     b = yield SelectReq("Select curve to match", kinds=("curve",),

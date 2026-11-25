@@ -35,6 +35,8 @@ def _thumbnail(ctx) -> bytes | None:
 
 @command("save", mutates=False)
 def cmd_save(ctx):
+    """Save the model as .byrd, or to another format by its extension (e.g.
+    .3dm)."""
     default = getattr(ctx, "current_path", None) or "~/untitled.byrd"
     path = yield FileReq("Save as (.byrd or .3dm path)", default=default,
                          save=True, title="Save model",
@@ -64,6 +66,7 @@ def cmd_save(ctx):
 
 @command("open", mutates=True)
 def cmd_open(ctx):
+    """Open a model, replacing the current one."""
     path = yield FileReq("File to open (.byrd)", title="Open model",
                          filters=fileio.import_filter())
     path = _expand(path)
@@ -81,6 +84,8 @@ def cmd_open(ctx):
 
 @command("import", aliases=("imp",), mutates=True, space="any")
 def cmd_import(ctx):
+    """Import a model file into the current one, or place an image as a
+    picture."""
     path = yield FileReq("File to import (model or image)", title="Import",
                          filters=fileio.import_filter(pictures=True))
     path = _expand(path)
@@ -146,6 +151,7 @@ def cmd_setdefaultapp(ctx):
 
 @command("new", mutates=True)
 def cmd_new(ctx):
+    """Clear the scene and start a new document."""
     confirm = yield OptionReq("Clear the scene?", options=["Yes", "No"],
                               default="No")
     if confirm == "Yes":

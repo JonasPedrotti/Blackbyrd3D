@@ -10,6 +10,8 @@ ASPECTS = {
 
 @command("camera", aliases=("cam",), mutates=False)
 def cmd_camera(ctx):
+    """Set the view's camera: Lens (focal length), Sensor, Place, Position,
+    Target, or Frame guides for an aspect ratio."""
     vp = ctx.viewport
     cam = vp.camera
     action = yield OptionReq(

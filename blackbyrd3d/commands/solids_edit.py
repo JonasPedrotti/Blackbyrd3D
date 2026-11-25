@@ -185,6 +185,8 @@ def cmd_filletedge(ctx, objs=None):
 
 @command("chamferedge", aliases=("che",))
 def cmd_chamferedge(ctx):
+    """Chamfer edges. Ctrl+Shift-click edges first to chamfer only those;
+    otherwise every edge of the selected solids."""
     picked = _subobject_edge_map(ctx)
     if picked:
         chosen = [ctx.scene.get(oid) for oid in picked]
@@ -236,6 +238,7 @@ def cmd_chamferedge(ctx):
 
 @command("cap")
 def cmd_cap(ctx):
+    """Close the planar holes of open surfaces to make solids."""
     objs = yield SelectReq("Select open surfaces to cap",
                            kinds=("surface", "solid", "compound"))
     done = 0
@@ -255,6 +258,7 @@ def cmd_cap(ctx):
 
 @command("intersect", aliases=("int",))
 def cmd_intersect(ctx):
+    """Curves where two surfaces or solids meet."""
     a = yield SelectReq("Select first object", kinds=("surface", "solid"),
                         max_count=1)
     b = yield SelectReq("Select second object", kinds=("surface", "solid"),
@@ -267,6 +271,8 @@ def cmd_intersect(ctx):
 
 @command("contour")
 def cmd_contour(ctx):
+    """Section curves through objects at even spacing along Z, X, Y or the
+    CPlane normal."""
     objs = yield SelectReq("Select objects to contour",
                            kinds=("surface", "solid"))
     axis = yield OptionReq("Contour direction",

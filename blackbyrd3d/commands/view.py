@@ -41,36 +41,42 @@ def _turn(ctx, name: str, said: str | None = None):
 
 @command("top", mutates=False)
 def cmd_top(ctx):
+    """Look at the model from the top."""
     _turn(ctx, "top", "Top view.")
     yield from ()
 
 
 @command("front", mutates=False)
 def cmd_front(ctx):
+    """Look at the model from the front."""
     _turn(ctx, "front", "Front view.")
     yield from ()
 
 
 @command("right", mutates=False)
 def cmd_right(ctx):
+    """Look at the model from the right."""
     _turn(ctx, "right", "Right view.")
     yield from ()
 
 
 @command("isometric", aliases=("iso",), mutates=False)
 def cmd_isometric(ctx):
+    """Isometric view."""
     _turn(ctx, "isometric", "Isometric view.")
     yield from ()
 
 
 @command("perspective", aliases=("persp",), mutates=False)
 def cmd_persp(ctx):
+    """Perspective view."""
     _turn(ctx, "perspective", "Perspective view.")
     yield from ()
 
 
 @command("zoomextents", aliases=("ze", "zea"), mutates=False, space="any")
 def cmd_zoom_extents(ctx):
+    """Zoom to fit everything in the view."""
     _vp(ctx).zoom_extents()
     ctx.echo("Zoomed to extents.")
     yield from ()
@@ -107,6 +113,7 @@ def cmd_redoview(ctx):
 
 @command("wireframe", aliases=("wf",), mutates=False)
 def cmd_wireframe(ctx):
+    """Wireframe display."""
     _vp(ctx).set_display_mode("wireframe")
     ctx.echo("Wireframe display.")
     yield from ()
@@ -114,6 +121,7 @@ def cmd_wireframe(ctx):
 
 @command("shaded", aliases=("sh",), mutates=False)
 def cmd_shaded(ctx):
+    """Shaded display."""
     _vp(ctx).set_display_mode("shaded")
     ctx.echo("Shaded display.")
     yield from ()
@@ -121,6 +129,7 @@ def cmd_shaded(ctx):
 
 @command("ghosted", aliases=("gh",), mutates=False)
 def cmd_ghosted(ctx):
+    """Ghosted display, shaded and see-through."""
     _vp(ctx).set_display_mode("ghosted")
     ctx.echo("Ghosted display.")
     yield from ()
@@ -128,18 +137,21 @@ def cmd_ghosted(ctx):
 
 @command("back", mutates=False)
 def cmd_back(ctx):
+    """Look at the model from the back."""
     _turn(ctx, "back")
     yield from ()
 
 
 @command("left", mutates=False)
 def cmd_left(ctx):
+    """Look at the model from the left."""
     _turn(ctx, "left")
     yield from ()
 
 
 @command("bottom", mutates=False)
 def cmd_bottom(ctx):
+    """Look at the model from below."""
     _turn(ctx, "bottom")
     yield from ()
 
@@ -528,6 +540,7 @@ def cmd_4view(ctx):
 
 @command("1view", aliases=("oneview", "singleview"), mutates=False)
 def cmd_1view(ctx):
+    """Show one viewport instead of four."""
     win = ctx.window
     if win is None:
         ctx.echo("Viewport layouts need the GUI.")
@@ -670,6 +683,7 @@ def cmd_technical(ctx):
 
 @command("grid", mutates=False)
 def cmd_grid(ctx):
+    """Show or hide the grid."""
     vp = _vp(ctx)
     vp.grid_visible = not vp.grid_visible
     vp.update()
@@ -679,6 +693,7 @@ def cmd_grid(ctx):
 
 @command("snap", mutates=False)
 def cmd_snap(ctx):
+    """Turn object snaps on or off."""
     vp = _vp(ctx)
     vp.snaps.enabled = not vp.snaps.enabled
     ctx.echo(f"Object snap {'on' if vp.snaps.enabled else 'off'} "
@@ -733,6 +748,7 @@ def cmd_osnap(ctx):
 
 @command("gridsnap", mutates=False)
 def cmd_gridsnap(ctx):
+    """Turn snapping to the grid on or off."""
     vp = _vp(ctx)
     vp.grid_snap = not vp.grid_snap
     ctx.echo(f"Grid snap {'on' if vp.grid_snap else 'off'} "
@@ -769,6 +785,7 @@ def cmd_pointson(ctx):
 
 @command("pointsoff", aliases=("pf",), mutates=False)
 def cmd_pointsoff(ctx):
+    """Hide all control points."""
     vp = _vp(ctx)
     n = len(vp.cv_enabled)
     vp.cv_enabled.clear()
@@ -840,6 +857,7 @@ def set_units(ctx, choice: str, rescale: bool):
 
 @command("distance", aliases=("dist",), mutates=False)
 def cmd_distance(ctx):
+    """Measure the distance between two points."""
     p1 = yield PointReq("First point")
     p2 = yield PointReq("Second point", rubber_from=p1)
     d = sum((b - a) ** 2 for a, b in zip(p1, p2)) ** 0.5
@@ -848,6 +866,7 @@ def cmd_distance(ctx):
 
 @command("area", mutates=False)
 def cmd_area(ctx):
+    """Measure the area of surfaces or solids."""
     objs = yield SelectReq("Select surfaces or solids",
                            kinds=("surface", "solid"))
     total = sum(g.surface_area(o.shape) for o in objs)
@@ -856,6 +875,7 @@ def cmd_area(ctx):
 
 @command("volume", aliases=("vol",), mutates=False)
 def cmd_volume(ctx):
+    """Measure the volume of solids."""
     objs = yield SelectReq("Select solids", kinds=("solid",))
     total = sum(g.volume(o.shape) for o in objs)
     ctx.echo(f"Volume: {total:.4f} {ctx.scene.units}³")
@@ -892,6 +912,7 @@ def cmd_centroid(ctx):
 
 @command("length", aliases=("len",), mutates=False)
 def cmd_length(ctx):
+    """Measure the length of curves."""
     objs = yield SelectReq("Select curves", kinds=("curve",))
     total = sum(g.curve_length(o.shape) for o in objs)
     ctx.echo(f"Length: {ctx.scene.format_length(total)}")
@@ -938,6 +959,7 @@ def cmd_printcheck(ctx):
 
 @command("curvature", mutates=False)
 def cmd_curvature(ctx):
+    """Curvature and radius of a curve at a point."""
     objs = yield SelectReq("Select curve", kinds=("curve",), max_count=1)
     pt = yield PointReq("Point on curve to evaluate")
     info = g.curvature_at(objs[0].shape, pt)
@@ -974,6 +996,7 @@ def cmd_cplane(ctx):
 
 @command("curvatureanalysis", aliases=("curvmap",), mutates=False)
 def cmd_curvature_analysis(ctx):
+    """Color surfaces by curvature (run again to turn off)."""
     vp = _vp(ctx)
     if vp.display_mode == "curvature":
         vp.set_display_mode("shaded")
@@ -987,6 +1010,7 @@ def cmd_curvature_analysis(ctx):
 
 @command("namedview", aliases=("nv",), mutates=False)
 def cmd_namedview(ctx):
+    """Save, restore, list or delete named views."""
     from .base import OptionReq, TextReq
     action = yield OptionReq("Named view",
                              options=["Save", "Restore", "List", "Delete"],
@@ -1022,6 +1046,7 @@ def cmd_namedview(ctx):
 
 @command("zebra", mutates=False)
 def cmd_zebra(ctx):
+    """Zebra stripes to check surface continuity (run again to turn off)."""
     vp = _vp(ctx)
     if vp.display_mode == "zebra":
         vp.set_display_mode("shaded")
@@ -1035,6 +1060,7 @@ def cmd_zebra(ctx):
 
 @command("gumball", mutates=False)
 def cmd_gumball(ctx):
+    """Turn the gumball on or off."""
     gb = _vp(ctx).gumball
     gb.set_enabled(not gb.enabled)
     ctx.echo(f"Gumball {'on' if gb.enabled else 'off'}.")

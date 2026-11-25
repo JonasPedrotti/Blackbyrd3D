@@ -10,6 +10,7 @@ from .base import (
 
 @command("patch", aliases=("networksrf",))
 def cmd_patch(ctx):
+    """Surface filling a boundary of two or more curves."""
     curves = yield SelectReq("Select boundary curves", kinds=("curve",),
                              min_count=2)
     srf = g.patch_surface([c.shape for c in curves])
@@ -19,6 +20,7 @@ def cmd_patch(ctx):
 
 @command("blendcrv", aliases=("blend",))
 def cmd_blendcrv(ctx):
+    """Blend curve between two curve ends, Tangent or Position."""
     a = yield SelectReq("Select first curve", kinds=("curve",), max_count=1)
     b = yield SelectReq("Select second curve", kinds=("curve",),
                         max_count=1, allow_preselected=False)
@@ -32,6 +34,7 @@ def cmd_blendcrv(ctx):
 
 @command("project")
 def cmd_project(ctx):
+    """Project curves onto a surface along the CPlane normal."""
     curves = yield SelectReq("Select curves to project", kinds=("curve",))
     targets = yield SelectReq("Select target surface",
                               kinds=("surface", "solid"), max_count=1,
@@ -51,6 +54,7 @@ def cmd_project(ctx):
 
 @command("pull")
 def cmd_pull(ctx):
+    """Pull curves onto a surface, each point to its closest."""
     curves = yield SelectReq("Select curves to pull", kinds=("curve",))
     targets = yield SelectReq("Select target surface",
                               kinds=("surface", "solid"), max_count=1,
@@ -68,6 +72,7 @@ def cmd_pull(ctx):
 
 @command("helix")
 def cmd_helix(ctx):
+    """Helix from base center, radius, pitch and turns."""
     import math
     DEFAULT_TURNS = 5.0
     center = yield PointReq("Center of helix base")
@@ -239,6 +244,8 @@ def place_model_text(ctx):
 
 @command("unrollsrf", aliases=("unroll",))
 def cmd_unrollsrf(ctx):
+    """Unroll planar, cylindrical or conical faces flat onto an Unrolled
+    layer."""
     objs = yield SelectReq("Select surfaces to unroll (planar, cylindrical "
                            "or conical faces)", kinds=("surface", "solid"))
     layer = ctx.scene.layers.find_by_name("Unrolled")
@@ -274,6 +281,7 @@ def cmd_unrollsrf(ctx):
 
 @command("pipe")
 def cmd_pipe(ctx):
+    """Pipe of a set radius around rail curves, capped or open."""
     rails = yield SelectReq("Select rail curves", kinds=("curve",))
 
     from . import dragging
@@ -313,6 +321,7 @@ def cmd_pipe(ctx):
 
 @command("edgesrf", aliases=("srfedges",))
 def cmd_edgesrf(ctx):
+    """Surface from 2, 3 or 4 connected edge curves."""
     curves = yield SelectReq("Select 2, 3 or 4 connected curves",
                              kinds=("curve",), min_count=2, max_count=4)
     srf = g.edge_surface([c.shape for c in curves])
@@ -322,6 +331,8 @@ def cmd_edgesrf(ctx):
 
 @command("dupborder")
 def cmd_dupborder(ctx):
+    """Copy the open borders of surfaces, or the boundary of hatches, as
+    curves."""
     objs = yield SelectReq("Select surfaces, polysurfaces or hatches",
                            kinds=("surface", "solid", "hatch"))
     made = []
@@ -360,6 +371,7 @@ def cmd_dupedge(ctx):
 
 @command("untrim")
 def cmd_untrim(ctx):
+    """Remove trims from surfaces: only the holes, or All."""
     objs = yield SelectReq(
         "Select trimmed surfaces",
         kinds=("surface",),
@@ -379,6 +391,7 @@ def cmd_untrim(ctx):
 
 @command("extractisocurve", aliases=("isocurve",))
 def cmd_extractisocurve(ctx):
+    """Copy isocurves of a surface at picked points, in U, V or Both."""
     srfs = yield SelectReq("Select surface", kinds=("surface",), max_count=1)
     o = srfs[0]
     made = 0
