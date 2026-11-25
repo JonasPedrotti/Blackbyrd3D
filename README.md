@@ -111,7 +111,7 @@ floating window can no longer be dragged by its title bar, and dialogs open
 where the desktop places them rather than centred on the window.
 
 Each build carries the OpenCASCADE kernel and its own Python, and needs a GPU
-with OpenGL 3.3. Headless use works anywhere. [Release notes](https://github.com/JonasPedrotti/Blackbyrd3D/releases/latest) · [Privacy](docs/privacy.md)
+with OpenGL 3.3. Headless use works anywhere. [Release notes](https://github.com/JonasPedrotti/Blackbyrd3D/releases/latest) · [Privacy](docs/privacy.md) · [Code signing](docs/code-signing.md)
 
 ## Give it a try
 
