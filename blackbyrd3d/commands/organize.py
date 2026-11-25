@@ -10,6 +10,7 @@ from .base import (FormField, FormReq, NumberReq, OptionReq, PointReq,
 
 @command("group")
 def cmd_group(ctx):
+    """Group objects so clicking one selects them all."""
     objs = yield SelectReq("Select objects to group", min_count=2)
     gid = uuid.uuid4().hex[:8]
     # round the groups already there, not instead of them: Ungroup takes
@@ -24,6 +25,7 @@ def cmd_group(ctx):
 
 @command("ungroup")
 def cmd_ungroup(ctx):
+    """Take the outermost group off the selected objects."""
     objs = yield SelectReq("Select grouped objects to ungroup")
     grouped = [o for o in objs if o.group_id]
     # the outermost group ends; any inside it are groups of their own again
@@ -195,6 +197,7 @@ def cmd_block(ctx):
 
 @command("insert")
 def cmd_insert(ctx):
+    """Insert an instance of a block definition at a point."""
     defs = ctx.scene.block_defs
     if not defs:
         ctx.echo("No block definitions yet — create one with 'block'.")
@@ -216,6 +219,7 @@ def cmd_insert(ctx):
 
 @command("blocklist", aliases=("blockmanager",), mutates=False)
 def cmd_blocklist(ctx):
+    """List the block definitions with their instance counts."""
     defs = ctx.scene.block_defs
     if not defs:
         ctx.echo("No block definitions.")

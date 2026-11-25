@@ -578,6 +578,8 @@ def _move_on_paper(ctx, lv):
 
 @command("move", aliases=("m",), space="any")
 def cmd_move(ctx):
+    """Move objects or held parts from one point to another; Vertical moves
+    along the CPlane normal only."""
     lv = ctx.sheet_view()
     if lv is not None:
         yield from _move_on_paper(ctx, lv)
@@ -645,6 +647,8 @@ def _copy_on_paper(ctx, lv):
 
 @command("copy", aliases=("co", "cp"), space="any")
 def cmd_copy(ctx):
+    """Copy objects or held parts from one point to others; Vertical copies
+    along the CPlane normal only."""
     lv = ctx.sheet_view()
     if lv is not None:
         yield from _copy_on_paper(ctx, lv)
@@ -994,6 +998,8 @@ def _mirror_on_paper(ctx, lv):
 
 @command("mirror", aliases=("mi",), space="any")
 def cmd_mirror(ctx):
+    """Mirror objects across a line picked in the CPlane; Copy keeps the
+    original."""
     lv = ctx.sheet_view()
     if lv is not None:
         yield from _mirror_on_paper(ctx, lv)
@@ -1098,6 +1104,7 @@ def cmd_align(ctx):
 
 @command("arraypolar")
 def cmd_array_polar(ctx):
+    """Copies in a ring around a center, over a set angle."""
     objs = yield SelectReq("Select objects to array")
     center = yield PointReq("Center of polar array")
     # the ring lies on the plane you are working on, so an array laid out in
@@ -1127,6 +1134,7 @@ def cmd_array_polar(ctx):
 
 @command("arraypath", aliases=("arraycrv",))
 def cmd_array_path(ctx):
+    """Copies along a curve; Freeform, Roadlike or no rotation."""
     objs = yield SelectReq("Select objects to array")
     paths = yield SelectReq("Select path curve", kinds=("curve",),
                             max_count=1, allow_preselected=False)
@@ -1209,6 +1217,8 @@ def _yaw_between(t0, t1, up):
 
 @command("array")
 def cmd_array(ctx):
+    """Copies in a grid with set counts and spacing along the CPlane X and
+    Y."""
     objs = yield SelectReq("Select objects to array")
     nx = yield IntReq("Count X", default=2, minimum=1)
     ny = yield IntReq("Count Y", default=1, minimum=1)

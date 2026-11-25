@@ -172,6 +172,8 @@ def _delete_held_segments(ctx) -> bool:
 
 @command("delete", aliases=("del", "erase"), space="any", repeatable=False)
 def cmd_delete(ctx):
+    """Delete the selected objects, or held control points, faces or curve
+    segments; on a sheet, the picked sheet items."""
     lv = ctx.sheet_view()
     if lv is not None:
         # what is picked on a sheet is the sheet's own, and the sheet is what
@@ -206,6 +208,8 @@ def cmd_delete(ctx):
 
 @command("join", aliases=("j",))
 def cmd_join(ctx):
+    """Join curves into one curve, or surfaces that share edges into a
+    polysurface."""
     objs = yield SelectReq("Select curves or surfaces to join",
                            kinds=("curve", "surface"), min_count=2,
                            too_few_ends=True)
@@ -251,6 +255,7 @@ def cmd_join(ctx):
 
 @command("offset")
 def cmd_offset(ctx):
+    """Offset a curve to one side, by dragging or typing a distance."""
     objs = yield SelectReq("Select curve to offset", kinds=("curve",),
                            max_count=1)
     from . import dragging
@@ -426,6 +431,8 @@ def cmd_filletcorners(ctx):
 
 @command("explode", aliases=("x",))
 def cmd_explode(ctx):
+    """Break objects into their parts: polysurfaces into surfaces, polycurves
+    into segments."""
     objs = yield SelectReq("Select objects to explode")
     made, whole = [], []
     for o in objs:
@@ -459,6 +466,8 @@ _SPLIT_KINDS = ("curve", "surface", "solid", "picture", "hatch")
 
 @command("split")
 def cmd_split(ctx):
+    """Split a curve, surface, hatch or picture with cutting objects, or a
+    curve at Points picked on it."""
     yield from _split(ctx)
 
 
@@ -644,6 +653,7 @@ def _trim_by_asking(ctx, target, pieces):
 
 @command("rebuild")
 def cmd_rebuild(ctx):
+    """Rebuild curves with a set point count and degree."""
     objs = yield SelectReq("Select curves to rebuild", kinds=("curve",))
     from .base import IntReq
     count = yield IntReq("Point count", default=10, minimum=2)
@@ -879,6 +889,7 @@ def cmd_dir(ctx):
 
 @command("hide")
 def cmd_hide(ctx):
+    """Hide the selected objects."""
     from ..core import clipping
     objs = yield SelectReq("Select objects to hide")
     in_sight = clipping.in_sight(ctx.scene)
@@ -892,6 +903,7 @@ def cmd_hide(ctx):
 
 @command("show", aliases=("unhide",))
 def cmd_show(ctx):
+    """Show every hidden object again."""
     n = ctx.scene.update_many([o.id for o in ctx.scene.all() if not o.visible],
                               visible=True)
     ctx.echo(f"Showed {n} object(s).")
@@ -1007,6 +1019,7 @@ def cmd_showselectedindetail(ctx):
 
 @command("selall", aliases=("sa",), mutates=False)
 def cmd_selall(ctx):
+    """Select everything."""
     ctx.selection.select_all()
     ctx.echo(f"Selected {len(ctx.selection.ids)} object(s).")
     yield from ()
@@ -1014,6 +1027,7 @@ def cmd_selall(ctx):
 
 @command("selnone", aliases=("sn",), mutates=False)
 def cmd_selnone(ctx):
+    """Clear the selection."""
     ctx.selection.clear()
     ctx.echo("Selection cleared.")
     yield from ()
@@ -1026,6 +1040,7 @@ def cmd_selnone(ctx):
 # of the one before it.
 @command("undo", mutates=False, repeatable=False)
 def cmd_undo(ctx):
+    """Undo the last change."""
     label = ctx.history.undo()
     ctx.echo(f"Undid {label}." if label else "Nothing to undo.")
     yield from ()
@@ -1033,6 +1048,7 @@ def cmd_undo(ctx):
 
 @command("redo", mutates=False, repeatable=False)
 def cmd_redo(ctx):
+    """Redo the last undone change."""
     label = ctx.history.redo()
     ctx.echo(f"Redid {label}." if label else "Nothing to redo.")
     yield from ()
@@ -1040,6 +1056,7 @@ def cmd_redo(ctx):
 
 @command("rename")
 def cmd_rename(ctx):
+    """Rename an object."""
     objs = yield SelectReq("Select object to rename", max_count=1)
     name = yield TextReq("New name", default=objs[0].name)
     ctx.scene.update(objs[0].id, name=name)
@@ -1048,6 +1065,8 @@ def cmd_rename(ctx):
 
 @command("layer")
 def cmd_layer(ctx):
+    """Layer actions: New, Current, Show, Hide, Rename, Weight, Linetype or
+    Hatch."""
     action = yield OptionReq(
         "Layer action", options=["New", "Current", "Show", "Hide", "Rename",
                                  "Weight", "Linetype", "Hatch"],

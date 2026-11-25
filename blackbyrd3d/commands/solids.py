@@ -190,6 +190,7 @@ def cmd_sphere(ctx):
 
 @command("cylinder", aliases=("cyl",))
 def cmd_cylinder(ctx):
+    """Cylinder from base center, radius and height, standing on the CPlane."""
     base = yield PointReq("Center of base")
     cp = ctx.cplane
     # the disc lies on the plane you are drawing on and the barrel runs up
@@ -228,6 +229,8 @@ def cmd_cylinder(ctx):
 
 @command("cone")
 def cmd_cone(ctx):
+    """Cone from base center, radius and apex height, standing on the
+    CPlane."""
     base = yield PointReq("Center of base")
     cp = ctx.cplane
     up = tuple(float(a) for a in cp.normal)
@@ -262,6 +265,7 @@ def cmd_cone(ctx):
 
 @command("torus")
 def cmd_torus(ctx):
+    """Torus from center, major radius and tube radius."""
     center = yield PointReq("Center of torus")
     cp = ctx.cplane
     up = tuple(float(a) for a in cp.normal)

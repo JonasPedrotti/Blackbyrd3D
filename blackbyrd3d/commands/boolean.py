@@ -53,6 +53,7 @@ def _union(ctx, merge: bool):
 
 @command("booleanunion", aliases=("union", "bu"))
 def cmd_union(ctx):
+    """Merge two or more solids into one."""
     yield from _union(ctx, merge=False)
 
 
@@ -88,6 +89,7 @@ def cmd_difference(ctx):
 
 @command("booleanintersection", aliases=("intersection", "bi"))
 def cmd_intersection(ctx):
+    """Keep only the volume two or more solids share."""
     objs = yield SelectReq("Select 2 or more solids to intersect",
                            kinds=_SOLIDISH, min_count=2)
     result = reduce(lambda a, b: g.boolean_intersection(a, b),

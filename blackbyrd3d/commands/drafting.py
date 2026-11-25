@@ -52,6 +52,8 @@ def _entered_or_only_detail(ctx):
 
 @command("layout")
 def cmd_layout(ctx):
+    """Manage paper layouts: New (with paper size), Rename, Delete, Duplicate
+    or List."""
     action = yield OptionReq(
         "Layout", options=["New", "Rename", "Delete", "Duplicate", "List"],
         default="New")
@@ -169,6 +171,8 @@ def _fit_pending_detail(detail, bounds):
 
 @command("detail", space="paper")
 def cmd_detail(ctx):
+    """Draw a detail on the layout, a window showing the model from a view at a
+    scale."""
     lay = _active_layout(ctx)
     if lay is None:
         ctx.echo("Switch to a layout first (create one with 'layout').")
@@ -255,6 +259,7 @@ def cmd_detail(ctx):
 
 @command("detailscale")
 def cmd_detailscale(ctx):
+    """Set the scale of the detail you are in, e.g. 1:20."""
     lay, detail = _entered_or_only_detail(ctx)
     if detail is None:
         ctx.echo("Enter a detail first (double-click it).")
@@ -278,6 +283,8 @@ def cmd_detailscale(ctx):
 
 @command("detailmode")
 def cmd_detailmode(ctx):
+    """Set how the detail you are in draws the model: Technical, Hidden,
+    Wireframe, Shaded, Plaster or PlasterColor."""
     lay, detail = _entered_or_only_detail(ctx)
     if detail is None:
         ctx.echo("Enter a detail first (double-click it).")
@@ -310,6 +317,7 @@ def cmd_detaillock(ctx):
 
 @command("detailborder")
 def cmd_detailborder(ctx):
+    """Show or hide the border of the detail you are in."""
     lay, detail = _entered_or_only_detail(ctx)
     if detail is None:
         ctx.echo("Enter a detail first (double-click it).")
@@ -322,6 +330,7 @@ def cmd_detailborder(ctx):
 
 @command("detaildelete")
 def cmd_detaildelete(ctx):
+    """Delete the detail you are in."""
     lay, detail = _entered_or_only_detail(ctx)
     if detail is None:
         ctx.echo("Enter the detail to delete first (double-click it).")
@@ -337,6 +346,8 @@ def cmd_detaildelete(ctx):
 
 @command("make2d")
 def cmd_make2d(ctx):
+    """Project the picked objects (or everything visible) to 2D curves as seen
+    from the current view, hidden lines on their own layer."""
     objs = yield SelectReq(
         "Select objects to project (Enter = all visible)", min_count=0)
     if not objs:
@@ -404,6 +415,7 @@ def cmd_printsheets(ctx):
 
 @command("exportpdf", aliases=("pdf",), mutates=False)
 def cmd_exportpdf(ctx):
+    """Export the current layout, or all of them, to a PDF."""
     lay = _active_layout(ctx)
     if lay is None:
         if not ctx.scene.layouts:
@@ -482,6 +494,7 @@ def place_note(ctx, lay):
 @command("dim", aliases=("dimension", "dimlinear", "dimaligned"),
          space="paper")
 def cmd_dim(ctx):
+    """Linear dimension between two points, on a layout or in the model."""
     lay = _active_layout(ctx)
     if lay is None:
         yield from _dim_in_the_model(ctx)
@@ -616,6 +629,7 @@ def _nice(value: float) -> float:
 
 @command("leader", space="paper")
 def cmd_leader(ctx):
+    """Leader on a layout: an arrow, a bent line and a text."""
     lay = _active_layout(ctx)
     if lay is None:
         ctx.echo("Leaders go on layouts — switch to one first.")
@@ -1088,6 +1102,7 @@ def _dim_scale_at(lay, x, y):
 
 @command("dimradius", aliases=("dimr",), space="paper")
 def cmd_dimradius(ctx):
+    """Radius dimension on a layout."""
     lay = _active_layout(ctx)
     if lay is None:
         ctx.echo("Dimensions go on layouts — switch to one first.")
@@ -1106,6 +1121,7 @@ def cmd_dimradius(ctx):
 
 @command("dimdiameter", aliases=("dimdia",), space="paper")
 def cmd_dimdiameter(ctx):
+    """Diameter dimension on a layout."""
     lay = _active_layout(ctx)
     if lay is None:
         ctx.echo("Dimensions go on layouts — switch to one first.")
@@ -1124,6 +1140,7 @@ def cmd_dimdiameter(ctx):
 
 @command("dimangle", aliases=("dimangular",), space="paper")
 def cmd_dimangle(ctx):
+    """Angular dimension on a layout, from a vertex and two directions."""
     lay = _active_layout(ctx)
     if lay is None:
         ctx.echo("Dimensions go on layouts — switch to one first.")
@@ -1141,6 +1158,8 @@ def cmd_dimangle(ctx):
 
 @command("titleblock")
 def cmd_titleblock(ctx):
+    """Add or edit the layout's title block: project, title and author; date,
+    sheet and scale fill in themselves."""
     lay = _active_layout(ctx)
     if lay is None:
         ctx.echo("Title blocks go on layouts — switch to one first.")
@@ -1161,6 +1180,7 @@ def cmd_titleblock(ctx):
 
 @command("scalebar", space="paper")
 def cmd_scalebar(ctx):
+    """Place a scale bar on a layout, at the scale of the detail under it."""
     lay = _active_layout(ctx)
     if lay is None:
         ctx.echo("Scale bars go on layouts — switch to one first.")
@@ -1178,6 +1198,8 @@ def cmd_scalebar(ctx):
 
 @command("detailsection")
 def cmd_detailsection(ctx):
+    """Cut the detail you are in with a section plane: what is in front is
+    removed, cut faces are hatched."""
     lay, detail = _entered_or_only_detail(ctx)
     if detail is None:
         ctx.echo("Enter a detail first (double-click it).")
@@ -1231,6 +1253,7 @@ def cmd_exportdxf(ctx):
 
 @command("exportsvg", mutates=False)
 def cmd_exportsvg(ctx):
+    """Export the current layout to an SVG file."""
     lay = _active_layout(ctx)
     if lay is None:
         ctx.echo("Switch to a layout to export it as SVG.")

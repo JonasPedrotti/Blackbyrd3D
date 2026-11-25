@@ -52,6 +52,8 @@ def cmd_line(ctx):
 
 @command("polyline", aliases=("pl", "pline"), space="any")
 def cmd_polyline(ctx):
+    """Polyline through picked points; Close or a click back on the start
+    closes it, Enter finishes it open."""
     pts = []
     while True:
         if not pts:
@@ -595,6 +597,7 @@ def cmd_closecrv(ctx):
 # mark on the page, at the millimetres it was put at, and it is not printed.
 @command("point", aliases=("pt",), space="any")
 def cmd_point(ctx):
+    """Place one point object."""
     p = yield PointReq("Location of point object (Enter to cancel)",
                        allow_empty=True, preview_fn=g.make_point)
     if p is None:
@@ -606,6 +609,7 @@ def cmd_point(ctx):
 
 @command("points", space="any")
 def cmd_points(ctx):
+    """Place point objects one after another until Enter."""
     count = 0
     p = yield PointReq("Location of point object (Enter to finish)",
                        allow_empty=True, preview_fn=g.make_point)
@@ -619,6 +623,7 @@ def cmd_points(ctx):
 
 @command("divide")
 def cmd_divide(ctx):
+    """Place points that divide curves into equal segments."""
     from .base import IntReq
     curves = yield SelectReq("Select curves to divide", kinds=("curve",))
     n = yield IntReq("Number of segments", default=10, minimum=1)
@@ -639,6 +644,7 @@ def cmd_divide(ctx):
 
 @command("tweencurves", aliases=("tween",))
 def cmd_tweencurves(ctx):
+    """Curves in even steps between two curves."""
     from .base import IntReq
     first = yield SelectReq("Select first curve", kinds=("curve",),
                             max_count=1)

@@ -11,42 +11,49 @@ def _select_kind(ctx, kind: str, label: str):
 
 @command("selcrv", aliases=("selcurves",), mutates=False)
 def cmd_selcrv(ctx):
+    """Select all curves."""
     _select_kind(ctx, "curve", "curve(s)")
     yield from ()
 
 
 @command("selhatch", aliases=("selhatches",), mutates=False)
 def cmd_selhatch(ctx):
+    """Select all hatches."""
     _select_kind(ctx, "hatch", "hatch(es)")
     yield from ()
 
 
 @command("selsrf", aliases=("selsurfaces",), mutates=False)
 def cmd_selsrf(ctx):
+    """Select all surfaces."""
     _select_kind(ctx, "surface", "surface(s)")
     yield from ()
 
 
 @command("selpt", aliases=("selpoints",), mutates=False)
 def cmd_selpt(ctx):
+    """Select all point objects."""
     _select_kind(ctx, "point", "point(s)")
     yield from ()
 
 
 @command("selsolid", aliases=("selsolids",), mutates=False)
 def cmd_selsolid(ctx):
+    """Select all solids."""
     _select_kind(ctx, "solid", "solid(s)")
     yield from ()
 
 
 @command("selpointcloud", aliases=("selpc", "selpointclouds"), mutates=False)
 def cmd_selpointcloud(ctx):
+    """Select all point clouds."""
     _select_kind(ctx, "pointcloud", "point cloud(s)")
     yield from ()
 
 
 @command("sellayer", mutates=False)
 def cmd_sellayer(ctx):
+    """Select every object on a layer."""
     name = yield TextReq("Layer name")
     layer = ctx.scene.layers.find_by_name(name)
     if layer is None:
@@ -71,6 +78,7 @@ def cmd_selname(ctx):
 
 @command("sellast", mutates=False)
 def cmd_sellast(ctx):
+    """Select the most recently created object."""
     objs = ctx.scene.all()
     if objs:
         ctx.selection.set([objs[-1].id])
@@ -82,6 +90,7 @@ def cmd_sellast(ctx):
 
 @command("invert", aliases=("selinv",), mutates=False)
 def cmd_invert(ctx):
+    """Invert the selection."""
     current = set(ctx.selection.ids)
     ids = [o.id for o in ctx.scene.selectable_objects()
            if o.id not in current]
@@ -92,6 +101,7 @@ def cmd_invert(ctx):
 
 @command("isolate")
 def cmd_isolate(ctx):
+    """Hide everything but the selected objects; 'unisolate' brings it back."""
     from ..core import clipping
     objs = yield SelectReq("Select objects to isolate")
     keep = {o.id for o in objs}
@@ -111,6 +121,7 @@ def cmd_isolate(ctx):
 
 @command("unisolate")
 def cmd_unisolate(ctx):
+    """Show again what 'isolate' hid."""
     hidden = getattr(ctx, "_isolated", [])
     n = ctx.scene.update_many((i for i in hidden if ctx.scene.get(i)),
                               visible=True)
