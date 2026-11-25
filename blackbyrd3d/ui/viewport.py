@@ -2428,7 +2428,9 @@ class Viewport(QOpenGLWidget):
             if not self._draw_readout.isHidden():
                 self._draw_readout.setVisible(False)
             return
-        if not length and ghost is None and frame is None:
+        snap = self._marked_snap() if self._readout_wanted else None
+        snap_name = _SNAP_LABELS.get(snap[1]) if snap is not None else None
+        if not length and ghost is None and frame is None and not snap_name:
             if not self._draw_readout.isHidden():
                 self._draw_readout.setVisible(False)
             return
@@ -2456,12 +2458,15 @@ class Viewport(QOpenGLWidget):
             cx, cy = anchor
             text = " × ".join(self._readout_length(v) for v in lengths)
         else:
-            anchor = self._readout_anchor(span[1])
+            # before the first point there is no leg, only the snap's name
+            anchor = self._readout_anchor(span[1] if length else snap[0])
             if anchor is None:              # cursor point behind the camera
                 self._draw_readout.setVisible(False)
                 return
             cx, cy = anchor
-            text = self._readout_length(length)
+            text = self._readout_length(length) if length else ""
+        if snap_name:
+            text = f"{snap_name}\n{text}" if text else snap_name
         self._draw_readout.setText(text)
         self._draw_readout.adjustSize()
         w, h = self._draw_readout.width(), self._draw_readout.height()
@@ -4528,17 +4533,21 @@ class Viewport(QOpenGLWidget):
             return self._active_snap
         return None
 
+    def _marked_snap(self):
+        snap = self._snap_to_draw()
+        # a gumball being dragged lands where a pick would too
+        if (snap is None and getattr(getattr(self, "gumball", None), "drag",
+                                     None) is not None):
+            snap = self._active_snap
+        return snap
+
     def _draw_preview(self, mvp):
         pts = self._preview_data
         markers = self._marker_points
         if self.space != "model" and self._drawing_through() is not None:
             pts = self._on_paper(pts) if len(pts) else pts
             markers = [self._on_paper([m])[0] for m in markers]
-        snap = self._snap_to_draw()
-        # a gumball being dragged lands where a pick would too
-        if (snap is None and getattr(getattr(self, "gumball", None), "drag",
-                                     None) is not None):
-            snap = self._active_snap
+        snap = self._marked_snap()
         # An elevator standing before the first point has no leg drawn
         # against it, so without the axis itself on screen Ctrl looks like
         # it did nothing at all.
@@ -4583,7 +4592,7 @@ class Viewport(QOpenGLWidget):
                                  (*theme.SELECTION_COLOR, 0.5), 1.0)
             axes = self.camera.right_up()
             self._preview.update(rebased(np.concatenate(
-                [_snap_marker("guide", np.asarray(g, np.float32), *axes, size)
+                [_guide_marker(np.asarray(g, np.float32), *axes, size)
                  for g in guides]), self._frame_anchor))
             self._draw_lines(self._preview, mvp,
                              (*theme.SELECTION_COLOR, 0.9), 1.6)
@@ -4592,43 +4601,34 @@ class Viewport(QOpenGLWidget):
             self._preview.update(rebased(allpts, self._frame_anchor))
             self._draw_lines(self._preview, mvp,
                              (*theme.SELECTION_COLOR, 0.9), 1.6)
-        if snap is not None:
+        # The snap itself is named in the draw readout; only a
+        # projected one is drawn, as a faint line down to a plain point
+        # marker where the point will land.
+        if snap is not None and self._projecting():
             if self.space != "model":
-                # A snap inside a detail is a model point drawn on the paper,
-                # so bring it back through the window. Both it and a native
-                # paper snap use page axes for a visible square marker.
+                # a snap inside a detail is a model point drawn on the
+                # paper, so bring it back through the window
                 if self._drawing_through() is not None:
                     at = self._on_paper([snap[0]])[0]
                 else:
                     at = np.asarray(snap[0], float)
                 axes = (np.array([1.0, 0.0, 0.0]), np.array([0.0, 1.0, 0.0]))
-                # Wider than a detail's corner grip, which is painted over
-                # the top of it: a marker the grip's size was hidden by the
-                # grip it landed on, so a snapped corner looked unsnapped.
-                reach = size * 1.8
             else:
                 at = np.asarray(snap[0], float)
                 axes = self.camera.right_up()
-                # A fixed number of pixels where the snap is, not a share of
-                # the distance to the camera's target: with the target far
-                # off, as a file's own view often has it, a snap near the
-                # eye was marked a metre wide.
+                # a fixed number of pixels where the snap is, not a share
+                # of the distance to the camera's target
                 size = self._world_per_pixel(at) * SNAP_MARKER_PX
-                reach = size * 0.95
-            segs = _snap_marker(snap[1], at, *axes, reach)
-            if self._projecting():
-                # the snap stays on its feature; a faint line runs down to
-                # a plain point marker where the point will land
-                down = np.asarray(self.snaps.projected(snap[0]), np.float32)
-                if self.space != "model":
-                    down = self._on_paper([down])[0]
-                self._preview.update(rebased(np.stack([at, down]),
-                                             self._frame_anchor))
-                self._draw_lines(self._preview, mvp,
-                                 (*theme.SELECTION_COLOR, 0.35), 1.0)
-                r, u = (np.asarray(a, np.float32) * size * 0.5 for a in axes)
-                segs = np.concatenate([segs, np.stack([down - r, down + r]),
-                                       np.stack([down - u, down + u])])
+            down = np.asarray(self.snaps.projected(snap[0]), np.float32)
+            if self.space != "model":
+                down = self._on_paper([down])[0]
+            self._preview.update(rebased(np.stack([at, down]),
+                                         self._frame_anchor))
+            self._draw_lines(self._preview, mvp,
+                             (*theme.SELECTION_COLOR, 0.35), 1.0)
+            r, u = (np.asarray(a, np.float32) * size * 0.5 for a in axes)
+            segs = np.concatenate([np.stack([down - r, down + r]),
+                                   np.stack([down - u, down + u])])
             self._preview.update(rebased(segs, self._frame_anchor))
             self._draw_lines(self._preview, mvp,
                              _snap_marker_color(self.space), 2.0)
@@ -8306,46 +8306,23 @@ def _axis_guide(base, direction, reach: float) -> np.ndarray:
     return np.stack([b - reach * d, b + reach * d])
 
 
-def _snap_marker(kind: str, c: np.ndarray, right: np.ndarray,
-                 up: np.ndarray, s: float) -> np.ndarray:
-    """Snap marker glyphs, as GL_LINES vertex pairs."""
+# What the draw readout names a snap. Near has none: the cursor sitting on
+# the curve already says it.
+_SNAP_LABELS = {
+    "end": "End", "point": "Point", "mid": "Mid", "center": "Cen",
+    "quad": "Quad", "int": "Int", "appint": "AppInt", "perp": "Perp",
+    "track": "Track", "guide": "Guide",
+}
+
+
+def _guide_marker(c: np.ndarray, right: np.ndarray, up: np.ndarray,
+                  s: float) -> np.ndarray:
+    """A tracking guide's plus, as GL_LINES vertex pairs."""
     r = np.asarray(right, float) * s
     u = np.asarray(up, float) * s
     c = np.asarray(c, float)
-
-    def loop(pts):
-        return [np.stack([pts[i], pts[(i + 1) % len(pts)]])
-                for i in range(len(pts))]
-
-    if kind in ("end", "point"):           # square around the snapped point
-        segs = loop([c - r - u, c + r - u, c + r + u, c - r + u])
-    elif kind == "mid":                   # triangle
-        segs = loop([c - r - u, c + r - u, c + u])
-    elif kind == "center":                # octagon ~ circle
-        pts = []
-        for k in range(8):
-            a = k * np.pi / 4
-            pts.append(c + r * np.cos(a) + u * np.sin(a))
-        segs = loop(pts)
-    elif kind == "quad":                  # diamond
-        segs = loop([c - r, c - u, c + r, c + u])
-    elif kind == "int":                   # X
-        segs = [np.stack([c - r - u, c + r + u]),
-                np.stack([c - r + u, c + r - u])]
-    elif kind == "appint":                # X with the middle missing
-        # the gap is the point: the two curves cross here on screen and
-        # nothing is joined, which is what separates this from `int`
-        segs = [np.stack([c + d * 0.4, c + d])
-                for d in (r + u, -(r + u), r - u, u - r)]
-    elif kind in ("guide", "track"):      # plus
-        segs = [np.stack([c - r, c + r]), np.stack([c - u, c + u])]
-    elif kind == "perp":                  # perpendicular glyph
-        segs = [np.stack([c - r - u, c + r - u]),
-                np.stack([c - u, c + u])]
-    else:                                 # near: slash
-        segs = [np.stack([c - r - u, c + r + u]),
-                np.stack([c - r, c + r])]
-    return np.concatenate(segs)
+    return np.concatenate([np.stack([c - r, c + r]),
+                           np.stack([c - u, c + u])])
 
 
 def _snap_marker_color(space: str) -> tuple[float, float, float, float]:

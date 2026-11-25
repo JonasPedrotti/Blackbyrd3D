@@ -13,6 +13,9 @@
   tried on real hardware yet.
 - **Full command list.** The documentation site now describes every
   command, and so do `help` and F1 in the app.
+- **Snap names instead of snap icons.** The snap kind (End, Mid, Cen,
+  Perp ...) shows above the distance readout, the pick radius is a bit
+  larger, Cen's much larger, and Perp reaches every side of a polyline.
 
 ## 0.3.0
 

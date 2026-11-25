@@ -58,6 +58,7 @@ def test_the_front_of_the_solid_and_what_lies_on_it_snap(pane):
 
 def test_near_skips_a_covered_curve(pane):
     pane.snaps.types["near"] = True
+    pane.snaps.types["center"] = False     # the face's middle is in reach
     pane.scene.add(g.make_line((-30, 10, 2), (30, 10, 2)))
     assert _pick(pane, (1, 10, 2)) is None
     assert _pick(pane, (15, 10, 2))[1] == "near"

@@ -132,6 +132,7 @@ def test_a_pixel_looks_along_the_view(sheet):
     eye = DetailEye(w.viewport.layout_view, det)
     pos = _frame(w, det, 0.4, 0.4)
     vp = w.viewport
+    vp.snaps.enabled = False        # the ray, not what it might snap to
     origin, direction = eye.ray_through(pos.x(), pos.y(), vp.width(),
                                         vp.height())
     assert direction == pytest.approx([0.0, 1.0, 0.0])   # front view: +y in

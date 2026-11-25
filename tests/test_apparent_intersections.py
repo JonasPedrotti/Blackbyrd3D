@@ -285,16 +285,9 @@ def test_the_osnap_command_offers_it():
     assert "AppInt" in _OSNAP_KINDS
 
 
-def test_it_has_a_marker_of_its_own():
-    from blackbyrd3d.ui.viewport import _snap_marker
-    c = np.zeros(3)
-    right = np.array([1.0, 0.0, 0.0])
-    up = np.array([0.0, 1.0, 0.0])
-    mine = _snap_marker("appint", c, right, up, 6.0)
-    theirs = _snap_marker("int", c, right, up, 6.0)
-    assert len(mine)
-    assert np.asarray(mine).shape != np.asarray(theirs).shape or \
-        not np.allclose(np.asarray(mine), np.asarray(theirs))
+def test_it_has_a_label_of_its_own():
+    from blackbyrd3d.ui.viewport import _SNAP_LABELS
+    assert _SNAP_LABELS["appint"] != _SNAP_LABELS["int"]
 
 
 def test_the_setting_is_remembered():

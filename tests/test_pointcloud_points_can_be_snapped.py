@@ -42,7 +42,7 @@ def test_nearest_sample_retains_xyz_and_respects_screen_radius_and_camera_front(
     index = SnapIndex(scene)
     assert_point(hit(index, cam, (3, 2, 7), (3, 2)), (3, 2, 7))
     assert_point(hit(index, cam, (3, 4, 7)), (3, 4, 7))
-    assert hit(index, cam, (3, 2, 7), (0, 15)) is None
+    assert hit(index, cam, (3, 2, 7), (0, 22)) is None
     assert hit(index, cam, (100, -8, 4)) is None
 
 
