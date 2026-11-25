@@ -120,7 +120,22 @@ def should_offer(config) -> bool:
     """Ask on launch? Once, and never when the answer is already yes."""
     if config.get("file_assoc", "asked", default=False):
         return False
+    if sys.platform == "win32" and _installer_asked():
+        return False
     return status() != "default"
+
+
+def _installer_asked() -> bool:
+    """Whether the Windows installer's own checkbox already settled it."""
+    import winreg
+    for root in (winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE):
+        try:
+            with winreg.OpenKey(root, r"Software\Blackbyrd3D") as key:
+                winreg.QueryValueEx(key, "AssociateFiles")
+                return True
+        except OSError:
+            continue
+    return False
 
 
 def make_default() -> tuple[bool, str]:

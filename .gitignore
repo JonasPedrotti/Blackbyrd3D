@@ -15,6 +15,8 @@ dist/
 screenshots/
 .tokensave/
 packaging/windows/Output/
+# drawn at build time by make_wizard_images.py
+packaging/windows/wizard/
 # generated at build time from blackbyrd3d.__version__
 packaging/windows/file_version_info.txt
 *.dmg

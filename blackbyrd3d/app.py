@@ -76,6 +76,8 @@ class MainWindow(QMainWindow):
     # emitted from the background update-check thread; handled on the main
     # thread so the notice is shown Qt-safely
     updateAvailable = Signal(object)
+    # the launch check found nothing newer (True) or could not reach GitHub
+    updateUpToDate = Signal(bool)
 
     def __init__(self):
         super().__init__()
@@ -94,6 +96,7 @@ class MainWindow(QMainWindow):
         # core state
         self._pending_update = None
         self.updateAvailable.connect(self._on_update_available)
+        self.updateUpToDate.connect(self._on_update_none)
         from .utils.config import Config
         self.cfg = Config()
         self.scene = Scene()
@@ -3435,13 +3438,21 @@ class MainWindow(QMainWindow):
         import platform
         import threading
         from . import __version__
-        from .utils.updates import check_for_update
+        from .utils.updates import _fetch, check_for_update
 
         def worker():
+            reached = []
+
+            def fetch():
+                raw = _fetch()
+                reached.append(True)
+                return raw
             rel = check_for_update(__version__, platform.system(),
-                                   platform.machine())
+                                   platform.machine(), fetch=fetch)
             if rel:
                 self.updateAvailable.emit(rel)
+            else:
+                self.updateUpToDate.emit(bool(reached))
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -3461,6 +3472,24 @@ class MainWindow(QMainWindow):
             f"Blackbyrd3D {rel['version']} is available")
         self._update_button.setToolTip("Download or read the release notes")
         self._update_button.show()
+
+    # long enough to be read, short enough not to stay in the way
+    UPDATE_NOTE_MS = 8000
+
+    def _on_update_none(self, reached):
+        """Main-thread slot: the launch check is done and found nothing,
+        said for a moment so a ticked check is seen to have run."""
+        from PySide6.QtCore import QTimer
+        from PySide6.QtWidgets import QLabel
+        from . import __version__
+        if getattr(self, "_update_note", None) is None:
+            self._update_note = QLabel()
+            self.statusBar().addPermanentWidget(self._update_note)
+        self._update_note.setText(
+            f"Blackbyrd3D {__version__} is up to date" if reached
+            else "Could not reach GitHub to check for updates")
+        self._update_note.show()
+        QTimer.singleShot(self.UPDATE_NOTE_MS, self, self._update_note.hide)
 
     def _open_update_notice(self):
         """The notice has done its job once clicked: the download dialog

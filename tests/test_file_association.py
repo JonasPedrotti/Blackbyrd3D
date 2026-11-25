@@ -101,8 +101,17 @@ def test_status_reads_xdg_mime_answer(monkeypatch):
 
 def test_offers_once_until_answered(monkeypatch, config):
     monkeypatch.setattr(file_assoc, "status", lambda: "not_default")
+    monkeypatch.setattr(file_assoc, "_installer_asked", lambda: False)
     assert file_assoc.should_offer(config)
     config.set("file_assoc", "asked", True)
+    assert not file_assoc.should_offer(config)
+
+
+def test_never_asks_again_what_the_windows_installer_asked(monkeypatch,
+                                                            config):
+    monkeypatch.setattr(file_assoc.sys, "platform", "win32")
+    monkeypatch.setattr(file_assoc, "status", lambda: "not_default")
+    monkeypatch.setattr(file_assoc, "_installer_asked", lambda: True)
     assert not file_assoc.should_offer(config)
 
 
