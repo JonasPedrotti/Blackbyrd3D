@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- **A tidier installer.** Its pages match its title bar, the text sits in
+  the middle of each page and the window is lower.
+
 ## 0.3.0
 
 - **Ortho and grid snap in every pane.** The Ortho and Grid buttons and F8

@@ -47,12 +47,13 @@ PrivilegesRequiredOverridesAllowed=dialog
 OutputBaseFilename=Blackbyrd3D-Setup-x86_64
 Compression=lzma2
 SolidCompression=yes
-; Dressed like the app's own popups: their card grey behind every page and
-; under the title bar, the splash beside the first and last page, its mark
-; in the corner of the rest
+; Dressed like the app: the dark style's title bar grey behind every page so
+; window and page are one colour, the splash beside the first and last page,
+; its mark in the corner of the rest
 WizardStyle=modern dark hidebevels includetitlebar
-WizardBackColor=#2e2f34
+WizardBackColor=#2b2b2b
 WizardSmallImageBackColor=none
+WizardSizePercent=120,100
 WizardImageFile=wizard\wizard-*x*.png
 WizardSmallImageFile=wizard\wizard-small-*.png
 SetupIconFile=byrd3d.ico
@@ -201,4 +202,114 @@ begin
   ApplyUpdateCheck;
   ApplyFileAssoc('.byrd', 'Blackbyrd3D.Document');
   ApplyFileAssoc('.wyrm', 'Blackbyrd3D.Wyrm');
+end;
+
+{ Page layout: the text on the Welcome, options and Finished pages sits in
+  the middle of its page rather than at the top. }
+
+{ The window is lower than modern style's default (WizardSizePercent), which
+  would narrow the picture beside the Welcome and Finished pages with it. It
+  keeps its width instead, drawn 202:314 by make_wizard_images.py, and the
+  text beside it moves over to make room. }
+procedure MakeRoom(C: TControl; Delta: Integer);
+begin
+  C.Left := C.Left + Delta;
+  C.Width := C.Width - Delta;
+end;
+
+procedure InitializeWizard;
+var
+  F: TWizardForm;
+  Delta: Integer;
+begin
+  F := WizardForm;
+  Delta := F.WizardBitmapImage.Height * 202 div 314 - F.WizardBitmapImage.Width;
+  F.WizardBitmapImage.Width := F.WizardBitmapImage.Width + Delta;
+  F.WizardBitmapImage2.Width := F.WizardBitmapImage2.Width + Delta;
+  MakeRoom(F.WelcomeLabel1, Delta);
+  MakeRoom(F.WelcomeLabel2, Delta);
+  MakeRoom(F.FinishedHeadingLabel, Delta);
+  MakeRoom(F.FinishedLabel, Delta);
+  MakeRoom(F.RunList, Delta);
+  MakeRoom(F.YesRadio, Delta);
+  MakeRoom(F.NoRadio, Delta);
+end;
+
+{ A list as tall as its rows, so it can be centred with the text above it. }
+procedure FitList(List: TNewCheckListBox);
+begin
+  List.Height := List.Items.Count * ScaleY(22) + ScaleY(4);
+end;
+
+{ Moves Top and Bottom, the first and last control of a stack, so the stack
+  is centred in Area; whatever lies between them moves with them. }
+procedure CentreStack(Top, Bottom: TControl; Area: Integer);
+var
+  Shift: Integer;
+begin
+  Shift := (Area - (Bottom.Top + Bottom.Height - Top.Top)) div 2 - Top.Top;
+  Top.Top := Top.Top + Shift;
+  if Bottom <> Top then
+    Bottom.Top := Bottom.Top + Shift;
+end;
+
+procedure CentreThree(A, B, C: TControl; Area: Integer);
+var
+  Shift: Integer;
+begin
+  Shift := (Area - (C.Top + C.Height - A.Top)) div 2 - A.Top;
+  A.Top := A.Top + Shift;
+  B.Top := B.Top + Shift;
+  C.Top := C.Top + Shift;
+end;
+
+{ Label as tall as its text, now that MakeRoom may have wrapped it, and
+  Below as far under it as it was. }
+procedure FitText(L: TNewStaticText; Below: TControl);
+var
+  Gap: Integer;
+begin
+  Gap := Below.Top - L.Top - L.Height;
+  L.AdjustHeight;
+  Below.Top := L.Top + L.Height + Gap;
+end;
+
+procedure CurPageChanged(CurPageID: Integer);
+var
+  F: TWizardForm;
+  LabelTop: Integer;
+begin
+  F := WizardForm;
+  F.WizardSmallBitmapImage.Visible := CurPageID <> wpSelectTasks;
+  case CurPageID of
+    wpWelcome:
+      begin
+        FitText(F.WelcomeLabel1, F.WelcomeLabel2);
+        F.WelcomeLabel2.AdjustHeight;
+        CentreStack(F.WelcomeLabel1, F.WelcomeLabel2, F.WelcomePage.ClientHeight);
+      end;
+    wpSelectTasks:
+      begin
+        FitList(F.TasksList);
+        CentreStack(F.SelectTasksLabel, F.TasksList, F.SelectTasksPage.ClientHeight);
+      end;
+    wpFinished:
+      begin
+        LabelTop := F.FinishedLabel.Top;
+        FitText(F.FinishedHeadingLabel, F.FinishedLabel);
+        if F.RunList.Visible then
+        begin
+          F.RunList.Top := F.RunList.Top + F.FinishedLabel.Top - LabelTop;
+          FitText(F.FinishedLabel, F.RunList);
+          FitList(F.RunList);
+          CentreThree(F.FinishedHeadingLabel, F.FinishedLabel, F.RunList,
+                      F.FinishedPage.ClientHeight);
+        end else
+        begin
+          F.FinishedLabel.AdjustHeight;
+          CentreStack(F.FinishedHeadingLabel, F.FinishedLabel,
+                      F.FinishedPage.ClientHeight);
+        end;
+      end;
+  end;
 end;
