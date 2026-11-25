@@ -1,15 +1,22 @@
 """3Dconnexion SpaceMouse navigation.
 
-Two sources, no third-party dependencies:
+One source per platform, no third-party dependencies:
 
-1. **spacenavd** (preferred): speaks the FreeSpacenav daemon's socket
-   protocol directly (``/var/run/spnav.sock``, override with the
+1. **spacenavd** on Linux (preferred): speaks the FreeSpacenav daemon's
+   socket protocol directly (``/var/run/spnav.sock``, override with the
    ``SPNAV_SOCKET`` env var). Display-server agnostic — works on X11
    and Wayland — and inherits the daemon's calibration and deadzones.
-2. **evdev fallback**: reads the kernel input device straight from
-   ``/dev/input/eventN`` (found via ``/proc/bus/input/devices``) using
-   only the stdlib. Needs read access to the device node (usually the
-   ``input`` group).
+2. **evdev fallback** on Linux: reads the kernel input device straight
+   from ``/dev/input/eventN`` (found via ``/proc/bus/input/devices``)
+   using only the stdlib. Needs read access to the device node (usually
+   the ``input`` group).
+3. **Raw Input** on Windows (spacemouse_win): the device's HID reports,
+   with or without the 3Dconnexion driver.
+4. **3DconnexionClient** on macOS (spacemouse_mac): the driver's own
+   framework, which holds the device there.
+
+Windows and macOS are untested on real hardware so far; their axes go
+through the same HID mapping as evdev (`hid_motion`).
 
 Mapping (turntable camera — the app has no roll):
   - slide left/right  -> pan X
@@ -28,6 +35,7 @@ from __future__ import annotations
 import os
 import socket
 import struct
+import sys
 import time
 
 from PySide6.QtCore import QObject, QSocketNotifier, QTimer
@@ -44,6 +52,69 @@ _FULL = 350.0                    # nominal full deflection from spacenavd
 _PAN_PX = 9.0
 _ORBIT_PX = 7.0
 _ZOOM_STEPS = 0.22
+
+
+# The device's own HID axes (X, Y, Z, Rx, Ry, Rz, as evdev and Raw Input
+# number them) into the navigator's order and signs. Y is push/pull and Z
+# lift on the device, the other way round from spacenavd.
+_HID_ORDER = (0, 2, 1, 3, 5, 4)
+_HID_SIGN = (1, -1, -1, 1, -1, -1)
+_HID_SCALE = _FULL / 500.0
+
+
+def hid_motion(axes) -> list[float]:
+    """Raw HID axis values, as (axis number, value) pairs, in the
+    navigator's six-axis order."""
+    motion = [0.0] * 6
+    for code, value in axes:
+        if 0 <= code < 6:
+            motion[_HID_ORDER[code]] += (value * _HID_SIGN[code]
+                                         * _HID_SCALE)
+    return motion
+
+
+def button_changes(old: int, new: int) -> list[tuple[int, bool]]:
+    """The presses and releases between two button bitmasks."""
+    changed = old ^ new
+    return [(bit, bool(new >> bit & 1))
+            for bit in range(max(changed.bit_length(), 0))
+            if changed >> bit & 1]
+
+
+class HidReports:
+    """A 3Dconnexion device's HID input reports, as navigator input.
+
+    Report 1 is the translation, or all six axes on newer devices; report
+    2 the rotation; report 3 the buttons as a bitmask. Each axis report is
+    a deflection, not a step, and is applied as it comes, like a
+    spacenavd motion event.
+    """
+
+    def __init__(self):
+        self.buttons = 0
+
+    def read(self, report: bytes):
+        """(motion, buttons) for one report; motion None if it moved
+        nothing."""
+        if not report:
+            return None, []
+        rid = report[0]
+        axes = ()
+        if rid == 1 and len(report) >= 13:
+            axes = enumerate(struct.unpack_from("<6h", report, 1))
+        elif rid == 1 and len(report) >= 7:
+            axes = enumerate(struct.unpack_from("<3h", report, 1))
+        elif rid == 2 and len(report) >= 7:
+            axes = ((i + 3, v) for i, v
+                    in enumerate(struct.unpack_from("<3h", report, 1)))
+        elif rid == 3:
+            mask = int.from_bytes(report[1:], "little")
+            changes = button_changes(self.buttons, mask)
+            self.buttons = mask
+            return None, changes
+        else:
+            return None, []
+        return hid_motion(axes), []
 
 
 _DIAL_TIMEOUT = 0.5   # seconds; a daemon that is there answers at once
@@ -82,7 +153,8 @@ class SpaceMouseNavigator(QObject):
         self.sock = None
         self._notifier = None
         self._buf = b""
-        self.source = None            # "spacenavd" | "evdev" | None
+        self.source = None            # see status()
+        self._hid = HidReports()
         self.diag_until = 0.0
         self._diag_last = 0.0
         # quiet retry so plugging in later just works
@@ -97,6 +169,18 @@ class SpaceMouseNavigator(QObject):
 
     def _connect(self):
         if self.source is not None:
+            return
+        if sys.platform == "win32":
+            from . import spacemouse_win
+            if spacemouse_win.listen(self):
+                self.source = "Windows Raw Input"
+                self._retry.stop()
+            return
+        if sys.platform == "darwin":
+            from . import spacemouse_mac
+            if spacemouse_mac.listen(self):
+                self.source = "3DconnexionClient"
+                self._retry.stop()
             return
         fd = None
         s = _dial_spacenavd(SPNAV_SOCKET)
@@ -150,9 +234,22 @@ class SpaceMouseNavigator(QObject):
 
     def status(self) -> str:
         if self.source is None:
+            if sys.platform == "darwin":
+                return ("no SpaceMouse source: is the 3Dconnexion driver "
+                        "(3DxWare) installed?")
+            if sys.platform == "win32":
+                return "no SpaceMouse source: Raw Input is unavailable"
             return ("no SpaceMouse source — is spacenavd running? "
                     f"(looked for {SPNAV_SOCKET} and /dev/input)")
+        if self.source in ("Windows Raw Input", "3DconnexionClient"):
+            return f"listening via {self.source} (experimental)"
         return f"connected via {self.source}"
+
+    def hid_report(self, report: bytes):
+        """One HID input report from a platform source."""
+        motion, buttons = self._hid.read(report)
+        if motion is not None or buttons:
+            self._apply(motion or [0.0] * 6, buttons)
 
     # ------------------------------------------------------------ events
 
@@ -198,11 +295,8 @@ class SpaceMouseNavigator(QObject):
                     _, _, etype, code, value = struct.unpack_from(
                         "qqHHi", data, off)
                     if etype == 3 and code < 6:          # EV_ABS
-                        # raw kernel axes: X, Y(fwd/back), Z(up/down)
-                        order = (0, 2, 1, 3, 5, 4)
-                        sign = (1, -1, -1, 1, -1, -1)
-                        i = order[code]
-                        motion[i] += value * sign[code] * (_FULL / 500.0)
+                        step = hid_motion(((code, value),))
+                        motion = [a + b for a, b in zip(motion, step)]
                     elif etype == 1 and value in (0, 1):  # EV_KEY
                         buttons.append((code - 0x100, value == 1))
         except BlockingIOError:
