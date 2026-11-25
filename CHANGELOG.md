@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.3.0
 
 - **Ortho and grid snap in every pane.** The Ortho and Grid buttons and F8
   and F9 now hold in all viewports, not only the first one.
