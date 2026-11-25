@@ -798,6 +798,28 @@ def _ghost_corners(dm):
     return _corners_memo[1]
 
 
+def shown_edge_segments(shape) -> tuple:
+    """A shape's edges and its naked edges, each as (N, 2, 3) segments."""
+    from ..core import geometry as _g
+    from ..core.tessellate import _edge_polyline, default_deflection
+    try:
+        edges = _g.edges_of(shape)
+        naked = _g.naked_edges(shape)
+        deflection = default_deflection(shape) if edges else 0.0
+    except Exception:                                      # noqa: BLE001
+        edges, naked, deflection = [], [], 0.0
+
+    def segments(found):
+        out = []
+        for edge in found:
+            pts = _edge_polyline(edge, deflection)
+            if pts is not None and len(pts) > 1:
+                out.append(np.stack([pts[:-1], pts[1:]], axis=1))
+        return (np.concatenate(out) if out else np.zeros((0, 2, 3)))
+
+    return segments(edges), segments(naked)
+
+
 def rebased(pts, anchor):
     """Points minus the anchor, subtracted in float64, cast to float32."""
     if anchor is None:
@@ -1690,6 +1712,7 @@ class Viewport(QOpenGLWidget):
         self.draft_angle = 3.0              # draft analysis threshold (deg)
         self._cv_cache: dict = {}
         self._dir_cache: dict = {}          # direction arrows, per mesh uid
+        self._shown_edges_cache: dict = {}  # ShowEdges segments, per mesh uid
         self.view_history = ViewHistory()   # for undoview / redoview
         self._view_last = self.camera.state()
         self._view_moved_at = 0.0
@@ -2055,6 +2078,7 @@ class Viewport(QOpenGLWidget):
         self._draw_control_points(mvp)
         self._draw_held_points(mvp)
         self._draw_combs(mvp)
+        self._draw_shown_edges(mvp)
         self._draw_direction_arrows(mvp)
         self._draw_clip_normals(mvp)
         self.gumball.paint(mvp)
@@ -4765,6 +4789,49 @@ class Viewport(QOpenGLWidget):
                     GL.glBindVertexArray(self._preview.vao)
                     GL.glDrawArrays(GL.GL_LINES, 0, len(arr))
         GL.glEnable(GL.GL_DEPTH_TEST)
+
+    def _draw_shown_edges(self, mvp):
+        """ShowEdges: every edge, the naked ones, or both, drawn on top
+        in the colour its panel set. Naked edges go wider, so they still
+        stand out when all edges are on."""
+        scene = self.scene
+        if not scene.edges_shown:
+            return
+        if not (scene.edges_show_all or scene.edges_show_naked):
+            return
+        color = (*scene.edges_color[:3], 1.0)
+        everything, naked = [], []
+        for obj_id in list(scene.edges_shown):
+            obj = scene.get(obj_id)
+            if obj is None:
+                scene.edges_shown.discard(obj_id)
+                continue
+            if not getattr(obj, "visible", True):
+                continue
+            all_segs, naked_segs = self._shown_edges_entry(obj)
+            if scene.edges_show_all and len(all_segs):
+                everything.append(all_segs)
+            if scene.edges_show_naked and len(naked_segs):
+                naked.append(naked_segs)
+        GL.glDisable(GL.GL_DEPTH_TEST)
+        for parts, width in ((everything, 2.0), (naked, 3.5)):
+            if parts:
+                segs = rebased(np.concatenate(parts).reshape(-1, 3),
+                               self._frame_anchor)
+                self._draw_thick_segments(segs.reshape(-1, 2, 3), mvp,
+                                          color, width)
+        GL.glEnable(GL.GL_DEPTH_TEST)
+
+    def _shown_edges_entry(self, obj) -> tuple:
+        """(all, naked) as (N, 2, 3) segments, kept until the shape
+        changes."""
+        mesh = getattr(obj, "mesh", None)
+        key = getattr(mesh, "uid", None)
+        entry = self._shown_edges_cache.get(obj.id)
+        if entry is None or entry[0] != key or key is None:
+            entry = (key, *shown_edge_segments(obj.shape))
+            self._shown_edges_cache[obj.id] = entry
+        return entry[1], entry[2]
 
     def _draw_direction_arrows(self, mvp):
         """Which way each curve runs, and which way each surface faces.

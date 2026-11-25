@@ -1522,6 +1522,17 @@ class MainWindow(QMainWindow):
             vp.set_point_mode(False)
         self.command_line.set_prompt("Command")
 
+    def show_edges_panel(self):
+        from .ui.show_edges_panel import ShowEdgesPanel
+        panel = getattr(self, "_show_edges_panel", None)
+        if panel is None:
+            panel = self._show_edges_panel = ShowEdgesPanel(self)
+        if not panel.isVisible():
+            panel.reset_options()
+            panel.show()
+        panel.refresh()
+        panel.raise_()
+
     def show_help_browser(self):
         from .ui.help_browser import HelpBrowser
         if getattr(self, "_help_browser", None) is None:
