@@ -6,6 +6,8 @@
   the middle of each page and the window is lower.
 - **`showedges`.** Highlights all or only the naked edges of objects, in
   a popup to add or remove objects and pick the edge color.
+- **Smoother curved surfaces.** Round faces are meshed finer, so a shaded
+  outline no longer shows corners past its edge when zoomed in.
 
 ## 0.3.0
 

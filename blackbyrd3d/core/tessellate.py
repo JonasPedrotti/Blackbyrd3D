@@ -233,7 +233,7 @@ class DisplayMesh:
 
 # Raise whenever tessellate() draws the same shape differently, so meshes
 # a file carries from before are made afresh rather than shown as they were.
-MESH_CACHE_VERSION = 1
+MESH_CACHE_VERSION = 2
 
 _STORED = ("local", "normals", "triangles", "local_edges", "local_isos",
            "edge_of_segment", "face_of_triangle", "local_points")
@@ -488,6 +488,12 @@ def _smooth_normals(verts: np.ndarray, tris: np.ndarray) -> np.ndarray:
 # 48,000-edge polysurface goes from 67k to 173k segments with no change in
 # the time to mesh it.
 CURVE_ANGLE = math.radians(1.0)
+
+# The same for the triangles of a curved face. At 20 degrees (0.35 rad) a
+# shaded outline showed its corners past the smooth edge drawn round it;
+# about 9 degrees hides them close up for 4 times the triangles on a
+# filleted box, and 7 degrees looked no better for 6 times.
+FACE_ANGLE = 0.15
 
 _BSPLINE_CURVE = GeomAbs_CurveType.GeomAbs_BSplineCurve
 _LINE = GeomAbs_CurveType.GeomAbs_Line
@@ -840,7 +846,8 @@ def _triangle_faces_mesh(shape) -> DisplayMesh | None:
     return mesh
 
 
-def tessellate(shape, deflection: float | None = None) -> DisplayMesh:
+def tessellate(shape, deflection: float | None = None,
+               angle: float = FACE_ANGLE) -> DisplayMesh:
     from .mesh import MeshShape, mesh_to_display
     from .pointcloud import PointCloudShape, cloud_to_display
     if isinstance(shape, MeshShape):
@@ -872,7 +879,7 @@ def tessellate(shape, deflection: float | None = None) -> DisplayMesh:
         if quick is not None:
             return quick
     if geometry.shape_kind(shape) != "curve":
-        BRepMesh_IncrementalMesh(shape, deflection, False, 0.35, True)
+        BRepMesh_IncrementalMesh(shape, deflection, False, angle, True)
 
     all_verts, all_norms, all_tris, all_curv, isos = [], [], [], [], []
     tri_face_ids = []
