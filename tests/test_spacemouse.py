@@ -32,6 +32,9 @@ def win_sm(tmp_path, monkeypatch):
                         str(tmp_path / "nonexistent.sock"))
     monkeypatch.setattr(sm_mod.SpaceMouseNavigator, "_open_evdev",
                         lambda self: None)
+    from blackbyrd3d.ui import spacemouse_mac, spacemouse_win
+    monkeypatch.setattr(spacemouse_win, "listen", lambda nav: False)
+    monkeypatch.setattr(spacemouse_mac, "listen", lambda nav: False)
     w = MainWindow()
     a, b = socket.socketpair()      # AF_UNIX on POSIX, AF_INET on Windows
     w.spacemouse.attach_socket(b)

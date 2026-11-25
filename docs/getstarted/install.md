@@ -50,13 +50,26 @@ A self-contained AppImage recipe lives in `packaging/appimage`:
 
 ## SpaceMouse
 
-3Dconnexion devices work out of the box when
+On **Linux**, 3Dconnexion devices work out of the box when
 [spacenavd](https://spacenav.sourceforge.net/) is running
-(`sudo apt install spacenavd`) — Blackbyrd3D speaks the daemon's
-socket directly, on X11 and Wayland alike. Slide to pan, push/pull to
-zoom, tilt/twist to orbit; buttons default to Fit and Perspective.
-Sensitivity and inversion live in *Settings → Mouse*; the `spacemouse`
-command shows status and a live axis readout (`Diag`).
+(`sudo apt install spacenavd`). Blackbyrd3D speaks the daemon's socket
+directly, on X11 and Wayland alike.
+
+On **Windows**, the device is read directly, with or without the
+3Dconnexion driver. If the view scrolls as well as moves, switch off the
+driver's mouse emulation for Blackbyrd3D in its settings.
+
+On **macOS**, install the 3Dconnexion driver (3DxWare); Blackbyrd3D reads
+the device through it.
+
+Windows and macOS support is new and not yet tried on real hardware. If
+your device moves the wrong way or not at all, please open an
+[Issue](https://github.com/JonasPedrotti/Blackbyrd3D/issues/new/choose)
+with the output of `spacemouse` > `Diag`.
+
+Slide to pan, push/pull to zoom, tilt/twist to orbit; buttons default to
+Fit and Perspective. Sensitivity and inversion live in *Settings → Mouse*;
+the `spacemouse` command shows status and a live axis readout (`Diag`).
 
 ## Configuration
 

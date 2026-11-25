@@ -27,7 +27,6 @@ is already there has to be reliable.
   the flat face under the cursor.
 - `splitface` and `insetface`: split a face or inset it without the object
   falling apart.
-- SpaceMouse support on Windows and macOS, as on Linux already.
 - A full command list on the documentation site.
 
 ## 2. Expanding the base

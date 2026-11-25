@@ -8,6 +8,9 @@
   a popup to add or remove objects and pick the edge color.
 - **Smoother curved surfaces.** Round faces are meshed finer, so a shaded
   outline no longer shows corners past its edge when zoomed in.
+- **SpaceMouse on Windows and macOS (experimental).** Windows reads the
+  device directly, macOS through the 3Dconnexion driver; neither has been
+  tried on real hardware yet.
 
 ## 0.3.0
 
