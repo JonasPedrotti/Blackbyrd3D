@@ -23,8 +23,6 @@ is already there has to be reliable.
 - Linux: let a torn-off Wyrm window be dragged by its title bar again after
   it was docked once, and centre dialogs on COSMIC, which places windows
   itself.
-- Curved surfaces stay smooth when zoomed in close: the faces in view are
-  meshed finer, so a shaded outline no longer stands out past its edge.
 - Draw on a face: the first point of a drawing command takes the plane of
   the flat face under the cursor.
 - `splitface` and `insetface`: split a face or inset it without the object
