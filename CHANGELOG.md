@@ -2,7 +2,8 @@
 
 ## Unreleased
 
-- **One grey in the installer.** Its pages now match its title bar.
+- **A tidier installer.** Its pages match its title bar, the text sits in
+  the middle of each page and the window is lower.
 
 ## 0.3.0
 
