@@ -107,7 +107,7 @@ def test_guides_and_the_rail_in_use_are_drawn(monkeypatch):
     monkeypatch.setattr(vp, "_preview", Buffer())
     monkeypatch.setattr(vp, "_draw_lines", lambda *a, **k: None)
     vp._draw_preview(None)
-    assert drawn == [2, 4, 4]               # rail, guide, marker on the cursor
+    assert drawn == [2, 4]                  # rail, guide; the snap is a label
 
 
 # -- lining up --
@@ -359,11 +359,11 @@ def test_the_bar_switch_clears_them_and_is_remembered(window):
 def test_the_line_between_two_guides_snaps():
     vp = _viewport()
     vp.snaps.guides += [(0.0, 0.0, 0.0), (10.0, 10.0, 0.0)]
-    px, py = _pixel(vp, (4.0, 4.0, 0.0))
+    px, py = _pixel(vp, (3.0, 3.0, 0.0))
     point = vp.world_point_at(px + 3, py)
     assert vp._active_snap[1] == "track"
     assert point[0] == pytest.approx(point[1], abs=1e-6)
-    assert 3.0 < point[0] < 5.0
+    assert 2.0 < point[0] < 4.0
     assert vp._guide_rails == [((0.0, 0.0, 0.0), (10.0, 10.0, 0.0))]
 
 

@@ -29,6 +29,13 @@ _PRIORITY = {"end": 0, "point": 0, "int": 1, "appint": 2, "quad": 3, "mid": 4,
 # about as near: an end and a mid a few pixels apart still go to the end.
 _PRIORITY_PX = 1.0
 
+# How far from the cursor a snap is caught, in pixels.
+SNAP_RADIUS_PX = 16.0
+
+# A center sits in empty space with nothing on screen to aim at, so it
+# reaches further.
+_REACH = {"center": 1.75}
+
 # How many screen segments near the cursor get paired up. Every pair is
 # tried, so the cost is square, and a drawing dense enough to put more than
 # this many edges under one pick radius is one where the answer would be a
@@ -820,7 +827,7 @@ class SnapIndex:
         return out
 
     def find(self, camera, px: float, py: float, width: int, height: int,
-             radius_px: float = 12.0, base_point=None, pending_points=None,
+             radius_px: float = SNAP_RADIUS_PX, base_point=None, pending_points=None,
              picked_points=None, clip=(), exclude_ids=None, extra_points=None,
              on_curve=None, hidden=None, along=None):
         """Best snap near the pixel. Returns (point, kind) or None.
@@ -924,7 +931,10 @@ class SnapIndex:
             d2[scr[:, 2] <= 0] = np.inf
             if clip:
                 d2[pending:][~in_sight(arr[pending:], clip)] = np.inf
-            in_range = np.nonzero(d2 < radius_px ** 2)[0]
+            reach = np.full(len(kinds), radius_px)
+            for kind, factor in _REACH.items():
+                reach[kinds == kind] *= factor
+            in_range = np.nonzero(d2 < reach ** 2)[0]
             ranked = sorted(in_range, key=lambda i: (
                 math.sqrt(d2[i]) + _PRIORITY_PX * _PRIORITY[kinds[i]],
                 scr[i, 2]))
@@ -945,7 +955,7 @@ class SnapIndex:
         return best
 
     def near_guide(self, camera, px: float, py: float, width: int,
-                   height: int, radius_px: float = 12.0):
+                   height: int, radius_px: float = SNAP_RADIUS_PX):
         """Index of the guide under the pixel, or None.
 
         Apart from `find`, because a guide is something you put there for
@@ -1098,23 +1108,29 @@ class SnapIndex:
         return float(along[i]), [(self.guides[i], point)]
 
     def _perp_feet(self, objects, base_point) -> list:
-        """Feet of perpendiculars from base_point onto visible curves."""
-        from OCP.BRepExtrema import BRepExtrema_DistShapeShape
-        from .occ import BRepBuilderAPI_MakeVertex, gp_Pnt
-        v = BRepBuilderAPI_MakeVertex(
-            gp_Pnt(*[float(c) for c in base_point])).Vertex()
+        """Feet of perpendiculars from base_point onto visible curves.
+
+        Every foot on every piece, not only the nearest one: a polyline's
+        far sides and a circle's far side are as perpendicular, and the
+        cursor picks among them."""
+        from OCP.Extrema import Extrema_ExtPC
+        from .occ import EDGE, TopExp_Explorer, edge_adaptor, gp_Pnt, to_edge
+        base = gp_Pnt(*[float(c) for c in base_point])
         feet = []
         for obj in objects:
             if obj.kind != "curve":
                 continue
-            try:
-                dist = BRepExtrema_DistShapeShape(v, obj.shape)
-                if dist.IsDone():
-                    for s in range(1, min(dist.NbSolution(), 4) + 1):
-                        p = dist.PointOnShape2(s)
-                        feet.append((p.X(), p.Y(), p.Z()))
-            except Exception:
-                continue
+            exp = TopExp_Explorer(obj.shape, EDGE)
+            while exp.More():
+                try:
+                    ext = Extrema_ExtPC(base, edge_adaptor(to_edge(exp.Current())))
+                    if ext.IsDone():
+                        for s in range(1, ext.NbExt() + 1):
+                            p = ext.Point(s).Value()
+                            feet.append((p.X(), p.Y(), p.Z()))
+                except Exception:
+                    pass
+                exp.Next()
         return feet
 
     def _near(self, objects, camera, px, py, width, height, radius_px,

@@ -16,6 +16,7 @@ from PySide6.QtGui import (QColor, QFont, QPainter, QPainterPath, QPen,
 
 from ..core import hlr, linetype
 from ..core.layers import screen_width_for
+from ..core.snaps import SNAP_RADIUS_PX
 from ..utils.math3d import look_at, ortho, perspective
 from . import section_caps as _caps
 from . import theme
@@ -287,7 +288,7 @@ class LayoutView:
         return x, y
 
     def note_snap(self, sx: float, sy: float, snaps,
-                  radius_px: float = 12.0):
+                  radius_px: float = SNAP_RADIUS_PX):
         """Shared paper snap query (name retained for existing callers)."""
         return self._snaps().pick(sx, sy, snaps, radius_px)
 

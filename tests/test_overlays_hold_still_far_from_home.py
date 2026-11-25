@@ -106,17 +106,6 @@ def test_a_short_leg_at_survey_millimetres_keeps_its_length(view):
     assert np.allclose(view._draw_span[1] - view._draw_span[0], leg)
 
 
-def test_the_snap_marker_sits_on_the_snap_at_survey_millimetres(view):
-    far = np.array([512345678.123, 5233758492.903, 420000.0])
-    view.camera.target = far.copy()
-    view._frame_anchor = vp_mod.view_anchor(view.camera.target)
-    view.point_mode = True
-    view._active_snap = (tuple(far + (0.25, 0.25, 0.0)), "end")
-    view._draw_preview(np.eye(4, dtype=np.float32))
-    square = view._preview.uploads[-1]
-    assert np.allclose(square.mean(axis=0), (0.25, 0.25, 0.0), atol=1e-3)
-
-
 def test_near_home_the_rubber_band_is_untouched(view):
     view.camera.target = np.zeros(3)
     view._frame_anchor = vp_mod.view_anchor(view.camera.target)
