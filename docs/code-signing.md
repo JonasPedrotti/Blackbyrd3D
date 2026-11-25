@@ -1,8 +1,8 @@
 # Code signing policy
 
 !!! note "Not signed yet"
-    Blackbyrd3D has applied to SignPath Foundation's programme for open
-    source. Until it is accepted, the Windows installer is unsigned and
+    Blackbyrd3D plans to apply to SignPath Foundation's programme for open
+    source. Until it is accepted there, the Windows installer is unsigned and
     Windows warns about an unknown publisher. This page is the policy the
     signed installers will follow.
 
