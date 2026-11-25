@@ -24,13 +24,17 @@ def stuck(dock: QDockWidget) -> bool:
     return dock.isFloating() and bool(dock.windowFlags() & _BYPASS)
 
 
+def buttons_down() -> bool:
+    return QApplication.mouseButtons() != Qt.MouseButton.NoButton
+
+
 def settle(dock: QDockWidget, pressed: bool = False) -> bool:
     """End the drag a marked floating panel is stuck in. Waits for the
     button to be up unless `pressed`, a new press having shown the old
     drag is over. Returns whether there was one."""
     if not stuck(dock):
         return False
-    if not pressed and QApplication.mouseButtons() != Qt.MouseButton.NoButton:
+    if not pressed and buttons_down():
         return False                    # perhaps still being dragged
     geometry = dock.geometry()
     cursor = QCursor.pos()

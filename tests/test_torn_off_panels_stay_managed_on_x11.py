@@ -19,7 +19,10 @@ def _floating_dock():
     return window, dock
 
 
-def test_a_panel_left_bypassing_the_window_manager_is_handed_back():
+def test_a_panel_left_bypassing_the_window_manager_is_handed_back(
+        monkeypatch):
+    # Qt keeps a button down that an earlier test pressed and never let go
+    monkeypatch.setattr(dock_release, "buttons_down", lambda: False)
     window, dock = _floating_dock()
     dock.setWindowFlags(dock.windowFlags() | BYPASS)
     dock.setGeometry(QRect(40, 166, 583, 701))
@@ -59,6 +62,16 @@ def test_a_tear_off_whose_release_went_missing_is_ended():
     assert dock_release.settle(dock, pressed=True)
     assert not dock_release.stuck(dock)
     assert QWidget.mouseGrabber() is None
+    window.close()
+
+
+def test_a_panel_still_being_dragged_is_left_alone(monkeypatch):
+    monkeypatch.setattr(dock_release, "buttons_down", lambda: True)
+    window, dock = _floating_dock()
+    dock.setWindowFlags(dock.windowFlags() | BYPASS)
+    dock.show()
+    assert not dock_release.settle(dock)
+    assert dock_release.stuck(dock)
     window.close()
 
 
