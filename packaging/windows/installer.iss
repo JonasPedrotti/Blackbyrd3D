@@ -203,8 +203,65 @@ begin
   ApplyFileAssoc('.wyrm', 'Blackbyrd3D.Wyrm');
 end;
 
-{ The options page goes without the mark in its corner. }
-procedure CurPageChanged(CurPageID: Integer);
+{ Page layout: the text on the Welcome, options and Finished pages sits in
+  the middle of its page rather than at the top. }
+
+{ A list as tall as its rows, so it can be centred with the text above it. }
+procedure FitList(List: TNewCheckListBox);
 begin
-  WizardForm.WizardSmallBitmapImage.Visible := CurPageID <> wpSelectTasks;
+  List.Height := List.Items.Count * ScaleY(22) + ScaleY(4);
+end;
+
+{ Moves Top and Bottom, the first and last control of a stack, so the stack
+  is centred in Area; whatever lies between them moves with them. }
+procedure CentreStack(Top, Bottom: TControl; Area: Integer);
+var
+  Shift: Integer;
+begin
+  Shift := (Area - (Bottom.Top + Bottom.Height - Top.Top)) div 2 - Top.Top;
+  Top.Top := Top.Top + Shift;
+  if Bottom <> Top then
+    Bottom.Top := Bottom.Top + Shift;
+end;
+
+procedure CentreThree(A, B, C: TControl; Area: Integer);
+var
+  Shift: Integer;
+begin
+  Shift := (Area - (C.Top + C.Height - A.Top)) div 2 - A.Top;
+  A.Top := A.Top + Shift;
+  B.Top := B.Top + Shift;
+  C.Top := C.Top + Shift;
+end;
+
+procedure CurPageChanged(CurPageID: Integer);
+var
+  F: TWizardForm;
+begin
+  F := WizardForm;
+  F.WizardSmallBitmapImage.Visible := CurPageID <> wpSelectTasks;
+  case CurPageID of
+    wpWelcome:
+      begin
+        F.WelcomeLabel2.AdjustHeight;
+        CentreStack(F.WelcomeLabel1, F.WelcomeLabel2, F.WelcomePage.ClientHeight);
+      end;
+    wpSelectTasks:
+      begin
+        FitList(F.TasksList);
+        CentreStack(F.SelectTasksLabel, F.TasksList, F.SelectTasksPage.ClientHeight);
+      end;
+    wpFinished:
+      begin
+        F.FinishedLabel.AdjustHeight;
+        if F.RunList.Visible then
+        begin
+          FitList(F.RunList);
+          CentreThree(F.FinishedHeadingLabel, F.FinishedLabel, F.RunList,
+                      F.FinishedPage.ClientHeight);
+        end else
+          CentreStack(F.FinishedHeadingLabel, F.FinishedLabel,
+                      F.FinishedPage.ClientHeight);
+      end;
+  end;
 end;

@@ -51,6 +51,11 @@ def test_the_options_page_goes_without_the_corner_mark():
             in ISS)
 
 
+def test_the_text_sits_in_the_middle_of_its_page():
+    for page in ("WelcomePage", "SelectTasksPage", "FinishedPage"):
+        assert f"F.{page}.ClientHeight" in ISS
+
+
 def test_the_build_draws_the_wizard_images_before_compiling():
     ps1 = (WIN / "build-installer.ps1").read_text()
     draw = ps1.find("make_wizard_images.py")
