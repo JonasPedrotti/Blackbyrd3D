@@ -1468,9 +1468,14 @@ def _btn_delete(p):
     p.drawLine(QPointF(9.1, 7), QPointF(9.1, 11.5))
 
 
+def _btn_remove(p):
+    p.drawLine(QPointF(3.5, 8), QPointF(12.5, 8))
+
+
 _LIST_GLYPHS = {"new": _btn_new, "sublayer": _btn_sublayer,
                 "group": _btn_group, "out": _btn_out, "up": _btn_up,
-                "down": _btn_down, "delete": _btn_delete}
+                "down": _btn_down, "delete": _btn_delete,
+                "remove": _btn_remove}
 
 
 def list_icon(name: str) -> QIcon:

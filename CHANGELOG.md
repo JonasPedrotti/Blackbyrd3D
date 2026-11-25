@@ -4,6 +4,8 @@
 
 - **A tidier installer.** Its pages match its title bar, the text sits in
   the middle of each page and the window is lower.
+- **`showedges`.** Highlights all or only the naked edges of objects, in
+  a popup to add or remove objects and pick the edge color.
 
 ## 0.3.0
 

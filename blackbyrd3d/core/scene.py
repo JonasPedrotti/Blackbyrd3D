@@ -239,6 +239,12 @@ class Scene:
         # long as `dir` runs. Which way a curve runs is a fact about the
         # drawing, not about the pane you happened to ask in.
         self.dir_enabled: set[str] = set()
+        # Objects whose edges ShowEdges is drawing, and how, for as long as
+        # its panel stays open.
+        self.edges_shown: set[str] = set()
+        self.edges_show_all: bool = False
+        self.edges_show_naked: bool = True
+        self.edges_color: tuple = (0.0, 0.0, 1.0)
         self.layouts: list = []         # drafting sheets (core/layout.py)
         self.sheet_groups: list = []    # SheetGroups the sheets sit in
         self.units: str = "mm"          # document units (utils/units.py)
@@ -784,6 +790,7 @@ class Scene:
         self.image_planes = []
         self.history_records = []
         self.trajectories = []
+        self.edges_shown.clear()
         self.session = None
         # units are a user preference as much as a document property: keep
         self.notify()

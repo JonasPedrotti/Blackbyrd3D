@@ -6086,6 +6086,33 @@ def free_boundaries(shape) -> list:
     return wires
 
 
+def naked_edges(shape) -> list:
+    """Edges that border only one face: the open seams of a surface or
+    polysurface. A closed solid has none."""
+    if not isinstance(shape, TopoDS_Shape):
+        return []
+    from OCP.BRep import BRep_Tool
+    from OCP.TopExp import TopExp
+    from OCP.TopTools import TopTools_IndexedDataMapOfShapeListOfShape
+    amap = TopTools_IndexedDataMapOfShapeListOfShape()
+    TopExp.MapShapesAndAncestors_s(shape, occ.EDGE, occ.FACE, amap)
+    out = []
+    for i in range(1, amap.Extent() + 1):
+        edge = occ.to_edge(amap.FindKey(i))
+        if BRep_Tool.Degenerated_s(edge):
+            continue
+        faces = amap.FindFromIndex(i)
+        # a seam edge is listed twice by the one face it closes
+        distinct = []
+        for f in faces:
+            if not any(f.IsSame(d) for d in distinct):
+                distinct.append(f)
+        if len(distinct) == 1 and not BRep_Tool.IsClosed_s(
+                edge, occ.to_face(distinct[0])):
+            out.append(edge)
+    return out
+
+
 def untrim(shape, holes_only: bool = True) -> TopoDS_Shape:
     """Remove trims from a single face.
 

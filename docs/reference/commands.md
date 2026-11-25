@@ -105,9 +105,12 @@ Commands that need a file open a filtered chooser by default. Append
 | `right` | Right |
 | `selclippingplane` | Select every clipping plane object. |
 | `shaded` (`sh`) | Shaded |
+| `showedges` | Highlight all edges or only the naked edges of objects. |
+| `showedgesadd` | Add objects to the ones ShowEdges is highlighting. |
+| `showedgesremove` | Take objects out of the ones ShowEdges is highlighting. |
 | `snap` | Snap |
 | `spacemouse` (`3dmouse`) | SpaceMouse status, on/off toggle, and a live axis readout for |
-| `surfaceedges` (`showedges`) | Show or hide the outlines of faces. Curves and text are unaffected. |
+| `surfaceedges` | Show or hide the outlines of faces. Curves and text are unaffected. |
 | `technical` (`tech`) | Hidden-line technical display (parallel projection linework). |
 | `tolerance` | Show or set the document's absolute modelling tolerance. |
 | `top` | Top |

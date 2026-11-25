@@ -581,7 +581,7 @@ def cmd_isocurves(ctx):
     ctx.echo(f"Surface isocurves {'on' if vp.shows_isocurves() else 'off'}.")
 
 
-@command("surfaceedges", aliases=("showedges",), mutates=False)
+@command("surfaceedges", mutates=False)
 def cmd_surfaceedges(ctx):
     """Show or hide the outlines of faces. Curves and text are unaffected."""
     from .base import OptionReq
@@ -593,6 +593,46 @@ def cmd_surfaceedges(ctx):
         default="Off" if now else "On")
     vp.set_edges(not now if choice == "Toggle" else choice == "On")
     ctx.echo(f"Surface edges {'on' if vp.shows_edges() else 'off'}.")
+
+
+_EDGE_KINDS = ("surface", "solid")
+
+
+@command("showedges", mutates=False)
+def cmd_showedges(ctx):
+    """Highlight all edges or only the naked edges of objects.
+
+    A popup stays open to add or remove objects and set the edge color;
+    closing it hides the edges again."""
+    objs = yield SelectReq("Select objects to show the edges of",
+                           kinds=_EDGE_KINDS)
+    ctx.scene.edges_shown.update(o.id for o in objs)
+    opener = getattr(ctx.window, "show_edges_panel", None)
+    if opener is not None:
+        opener()
+    _redraw_all(ctx)
+    ctx.echo(f"Showing the edges of {len(ctx.scene.edges_shown)} "
+             "object(s). Close the popup to hide them.")
+
+
+@command("showedgesadd", mutates=False)
+def cmd_showedgesadd(ctx):
+    """Add objects to the ones ShowEdges is highlighting."""
+    objs = yield SelectReq("Select objects to add", kinds=_EDGE_KINDS)
+    ctx.scene.edges_shown.update(o.id for o in objs)
+    _redraw_all(ctx)
+    ctx.echo(f"Showing the edges of {len(ctx.scene.edges_shown)} "
+             "object(s).")
+
+
+@command("showedgesremove", mutates=False)
+def cmd_showedgesremove(ctx):
+    """Take objects out of the ones ShowEdges is highlighting."""
+    objs = yield SelectReq("Select objects to remove", kinds=_EDGE_KINDS)
+    ctx.scene.edges_shown.difference_update(o.id for o in objs)
+    _redraw_all(ctx)
+    ctx.echo(f"Showing the edges of {len(ctx.scene.edges_shown)} "
+             "object(s).")
 
 
 @command("rendered", aliases=("render",), mutates=False)
