@@ -46,6 +46,11 @@ def test_the_wizard_is_dark_like_the_app():
     assert "WizardSmallImageFile=wizard\\" in ISS
 
 
+def test_the_options_page_goes_without_the_corner_mark():
+    assert ("WizardSmallBitmapImage.Visible := CurPageID <> wpSelectTasks"
+            in ISS)
+
+
 def test_the_build_draws_the_wizard_images_before_compiling():
     ps1 = (WIN / "build-installer.ps1").read_text()
     draw = ps1.find("make_wizard_images.py")

@@ -202,3 +202,9 @@ begin
   ApplyFileAssoc('.byrd', 'Blackbyrd3D.Document');
   ApplyFileAssoc('.wyrm', 'Blackbyrd3D.Wyrm');
 end;
+
+{ The options page goes without the mark in its corner. }
+procedure CurPageChanged(CurPageID: Integer);
+begin
+  WizardForm.WizardSmallBitmapImage.Visible := CurPageID <> wpSelectTasks;
+end;
