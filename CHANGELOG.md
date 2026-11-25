@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- **Update popup.** A newer release found on launch is announced in a
+  popup with Download now and Cancel, behind the welcome screen.
+
 ## 0.4.0
 
 - **A tidier installer.** Its pages match its title bar, the text sits in
