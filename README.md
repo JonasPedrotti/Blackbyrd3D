@@ -23,9 +23,13 @@ Built on [Serpentine3D](https://github.com/chisomobanzi/Serpentine3D) by Chisomo
 <a href="docs/reference/file-formats.md"><img src="https://img.shields.io/badge/FBX-26272b?style=flat-square" alt="FBX"></a>
 <a href="docs/reference/file-formats.md"><img src="https://img.shields.io/badge/STL-26272b?style=flat-square" alt="STL"></a>
 <a href="docs/reference/file-formats.md"><img src="https://img.shields.io/badge/3MF-26272b?style=flat-square" alt="3MF"></a>
-<a href="docs/reference/file-formats.md"><img src="https://img.shields.io/badge/SERP-26272b?style=flat-square" alt="SERP"></a>
 
 </div>
+
+<p align="center">
+  <img src="https://img.shields.io/github/downloads/JonasPedrotti/Blackbyrd3D/total"
+       alt="Downloads">
+</p>
 
 ## What it does
 
@@ -38,10 +42,6 @@ Built on [Serpentine3D](https://github.com/chisomobanzi/Serpentine3D) by Chisomo
 - **Drawings from the model.** A4 to A0 sheets with live detail views,
   hidden-line views, dimensions, hatching and title blocks, printed to
   vector PDF.
-- **An assistant that can see.** Describe a change and it runs the commands,
-  looks at the viewport to check its work and fixes its own mistakes, all
-  undoable. Use Claude, a ChatGPT account, an OpenAI key, or a local,
-  open-weight model.
 - **Headless.** Script it in the built-in editor, batch it with
   `byrd3d-batch`, or let any MCP client drive a live session. See the
   [scripting guide](docs/howto/scripting.md) and the
