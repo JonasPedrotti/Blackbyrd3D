@@ -1,10 +1,12 @@
 # Changelog
 
-## Unreleased
+## 0.4.1
 
 - **Updates show the right version.** The Windows installer removes the
   files of the previous install first, so an updated app no longer calls
   itself the old version and keeps offering the update.
+- **Update popup.** A newer release found on launch is announced in a
+  popup with Download now and Cancel, behind the welcome screen.
 
 ## 0.4.0
 

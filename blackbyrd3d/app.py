@@ -3469,20 +3469,28 @@ class MainWindow(QMainWindow):
 
     def _on_update_available(self, rel):
         """Main-thread slot: a newer release was found on launch."""
+        from . import __version__
         self._pending_update = rel
-        # A permanent widget: a timed message is wiped by the next status
-        # refresh or menu hover, so the notice was gone before anyone saw it.
-        if getattr(self, "_update_button", None) is None:
-            from PySide6.QtWidgets import QPushButton
-            self._update_button = QPushButton()
-            self._update_button.setFlat(True)
-            self._update_button.setCursor(Qt.CursorShape.PointingHandCursor)
-            self._update_button.clicked.connect(self._open_update_notice)
-            self.statusBar().addPermanentWidget(self._update_button)
-        self._update_button.setText(
-            f"Blackbyrd3D {rel['version']} is available")
-        self._update_button.setToolTip("Download or read the release notes")
-        self._update_button.show()
+        box = getattr(self, "_update_box", None)
+        if box is None:
+            from .ui.update_prompt import UpdatePrompt
+            box = self._update_box = UpdatePrompt(self)
+            box.downloadRequested.connect(self._download_update)
+        box.set_release(rel["version"], __version__)
+        box.show()
+        # behind the welcome screen, which is what the launch is about
+        welcome = getattr(self, "_welcome", None)
+        if welcome is not None and welcome.isVisible():
+            welcome.raise_()
+            welcome.activateWindow()
+
+    def _download_update(self):
+        from PySide6.QtCore import QUrl
+        from PySide6.QtGui import QDesktopServices
+        rel = self._pending_update or {}
+        url = rel.get("download") or rel.get("url")
+        if url:
+            QDesktopServices.openUrl(QUrl(url))
 
     # long enough to be read, short enough not to stay in the way
     UPDATE_NOTE_MS = 8000
@@ -3501,12 +3509,6 @@ class MainWindow(QMainWindow):
             else "Could not reach GitHub to check for updates")
         self._update_note.show()
         QTimer.singleShot(self.UPDATE_NOTE_MS, self, self._update_note.hide)
-
-    def _open_update_notice(self):
-        """The notice has done its job once clicked: the download dialog
-        says the rest, and it is not left standing in the status bar."""
-        self._update_button.hide()
-        self._check_updates_manual()
 
     def _check_updates_manual(self):
         """Help ▸ Check for Updates: synchronous, always reports back."""
