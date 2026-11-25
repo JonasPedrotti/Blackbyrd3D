@@ -53,6 +53,7 @@ SolidCompression=yes
 WizardStyle=modern dark hidebevels includetitlebar
 WizardBackColor=#2b2b2b
 WizardSmallImageBackColor=none
+WizardSizePercent=120,100
 WizardImageFile=wizard\wizard-*x*.png
 WizardSmallImageFile=wizard\wizard-small-*.png
 SetupIconFile=byrd3d.ico
