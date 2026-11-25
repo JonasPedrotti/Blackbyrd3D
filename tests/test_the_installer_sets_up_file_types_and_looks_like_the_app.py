@@ -56,6 +56,14 @@ def test_the_text_sits_in_the_middle_of_its_page():
         assert f"F.{page}.ClientHeight" in ISS
 
 
+def test_the_picture_keeps_its_width_in_the_lower_window():
+    """installer.iss widens the picture to the 202:314 it is drawn at."""
+    assert "WizardSizePercent=120,100" in ISS
+    assert "* 202 div 314" in ISS
+    images = (WIN / "make_wizard_images.py").read_text()
+    assert "RATIO = (202, 314)" in images
+
+
 def test_the_build_draws_the_wizard_images_before_compiling():
     ps1 = (WIN / "build-installer.ps1").read_text()
     draw = ps1.find("make_wizard_images.py")
@@ -68,6 +76,6 @@ def test_the_wizard_images_come_out_in_every_size(tmp_path):
         [sys.executable, str(WIN / "make_wizard_images.py"), str(tmp_path)],
         capture_output=True, text=True, timeout=120, check=True)
     names = set(out.stdout.split())
-    assert "wizard-202x386.png" in names and "wizard-534x1022.png" in names
+    assert "wizard-202x314.png" in names and "wizard-513x797.png" in names
     assert "wizard-small-58.png" in names and "wizard-small-159.png" in names
     assert all((tmp_path / n).stat().st_size > 0 for n in names)

@@ -207,6 +207,34 @@ end;
 { Page layout: the text on the Welcome, options and Finished pages sits in
   the middle of its page rather than at the top. }
 
+{ The window is lower than modern style's default (WizardSizePercent), which
+  would narrow the picture beside the Welcome and Finished pages with it. It
+  keeps its width instead, drawn 202:314 by make_wizard_images.py, and the
+  text beside it moves over to make room. }
+procedure MakeRoom(C: TControl; Delta: Integer);
+begin
+  C.Left := C.Left + Delta;
+  C.Width := C.Width - Delta;
+end;
+
+procedure InitializeWizard;
+var
+  F: TWizardForm;
+  Delta: Integer;
+begin
+  F := WizardForm;
+  Delta := F.WizardBitmapImage.Height * 202 div 314 - F.WizardBitmapImage.Width;
+  F.WizardBitmapImage.Width := F.WizardBitmapImage.Width + Delta;
+  F.WizardBitmapImage2.Width := F.WizardBitmapImage2.Width + Delta;
+  MakeRoom(F.WelcomeLabel1, Delta);
+  MakeRoom(F.WelcomeLabel2, Delta);
+  MakeRoom(F.FinishedHeadingLabel, Delta);
+  MakeRoom(F.FinishedLabel, Delta);
+  MakeRoom(F.RunList, Delta);
+  MakeRoom(F.YesRadio, Delta);
+  MakeRoom(F.NoRadio, Delta);
+end;
+
 { A list as tall as its rows, so it can be centred with the text above it. }
 procedure FitList(List: TNewCheckListBox);
 begin
@@ -235,15 +263,28 @@ begin
   C.Top := C.Top + Shift;
 end;
 
+{ Label as tall as its text, now that MakeRoom may have wrapped it, and
+  Below as far under it as it was. }
+procedure FitText(L: TNewStaticText; Below: TControl);
+var
+  Gap: Integer;
+begin
+  Gap := Below.Top - L.Top - L.Height;
+  L.AdjustHeight;
+  Below.Top := L.Top + L.Height + Gap;
+end;
+
 procedure CurPageChanged(CurPageID: Integer);
 var
   F: TWizardForm;
+  LabelTop: Integer;
 begin
   F := WizardForm;
   F.WizardSmallBitmapImage.Visible := CurPageID <> wpSelectTasks;
   case CurPageID of
     wpWelcome:
       begin
+        FitText(F.WelcomeLabel1, F.WelcomeLabel2);
         F.WelcomeLabel2.AdjustHeight;
         CentreStack(F.WelcomeLabel1, F.WelcomeLabel2, F.WelcomePage.ClientHeight);
       end;
@@ -254,15 +295,21 @@ begin
       end;
     wpFinished:
       begin
-        F.FinishedLabel.AdjustHeight;
+        LabelTop := F.FinishedLabel.Top;
+        FitText(F.FinishedHeadingLabel, F.FinishedLabel);
         if F.RunList.Visible then
         begin
+          F.RunList.Top := F.RunList.Top + F.FinishedLabel.Top - LabelTop;
+          FitText(F.FinishedLabel, F.RunList);
           FitList(F.RunList);
           CentreThree(F.FinishedHeadingLabel, F.FinishedLabel, F.RunList,
                       F.FinishedPage.ClientHeight);
         end else
+        begin
+          F.FinishedLabel.AdjustHeight;
           CentreStack(F.FinishedHeadingLabel, F.FinishedLabel,
                       F.FinishedPage.ClientHeight);
+        end;
       end;
   end;
 end;

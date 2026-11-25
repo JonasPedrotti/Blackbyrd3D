@@ -28,9 +28,13 @@ from blackbyrd3d.ui.splash import paint_mark, paint_wordmark  # noqa: E402
 # behind every page too, so window and page are one colour
 CARD = QColor("#2b2b2b")
 
-# Inno Setup's image areas at 100% to 250% DPI
-LARGE = [(202, 386), (269, 515), (336, 643), (403, 772), (430, 824),
-         (498, 953), (534, 1022)]
+# The image area's heights at 100% to 250% DPI with WizardSizePercent's
+# height at 100, each as wide as the area is at the 120 Inno Setup's modern
+# style defaults to: installer.iss widens the area to match, so the bird
+# keeps its size in a lower window.
+RATIO = (202, 314)
+LARGE = [(round(h * RATIO[0] / RATIO[1]), h)
+         for h in (314, 386, 459, 556, 604, 700, 797)]
 SMALL = [58, 77, 97, 116, 124, 143, 159]
 
 HERE = Path(__file__).resolve().parent
@@ -49,12 +53,12 @@ def large(w: int, h: int) -> QImage:
     p.fillRect(0, 0, w, h, CARD)
 
     mark = w * 0.78
-    paint_mark(p, (w - mark) / 2, h * 0.22, mark)
-
     ww, wh = brand.WORDMARK_SIZE
     word_w = w * 0.70
     word_h = word_w * wh / ww
-    paint_wordmark(p, (w - word_w) / 2, h * 0.22 + mark * 1.02, word_h)
+    top = (h - (mark * 1.02 + word_h)) / 2
+    paint_mark(p, (w - mark) / 2, top, mark)
+    paint_wordmark(p, (w - word_w) / 2, top + mark * 1.02, word_h)
 
     p.end()
     return img
