@@ -2054,6 +2054,10 @@ class MainWindow(QMainWindow):
 
     def _on_point_picked(self, point):
         if isinstance(self.processor.request, PointReq):
+            if self.command_line.input.text().strip():
+                # what was typed wins, aimed where the click was
+                self.command_line.submit_input()
+                return
             self.ctx.last_point = point
             self.processor.provide(point)
 

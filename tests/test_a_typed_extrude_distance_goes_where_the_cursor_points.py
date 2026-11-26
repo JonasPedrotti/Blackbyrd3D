@@ -73,3 +73,28 @@ def test_the_ghost_of_a_typed_number_turns_with_the_cursor(window):
         window._show_cursor_ghost((0.0, 0.0, 3.0))
         assert shown and shown[-1] is not None
         assert g.bbox(shown[-1])[1][2] == pytest.approx(top, abs=1e-6)
+
+
+def test_a_left_click_keeps_to_the_typed_number(window):
+    """The click used to land where the cursor was and drop what was typed;
+    it says only which way the typed number goes."""
+    c = window.scene.add(g.make_circle((0, 0, 0), 5))
+    window.selection.set([c.id])
+    window.processor.run("extrude")
+    window.command_line.input.setText("10")
+    window.ctx.replay_aim = ((0.0, 0.0, 0.0), DOWN)
+    window._on_point_picked((0.0, 0.0, 3.0))
+    assert not window.processor.busy
+    lo, hi = g.bbox(window.scene.all()[-1].shape)
+    assert (lo[2], hi[2]) == pytest.approx((-10, 0), abs=1e-6)
+    assert window.command_line.input.text() == ""
+
+
+def test_a_left_click_with_nothing_typed_still_takes_the_point(window):
+    c = window.scene.add(g.make_circle((0, 0, 0), 5))
+    window.selection.set([c.id])
+    window.processor.run("extrude")
+    window._on_point_picked((0.0, 0.0, 3.0))
+    assert not window.processor.busy
+    lo, hi = g.bbox(window.scene.all()[-1].shape)
+    assert (lo[2], hi[2]) == pytest.approx((0, 3), abs=1e-6)
