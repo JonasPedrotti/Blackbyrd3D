@@ -27,6 +27,7 @@ Commands that need a file open a filtered chooser by default. Append
 |---|---|
 | `turntable` | Orbit the camera once around the work and write a video clip; orbits the selection if there is one, at the pane's own elevation. |
 | `turntableui` | Record a portrait turntable of the current shot and application UI. |
+| `viewcapture` (`screenshot`, `viewcapturetofile`, `vcf`, `viewcapturetoclipboard`, `vcc`) | Capture the active viewport as an image: copy it or save it, at the pane's own pixels or scaled up or down. A script gives the file to save to instead. |
 
 ## Curves
 
@@ -120,8 +121,6 @@ Commands that need a file open a filtered chooser by default. Append
 | `top` | Look at the model from the top. |
 | `undoview` | Put the view back where it was before the last view change. |
 | `units` | Set document units; optionally rescale the model to keep real size. |
-| `viewcapturetoclipboard` (`vcc`) | Copy the active viewport image to the clipboard. |
-| `viewcapturetofile` (`vcf`, `viewcapture`) | Save the active viewport as a PNG image. |
 | `volume` (`vol`) | Measure the volume of solids. |
 | `wireframe` (`wf`) | Wireframe display. |
 | `wyrm` (`nodes`) | Open Wyrm, the visual graph editor: wire components together to make geometry, watch it preview in the model, then Bake it in. |

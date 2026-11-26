@@ -1,4 +1,4 @@
-"""Clips out of the viewport: the turntable."""
+"""Pictures and clips out of the viewport: ViewCapture and the turntable."""
 
 from __future__ import annotations
 
@@ -63,6 +63,33 @@ def _story_frame(image, width: int = 1080, height: int = 1920):
     finally:
         painter.end()
     return frame
+
+
+@command("viewcapture",
+         aliases=("screenshot", "viewcapturetofile", "vcf",
+                  "viewcapturetoclipboard", "vcc"),
+         mutates=False)
+def cmd_viewcapture(ctx):
+    """Capture the active viewport as an image: copy it or save it, at the
+    pane's own pixels or scaled up or down. A script gives the file to
+    save to instead."""
+    vp = ctx.viewport
+    window = ctx.window
+    processor = getattr(window, "processor", None)
+    if (processor is not None and not processor.headless
+            and hasattr(vp, "capture_image")):
+        from ..ui.view_capture import ViewCaptureDialog
+        ViewCaptureDialog(window, vp, window._pick_file, ctx.echo).exec()
+        return
+    path = yield FileReq("Image path", default="~/viewport.png", save=True,
+                         title="Save viewport capture",
+                         filters="Images (*.png *.jpg *.jpeg)")
+    path = os.path.abspath(os.path.expanduser(path.strip()))
+    if not path.lower().endswith((".png", ".jpg", ".jpeg")):
+        path += ".png"
+    img = vp.grabFramebuffer()
+    img.save(path)
+    ctx.echo(f"Saved {img.width()}x{img.height()} capture to {path}")
 
 
 @command("turntable", mutates=False)

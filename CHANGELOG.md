@@ -13,6 +13,9 @@
 - **Paste in another window.** Objects copied in one Blackbyrd3D window
   paste in another, onto layers of the same name, with a progress popup
   for big ones.
+- **ViewCapture.** One command for a picture of the viewport, also typed
+  as Screenshot: a preview, the size in pixels or as a scale, Copy and Save.
+  Spelled out aliases now show up in the command line's completion.
 - **Update from inside the app.** On Windows and in an AppImage, Update now
   downloads the new release, checks it against GitHub's checksum, installs
   it and restarts. The installer's progress bar is the app's gold one.

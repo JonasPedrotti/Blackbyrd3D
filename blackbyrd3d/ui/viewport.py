@@ -1867,6 +1867,7 @@ class Viewport(QOpenGLWidget):
         self.cloud_lod = None
         self._max_line_width = 1.0          # real cap read back in initializeGL
         self._pane_ratio = 1.0              # read again every frame
+        self._capturing = False             # capture_image is drawing
         self._uloc_cache: dict = {}
         # what the GL context is already set to, so the draw loop can stop
         # re-sending it. _reset_gl_state() drops all of it.
@@ -2182,6 +2183,8 @@ class Viewport(QOpenGLWidget):
             self._draw_axis_triad(view, w, h)
         self._draw_frame_guides(w, h)
         self._draw_selection_box(w, h)
+        if self._capturing:
+            return        # what QPainter adds lands on the pane, not here
         self._update_gumball_readout()
         self._update_draw_readout()
         self._paint_dots(w, h)
@@ -5932,6 +5935,87 @@ class Viewport(QOpenGLWidget):
     def screenshot(self, path: str) -> bool:
         img = self.grabFramebuffer()
         return img.save(path)
+
+    # the longest side a capture is drawn at: past this a frame, its
+    # samples and the image read back from it run to gigabytes
+    CAPTURE_MAX_SIDE = 12000
+
+    def capture_size(self, scale: float = 1.0) -> tuple[int, int]:
+        """The pixels a capture at `scale` times the pane's own comes to."""
+        ratio = self.devicePixelRatioF() * float(scale)
+        return (max(1, int(round(self.width() * ratio))),
+                max(1, int(round(self.height() * ratio))))
+
+    def capture_max_scale(self) -> float:
+        w, h = self.capture_size(1.0)
+        limit = self.CAPTURE_MAX_SIDE
+        self.makeCurrent()
+        try:
+            limit = min(limit, int(GL.glGetIntegerv(
+                GL.GL_MAX_RENDERBUFFER_SIZE)))
+        except Exception:                                  # noqa: BLE001
+            pass
+        finally:
+            self.doneCurrent()
+        return max(0.1, limit / max(w, h))
+
+    def capture_image(self, scale: float = 1.0):
+        """The pane as it stands, drawn at `scale` times its own resolution.
+
+        The whole frame, grid and gumball and all, drawn afresh into a
+        buffer of its own the way a detail is (DrawTarget): lines keep
+        their width against the picture, so a capture at 2 looks like the
+        pane on a screen of twice the density, not like a zoomed one. A
+        sheet paints through QPainter onto the pane itself, so it is taken
+        as the pane shows it and scaled.
+        """
+        from PySide6.QtCore import Qt
+        from PySide6.QtOpenGL import (QOpenGLFramebufferObject,
+                                      QOpenGLFramebufferObjectFormat)
+        px_w, px_h = self.capture_size(scale)
+        if self.space != "model":
+            img = self.grabFramebuffer()
+            if (img.width(), img.height()) != (px_w, px_h):
+                img = img.scaled(px_w, px_h,
+                                 Qt.AspectRatioMode.IgnoreAspectRatio,
+                                 Qt.TransformationMode.SmoothTransformation)
+            return img
+        ratio = self.devicePixelRatioF() * float(scale)
+        self.makeCurrent()
+        old_target, old_ratio = self._target, self._pane_ratio
+        try:
+            fmt = QOpenGLFramebufferObjectFormat()
+            fmt.setAttachment(
+                QOpenGLFramebufferObject.Attachment.CombinedDepthStencil)
+            fmt.setSamples(4)
+            fbo = QOpenGLFramebufferObject(px_w, px_h, fmt)
+            if not fbo.isValid():
+                return None
+            fbo.bind()
+            GL.glViewport(0, 0, px_w, px_h)
+            self._target = DrawTarget(float(self.width()),
+                                      float(self.height()), ratio)
+            self._pane_ratio = ratio
+            self._capturing = True
+            try:
+                self._paint_frame()
+            finally:
+                self._capturing = False
+                self._target, self._pane_ratio = old_target, old_ratio
+            img = fbo.toImage()
+            fbo.release()
+            return img
+        except Exception:                                  # noqa: BLE001
+            traceback.print_exc()
+            return None
+        finally:
+            self._target, self._pane_ratio = old_target, old_ratio
+            GL.glBindFramebuffer(GL.GL_FRAMEBUFFER,
+                                 self.defaultFramebufferObject())
+            dpr = self.devicePixelRatioF()
+            GL.glViewport(0, 0, int(self.width() * dpr),
+                          int(self.height() * dpr))
+            self.doneCurrent()
 
     def render_model_image(self, camera, px_w: int, px_h: int):
         """Render the model through `camera` at any size, offscreen.

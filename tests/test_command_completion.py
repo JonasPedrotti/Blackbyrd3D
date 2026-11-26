@@ -224,3 +224,25 @@ def test_the_app_says_when_it_is_asking_for_something_rather_than_waiting():
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
+
+
+# ------------------------------------------------------ aliases as names
+
+def test_a_spelled_out_alias_is_offered():
+    assert "screenshot" in rank_completions("scree", [])
+
+
+def test_typing_the_start_of_an_alias_fills_it_in():
+    cl = _cl()
+    QTest.keyClicks(cl.input, "screen")
+    assert cl.input.text() == "screenshot"
+
+
+def test_an_alias_is_not_offered_beside_its_own_command():
+    offered = rank_completions("viewc", [])
+    assert "viewcapture" in offered
+    assert "viewcapturetofile" not in offered
+
+
+def test_a_short_alias_is_not_offered():
+    assert "vcc" not in rank_completions("v", [])

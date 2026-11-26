@@ -35,8 +35,6 @@ CASES = [
      "Picker Sheet.dxf"),
     ("exportsvg", "sheet", (), True, "svg", ("*.svg",),
      "Picker Sheet.svg"),
-    ("viewcapturetofile", "plain", (), True, "capture",
-     ("*.png", "*.jpg", "*.jpeg"), "viewport.png"),
     ("turntable", "model", ("", ""), True, "turntable", ("*.mp4",),
      "turntable"),
     ("turntableui", "plain", ("",), True, "turntable", ("*.mp4",),
