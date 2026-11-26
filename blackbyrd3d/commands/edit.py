@@ -538,8 +538,9 @@ def cmd_trim(ctx):
     position (typed, scripted, or chosen from a list) cannot say which
     part, so it asks which piece instead, as trim always did.
     """
-    cutters = yield SelectReq("Select cutting objects")
+    cutters = yield SelectReq("Select cutting objects", keep=True)
     cutting = [(c.id, c.shape) for c in cutters]
+    shown = tuple(c.id for c in cutters)
     trimmed = 0
     while True:
         picked = yield SelectReq(
@@ -547,7 +548,7 @@ def cmd_trim(ctx):
             + (", Enter when done" if trimmed else ""),
             kinds=("curve", "surface", "solid", "picture", "hatch"),
             min_count=0 if trimmed else 1, max_count=1,
-            allow_preselected=False, want_point=True)
+            allow_preselected=False, want_point=True, shown=shown)
         if not picked:
             break
         target = picked[0]
