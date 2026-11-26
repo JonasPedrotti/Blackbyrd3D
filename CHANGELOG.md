@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- **Trim keeps its cutters selected.** Objects selected before Trim stay
+  lit while you click the parts away.
 - **Update from inside the app.** On Windows and in an AppImage, Update now
   downloads the new release, checks it against GitHub's checksum, installs
   it and restarts. The installer's progress bar is the app's gold one.

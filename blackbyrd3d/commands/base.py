@@ -251,6 +251,9 @@ class SelectReq(Req):
     # Leave the answer selected rather than letting go of it: what a
     # transform moves stays lit while you place it.
     keep: bool = False
+    # Objects that stay lit beside the ones being picked, as Trim keeps its
+    # cutters in sight. For a prompt that does not take a preselection.
+    shown: tuple = ()
     # Enter or a right-click with fewer than min_count picked ends the
     # command rather than asking again: Join with one curve is done.
     too_few_ends: bool = False
@@ -1158,6 +1161,8 @@ class CommandProcessor:
             self.ctx.pick_faces = {}
             if req.want_face:
                 self.ctx.selection.clear()
+            if req.shown and not req.allow_preselected:
+                self._show_picks()
             if (req.allow_preselected and self.ctx.selection.ids):
                 held = self.ctx.selection.objects()
                 pre = [o.id for o in held
@@ -1443,7 +1448,7 @@ class CommandProcessor:
             self._select_buffer.remove(obj_id)
         else:
             self._select_buffer.append(obj_id)
-        self.ctx.selection.set(self._select_buffer)
+        self._show_picks()
         if req.max_count and len(self._select_buffer) >= req.max_count:
             self.finish_selection()
         else:
@@ -1456,6 +1461,14 @@ class CommandProcessor:
             return
         self.ctx.pick_faces[obj_id] = int(face_index)
         self.click_object(obj_id)
+
+    def _show_picks(self):
+        """Light what is picked so far, and what the prompt keeps shown."""
+        req = self.request
+        shown = [i for i in getattr(req, "shown", ())
+                 if i in self.ctx.scene.objects
+                 and i not in self._select_buffer]
+        self.ctx.selection.set(shown + self._select_buffer)
 
     def _select_text(self, text: str):
         req = self.request
@@ -1482,14 +1495,14 @@ class CommandProcessor:
                 self._notify()
                 return
             self._select_buffer = matches
-            self.ctx.selection.set(self._select_buffer)
+            self._show_picks()
             self.finish_selection()
             return
         obj = self.ctx.scene.find_by_name(text)
         if obj and self._matching(obj, req):
             if obj.id not in self._select_buffer:
                 self._select_buffer.append(obj.id)
-            self.ctx.selection.set(self._select_buffer)
+            self._show_picks()
             if req.max_count and len(self._select_buffer) >= req.max_count:
                 self.finish_selection()
             else:
@@ -1516,7 +1529,7 @@ class CommandProcessor:
             # a sweep that catches only wrong-kind objects looks exactly
             # like a sweep that caught nothing — same words as a click
             self.ctx.echo("Object type not accepted here.")
-        self.ctx.selection.set(self._select_buffer)
+        self._show_picks()
         if req.max_count and len(self._select_buffer) >= req.max_count:
             self.finish_selection()
         else:

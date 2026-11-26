@@ -1732,6 +1732,7 @@ class Viewport(QOpenGLWidget):
         from ..core.view_settings import Background
         self.background = Background()
         self.point_mode = False             # command wants a point click
+        self.showing_for_pick = False       # lit only to be seen, not held
         from ..core.cplane import CPlane
         self.cplane = CPlane()
         self._own_cplane = False            # until `cplane` says otherwise

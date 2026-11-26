@@ -447,7 +447,8 @@ class Gumball:
         # is dragged by its own ink — but inside a detail what is picked is a
         # model object, so it gets the handles the model window gives it.
         on_model = vp.space == "model" or vp._detail_eye() is not None
-        if not (self.enabled and on_model and not vp.point_mode):
+        if not (self.enabled and on_model and not vp.point_mode
+                and not getattr(vp, "showing_for_pick", False)):
             return False
         if self.drag is not None:            # a drag stays live to its end
             return True

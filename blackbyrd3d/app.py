@@ -1664,6 +1664,11 @@ class MainWindow(QMainWindow):
         self._ghost_timer = None
         self._ghost_cost_ms = 0.0
         self.command_line.point_pending = isinstance(req, PointReq)
+        # what a pick prompt keeps lit is there to be seen, not dragged:
+        # a gumball on Trim's cutter would catch the click on the part
+        showing = bool(getattr(req, "shown", ()))
+        for vp in self.all_viewports():
+            vp.showing_for_pick = showing
         # Space submits like Enter everywhere but a free-text prompt
         self.command_line.text_pending = isinstance(req, TextReq)
         # Only guess at command names at the "Command" prompt; mid-command the
