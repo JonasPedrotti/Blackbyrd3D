@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.5.0
 
 - **Trim keeps its cutters selected.** Objects selected before Trim stay
   lit while you click the parts away.

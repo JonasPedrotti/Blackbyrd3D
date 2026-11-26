@@ -1,6 +1,6 @@
 [project]
 name = "blackbyrd3d"
-version = "0.4.1"
+version = "0.5.0"
 description = "Open-source NURBS surface modeller for Linux with MCP integration"
 readme = "README.md"
 license = "MIT"
