@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- **Update from inside the app.** On Windows and in an AppImage, Update now
+  downloads the new release, checks it against GitHub's checksum, installs
+  it and restarts. The installer's progress bar is the app's gold one.
+
 ## 0.4.1
 
 - **Updates show the right version.** The Windows installer removes the

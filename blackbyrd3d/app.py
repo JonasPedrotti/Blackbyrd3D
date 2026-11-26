@@ -3476,7 +3476,8 @@ class MainWindow(QMainWindow):
             from .ui.update_prompt import UpdatePrompt
             box = self._update_box = UpdatePrompt(self)
             box.downloadRequested.connect(self._download_update)
-        box.set_release(rel["version"], __version__)
+        box.set_release(rel["version"], __version__,
+                        installs=_can_install_update(rel))
         box.show()
         # behind the welcome screen, which is what the launch is about
         welcome = getattr(self, "_welcome", None)
@@ -3485,12 +3486,99 @@ class MainWindow(QMainWindow):
             welcome.activateWindow()
 
     def _download_update(self):
+        rel = self._pending_update or {}
+        if _can_install_update(rel):
+            self._install_update(rel)
+        else:
+            self._open_update_page(rel)
+
+    def _open_update_page(self, rel):
         from PySide6.QtCore import QUrl
         from PySide6.QtGui import QDesktopServices
-        rel = self._pending_update or {}
         url = rel.get("download") or rel.get("url")
         if url:
             QDesktopServices.openUrl(QUrl(url))
+
+    def _install_update(self, rel):
+        """Fetch the release beside a progress card, then hand over to it:
+        the Windows installer runs silently and starts the app again, an
+        AppImage is swapped and relaunched with the work carried over."""
+        import threading
+
+        from PySide6.QtCore import QTimer
+
+        from .ui.progress_card import ProgressCard
+        from .utils import updates
+        kind = _update_install_kind()
+        # the installer restarts the app on its own, so unsaved work cannot
+        # be handed over as an AppImage restart does
+        if kind == "windows" and not self._save_changes_first():
+            return
+        appimage = os.environ.get("APPIMAGE", "")
+        dest = (updates.windows_download_path() if kind == "windows"
+                else updates.appimage_download_path(appimage))
+        card = ProgressCard(self, f"Downloading Blackbyrd3D {rel['version']}",
+                            delay=0, title="Update")
+        state = {"done": 0, "total": rel.get("size") or 0,
+                 "error": None, "cancelled": False, "finished": False}
+
+        def progress(done, total):
+            state["done"] = done
+            state["total"] = total or state["total"]
+
+        def worker():
+            try:
+                updates.download(rel["download"], dest, rel["sha256"],
+                                 progress=progress, cancelled=card.wasCanceled)
+            except updates.DownloadCancelled:
+                state["cancelled"] = True
+            except Exception as exc:                          # noqa: BLE001
+                state["error"] = exc
+            state["finished"] = True
+
+        timer = QTimer(self)
+
+        def poll():
+            total = state["total"]
+            if total:
+                card.setValue(state["done"] * 100 // total)
+                card.setLabelText(f"{state['done'] / 1e6:.0f} of "
+                                  f"{total / 1e6:.0f} MB")
+            if not state["finished"]:
+                return
+            timer.stop()
+            card.finish()
+            if state["cancelled"]:
+                return
+            if state["error"] is not None:
+                self._update_failed(rel, state["error"])
+                return
+            try:
+                if kind == "windows":
+                    updates.start_windows_installer(dest)
+                else:
+                    updates.install_appimage(dest, appimage)
+            except Exception as exc:                          # noqa: BLE001
+                self._update_failed(rel, exc)
+                return
+            if kind == "windows":
+                self._restarting = True
+                self.close()
+            else:
+                restart_app(self)
+
+        card.setLabelText("Connecting to GitHub…")
+        card.setValue(0)
+        timer.timeout.connect(poll)
+        timer.start(100)
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _update_failed(self, rel, exc):
+        QMessageBox.warning(
+            self, "Update",
+            f"The update could not be installed: {exc}\n\n"
+            "The download page opens instead.")
+        self._open_update_page(rel)
 
     # long enough to be read, short enough not to stay in the way
     UPDATE_NOTE_MS = 8000
@@ -3532,7 +3620,9 @@ class MainWindow(QMainWindow):
         box.setWindowTitle("Update available")
         box.setText(f"<b>Blackbyrd3D {rel['version']}</b> is available.")
         box.setInformativeText(f"You have v{__version__}.")
-        dl = box.addButton("Download", QMessageBox.ButtonRole.AcceptRole)
+        dl = box.addButton(
+            "Update" if _can_install_update(rel) else "Download",
+            QMessageBox.ButtonRole.AcceptRole)
         notes = box.addButton("Release Notes",
                               QMessageBox.ButtonRole.ActionRole)
         box.addButton("Later", QMessageBox.ButtonRole.RejectRole)
@@ -3540,7 +3630,8 @@ class MainWindow(QMainWindow):
         clicked = box.clickedButton()
         url = None
         if clicked is dl:
-            url = rel.get("download") or rel.get("url")
+            self._pending_update = rel
+            self._download_update()
         elif clicked is notes:
             url = rel.get("url")
         if url:
@@ -4036,6 +4127,8 @@ def run_app(app, splash=None):
     it before the geometry kernel imports so it covers the slow cold start).
     """
     app.setApplicationName(APP_TITLE)
+    from .utils.updates import hold_running_mutex
+    hold_running_mutex()
     # GNOME matches windows to the launcher (icon, grouping, pinning)
     # by this name — must equal the installed blackbyrd3d.desktop
     app.setDesktopFileName("blackbyrd3d")
@@ -4174,6 +4267,20 @@ def _open_launch_args(window, args: list[str]):
             except Exception as exc:                          # noqa: BLE001
                 window.command_line.echo(f"Could not open {arg}: {exc}")
             break
+
+
+def _update_install_kind() -> str | None:
+    import platform
+
+    from .utils import updates
+    return updates.install_kind(platform.system(),
+                                frozen=bool(getattr(sys, "frozen", False)),
+                                appimage=os.environ.get("APPIMAGE"))
+
+
+def _can_install_update(rel) -> bool:
+    from .utils import updates
+    return updates.can_install(rel, _update_install_kind())
 
 
 def _restart_command() -> list[str]:
