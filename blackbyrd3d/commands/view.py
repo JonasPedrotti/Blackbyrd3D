@@ -8,9 +8,6 @@ from .base import (
 )
 
 
-_IMAGE_FILTER = "Images (*.png *.jpg *.jpeg)"
-
-
 def _vp(ctx):
     return ctx.viewport
 
@@ -153,32 +150,6 @@ def cmd_left(ctx):
 def cmd_bottom(ctx):
     """Look at the model from below."""
     _turn(ctx, "bottom")
-    yield from ()
-
-
-@command("viewcapturetofile", aliases=("vcf", "viewcapture"), mutates=False)
-def cmd_viewcapturetofile(ctx):
-    """Save the active viewport as a PNG image."""
-    import os
-    path = yield FileReq("Image path", default="~/viewport.png", save=True,
-                         title="Save viewport capture",
-                         filters=_IMAGE_FILTER)
-    path = os.path.abspath(os.path.expanduser(path.strip()))
-    if not path.lower().endswith((".png", ".jpg", ".jpeg")):
-        path += ".png"
-    img = _vp(ctx).grabFramebuffer()
-    img.save(path)
-    ctx.echo(f"Saved {img.width()}x{img.height()} capture to {path}")
-
-
-@command("viewcapturetoclipboard", aliases=("vcc",), mutates=False)
-def cmd_viewcapturetoclipboard(ctx):
-    """Copy the active viewport image to the clipboard."""
-    from PySide6.QtWidgets import QApplication
-    img = _vp(ctx).grabFramebuffer()
-    QApplication.clipboard().setImage(img)
-    ctx.echo(f"Copied {img.width()}x{img.height()} capture to the "
-             "clipboard.")
     yield from ()
 
 

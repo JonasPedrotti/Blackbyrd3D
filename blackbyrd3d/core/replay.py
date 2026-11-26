@@ -24,6 +24,7 @@ from .selection import SelectionManager
 
 # their effect is on disk, not in the scene
 SKIP_COMMANDS = {"save", "saveas", "export", "screenshot",
+                 "viewcapture", "viewcapturetofile",
                  "viewcapturetoclipboard", "turntable"}
 
 _TOL = 1e-4

@@ -341,10 +341,25 @@ def all_commands() -> list[CommandDef]:
     return sorted(_REGISTRY.values(), key=lambda c: c.name)
 
 
+# an alias this short is an abbreviation, typed whole; one longer is a name
+# somebody may type the start of, `screenshot` as much as `viewcapture`
+_COMPLETED_ALIAS_LENGTH = 4
+
+
 def completions(prefix: str) -> list[str]:
+    """Commands, and aliases spelled out as words, starting with `prefix`.
+
+    An alias is left out where its own command is offered too: `viewc`
+    wants `viewcapture`, not that and `viewcapturetofile` beside it.
+    """
     prefix = prefix.lower()
-    names = [c.name for c in _REGISTRY.values()]
-    return sorted(n for n in names if n.startswith(prefix))
+    names = {c.name for c in _REGISTRY.values() if c.name.startswith(prefix)}
+    for alias, target in _ALIASES.items():
+        if (len(alias) >= _COMPLETED_ALIAS_LENGTH and alias.startswith(prefix)
+                and alias not in _REGISTRY
+                and target.split()[0] not in names):
+            names.add(alias)
+    return sorted(names)
 
 
 # --------------------------------------------------------------- context
