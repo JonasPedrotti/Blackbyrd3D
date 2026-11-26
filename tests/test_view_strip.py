@@ -78,3 +78,27 @@ def test_a_zoom_from_the_strip_leaves_a_pick_running(_qapp):
         win.processor.cancel()
         win.mark_saved()
         win.close()
+
+
+def test_the_buttons_fill_the_strip_at_the_narrowest_panel(strip):
+    """At the width a fresh window gives the panel the row is full, with
+    no gap at the end, and never wider than that panel."""
+    from blackbyrd3d.app import PANEL_WIDTH
+    from blackbyrd3d.ui.view_strip import BUTTON, ICON, NARROWEST
+    assert NARROWEST == PANEL_WIDTH
+    need = strip.minimumSizeHint().width()
+    assert NARROWEST - len(TOOLS) < need <= NARROWEST
+    for b in strip.buttons.values():
+        assert b.size().toTuple() == (BUTTON, BUTTON)
+        assert b.iconSize().toTuple() == (ICON, ICON) == (BUTTON, BUTTON)
+
+
+@pytest.mark.parametrize("width", [280, 330])
+def test_the_row_is_centred(strip, width):
+    strip.resize(width, 40)
+    strip.show()
+    strip.layout().activate()
+    buttons = list(strip.buttons.values())
+    left = buttons[0].geometry().left()
+    right = width - 1 - buttons[-1].geometry().right()
+    assert abs(left - right) <= 1
