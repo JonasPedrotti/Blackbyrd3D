@@ -12,9 +12,6 @@ from PySide6.QtWidgets import QHBoxLayout, QToolButton, QVBoxLayout, QWidget
 
 from .icons import command_icon
 
-BUTTON = 32
-ICON = 28
-
 # (label, command, right-click label, right-click command)
 TOOLS = (
     ("Undo view change", "undoview", None, None),
@@ -26,6 +23,14 @@ TOOLS = (
     ("Lock objects", "lock", "Unlock all objects", "unlockall"),
     ("Lock all others", "lockother", "Unlock all objects", "unlockall"),
 )
+
+# The buttons fill the strip exactly at the narrowest the panel gets,
+# the width a fresh window gives it (PANEL_WIDTH in app.py).
+NARROWEST = 280
+MARGIN = 4
+SPACING = 1
+BUTTON = (NARROWEST - 2 * MARGIN - SPACING * (len(TOOLS) - 1)) // len(TOOLS)
+ICON = BUTTON          # the glyph keeps a margin of its own
 
 _QSS = (
     "#viewStrip { background: #2e2f34; border-bottom: 1px solid #1b1c1f; }"
@@ -45,8 +50,9 @@ class ViewStrip(QWidget):
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         self.setStyleSheet(_QSS)
         row = QHBoxLayout(self)
-        row.setContentsMargins(4, 1, 4, 1)
-        row.setSpacing(1)
+        row.setContentsMargins(MARGIN, 1, MARGIN, 1)
+        row.setSpacing(SPACING)
+        row.addStretch(1)          # centred: what is left over is split
         self.buttons: dict[str, QToolButton] = {}
         for label, command, alt_label, alt_command in TOOLS:
             button = self._button(label, command, alt_label, alt_command,
