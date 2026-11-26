@@ -106,6 +106,8 @@ class MainWindow(QMainWindow):
             self.scene.units = default_units
         self.selection = SelectionManager(self.scene)
         self.history = History(self.scene)
+        QApplication.instance().applicationStateChanged.connect(
+            self._on_application_state)
 
         # widgets
         self.viewport = Viewport(self.scene, self.selection, config=self.cfg)
@@ -2275,13 +2277,52 @@ class MainWindow(QMainWindow):
         QMimeData made here and left on the clipboard segfaults PySide6 as
         the interpreter shuts down, so quitting after a copy crashed.
         """
+        import time
+        from .core import shared_clipboard
         plural = "" if count == 1 else "s"
         self._clipboard_words = f"{count} {noun}{plural} copied in Blackbyrd3D"
+        self._clipboard_stamp = time.time()
+        self._clipboard_published = False
         QApplication.clipboard().setText(self._clipboard_words)
+        shared_clipboard.announce(self._clipboard_words, self._clipboard_stamp)
+
+    def _publish_clipboard(self):
+        """Hand the copy to the other windows, once, as this one lets go."""
+        clip = getattr(self, "_clipboard", None)
+        if not clip or getattr(self, "_clipboard_published", True):
+            return
+        from .core import shared_clipboard
+        self._clipboard_published = True
+        try:
+            shared_clipboard.publish(self._clipboard_words,
+                                     self._clipboard_stamp, clip,
+                                     self.scene.layers)
+        except Exception:                                     # noqa: BLE001
+            pass
+
+    def _on_application_state(self, state):
+        if state != Qt.ApplicationState.ApplicationActive:
+            self._publish_clipboard()
 
     def _copied_objects_are_on_the_clipboard(self, mime) -> bool:
-        return (mime is not None
-                and mime.text() == getattr(self, "_clipboard_words", None))
+        if mime is None or not mime.hasText():
+            return False
+        if mime.text() == getattr(self, "_clipboard_words", None):
+            return True
+        record = self._copy_from_another_window(mime)
+        return record is not None
+
+    def _copy_from_another_window(self, mime):
+        """The record another window left, when the clipboard's words are
+        its copy and it was made after this window's own."""
+        from .core import shared_clipboard
+        record = shared_clipboard.read()
+        if (record is None or record.get("pid") == os.getpid()
+                or mime is None or record.get("words") != mime.text()
+                or record.get("stamp", 0)
+                <= getattr(self, "_clipboard_stamp", -1)):
+            return None
+        return record
 
     def _paste(self):
         """Paste asks the clipboard, because what it holds is not in doubt.
@@ -2308,6 +2349,10 @@ class MainWindow(QMainWindow):
             field.setFocus()
             field.paste()
             return
+        record = self._copy_from_another_window(mime)
+        if record is not None:
+            self._paste_from_another_window(record, mime)
+            return
         clip = getattr(self, "_clipboard", None)
         if not clip:
             return
@@ -2315,18 +2360,103 @@ class MainWindow(QMainWindow):
         if kind == "sheet":
             self._paste_on_sheet(items)
             return
+        from .fileio.progress import Cancelled
+        try:
+            with self._paste_card("Pasting",
+                                  _many_faces_in(items)) as progress:
+                self._paste_in_model(items, progress)
+        except Cancelled:
+            pass
+
+    @contextlib.contextmanager
+    def _paste_card(self, heading: str, big: bool):
+        """The card a long job shows, at once when the paste is big.
+
+        OpenCascade holds the interpreter while it copies or reads a shape,
+        so a card held back half a second never came for one big object:
+        its only report was made before the work, and the window just hung.
+        The journal records the paste behind the card too, rather than on
+        its quiet timer a moment later with nothing on screen.
+        """
+        from .core.occ import foreground
+        from .fileio.progress import Progress, throttled
+        from .ui.progress_card import ProgressCard
+        card = ProgressCard(self, heading, delay=0.0 if big else 0.5,
+                            title="Pasting")
+
+        def report(fraction, message):
+            card.setLabelText(message)
+            card.setValue(int(fraction * 100))
+            QApplication.processEvents()
+            return not card.wasCanceled()
+
+        progress = Progress(throttled(report), heading)
+        progress.show_now = lambda: setattr(card, "_delay", 0.0)
+        try:
+            with foreground():
+                yield progress
+                if self.journal is not None:
+                    progress.tick(1.0, "Recording the paste")
+                    self.journal.flush()
+        finally:
+            card.finish()
+
+    def _paste_from_another_window(self, record, mime):
+        """A copy made in another Blackbyrd3D window: that window writes a
+        big copy out only as it loses the focus, and reading it back takes
+        a while too."""
+        import time
+        from .core import shared_clipboard
+        from .fileio.progress import Cancelled
+        try:
+            with self._paste_card("Pasting from another window",
+                                  shared_clipboard.is_big()) as progress:
+                while record is not None and record.get("pending"):
+                    progress(0.0, "Waiting for the other window to hand "
+                                  "its copy over")
+                    time.sleep(0.05)
+                    record = self._copy_from_another_window(mime)
+                if record is None:
+                    return
+                if shared_clipboard.is_big():
+                    progress.show_now()
+                if record.get("kind") == "sheet":
+                    self._paste_on_sheet(shared_clipboard.sheet_items(record))
+                    return
+                items = shared_clipboard.model_items(
+                    record, progress.part(0.0, 0.6))
+                # read just now, so nothing else holds them: no copy needed
+                self._paste_in_model(items, progress.part(0.6, 1.0),
+                                     layer_for=shared_clipboard.layer_for,
+                                     fresh=True)
+        except Cancelled:
+            self.ctx.echo("Paste cancelled.")
+        except Exception as exc:                              # noqa: BLE001
+            self.ctx.echo(f"Could not paste from the other window: {exc}")
+
+    def _paste_in_model(self, items, progress=None, layer_for=None,
+                        fresh=False):
         from .core import geometry as g
         self.history.checkpoint("paste")
+        if layer_for is not None:
+            had = len(self.scene.layers.all())
+            items = [(name, shape, layer_for(self.scene.layers, where))
+                     for name, shape, where in items]
+            if len(self.scene.layers.all()) != had:
+                self.scene.notify("layers")
         pasted = []
         live = {la.id for la in self.scene.layers.all()}
         # One notification for the paste, not one per object — see
         # Scene.batched. The clipboard holds whatever was selected, which on
         # a survey drawing is thousands of things.
         with self.scene.batched():
-            for name, shape, layer_id in items:
+            for i, (name, shape, layer_id) in enumerate(items):
+                if progress is not None:
+                    progress.tick(i / len(items),
+                                  f"Pasting object {i + 1} of {len(items)}")
                 lid = layer_id if layer_id in live else None
-                pasted.append(self.scene.add(g.copy_shape(shape),
-                                             layer_id=lid))
+                pasted.append(self.scene.add(
+                    shape if fresh else g.copy_shape(shape), layer_id=lid))
         self.selection.set([o.id for o in pasted])
         where = "" if self.viewport.space == "model" else " into the model"
         self.ctx.echo(f"Pasted {len(pasted)} object(s){where}.")
@@ -2951,6 +3081,7 @@ class MainWindow(QMainWindow):
                 and not self._save_changes_first()):
             ev.ignore()
             return
+        self._publish_clipboard()
         # Only a window somebody actually saw: a headless one (tests, a
         # crashed pre-show launch) closing would overwrite the layout the
         # user chose with default-constructed geometry.
@@ -3989,6 +4120,23 @@ class _ViewportTitleBar(QWidget):
 
     def refresh(self):
         self.button.setText(self._win._viewport_title(self._vp) + "  ▾")
+
+
+_BIG_PASTE_FACES = 5000
+
+
+def _many_faces_in(items) -> bool:
+    """Whether copying these takes long enough that a card is wanted at
+    once: a 100,000-face polysurface took three seconds to copy."""
+    from OCP.TopoDS import TopoDS_Shape
+    from .core import occ
+    faces = 0
+    for _name, shape, _layer in items:
+        if isinstance(shape, TopoDS_Shape):
+            faces += occ.map_shapes(shape, occ.FACE).Extent()
+            if faces > _BIG_PASTE_FACES:
+                return True
+    return False
 
 
 def _rhino_clipboard_format(mime) -> str | None:

@@ -10,6 +10,9 @@
   right-click ends any drawing command early. A typed extrude, box or
   cylinder height goes the way the cursor points (negative the other way),
   and a left-click keeps to the number typed.
+- **Paste in another window.** Objects copied in one Blackbyrd3D window
+  paste in another, onto layers of the same name, with a progress popup
+  for big ones.
 - **Update from inside the app.** On Windows and in an AppImage, Update now
   downloads the new release, checks it against GitHub's checksum, installs
   it and restarts. The installer's progress bar is the app's gold one.
