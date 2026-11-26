@@ -7,7 +7,7 @@ def _dist(a, b) -> float:
     return math.dist(a, b)
 
 from ..core import geometry as g
-from .base import PointReq, command, quadrant
+from .base import PointReq, aimed_along, command, quadrant
 
 
 @command("box")
@@ -75,7 +75,8 @@ def cmd_box(ctx):
         ctx.echo("Zero width — no box created.")
         return
     hp = yield PointReq("Height (click, or type a number)",
-                        axis_lock=(c2, up), number_from=(c2, up),
+                        axis_lock=(c2, up),
+                        number_from=aimed_along(ctx, c2, up),
                         rubber_from=c2, preview_fn=_box_to)
     shape = _box_to(hp)
     if shape is None:
@@ -137,7 +138,8 @@ def _box_from_center(ctx):
         return g.extrude(g.planar_face(_spread(du, dv)), up, h)
 
     hp = yield PointReq("Height (click, or type a number)",
-                        axis_lock=(anchor, up), number_from=(anchor, up),
+                        axis_lock=(anchor, up),
+                        number_from=aimed_along(ctx, anchor, up),
                         rubber_from=anchor, preview_fn=_box_to)
     shape = _box_to(hp)
     if shape is None:
@@ -217,8 +219,9 @@ def cmd_cylinder(ctx):
         return g.make_cylinder(b, r, abs(h), up)
 
     hp = yield PointReq("Height (click, or type a number)",
-                        axis_lock=(base, up), number_from=(base, up),
-                        preview_fn=_cyl_to)
+                        axis_lock=(base, up),
+                        number_from=aimed_along(ctx, base, up),
+                        rubber_from=base, preview_fn=_cyl_to)
     shape = _cyl_to(hp)
     if shape is None:
         ctx.echo("Zero radius or height — no cylinder created.")

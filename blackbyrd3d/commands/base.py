@@ -118,6 +118,21 @@ def quadrant(ctx, cplane=None):
     return (-1.0 if u < 0 else 1.0), (-1.0 if v < 0 else 1.0)
 
 
+def aimed_along(ctx, base, direction):
+    """A `number_from` along an axis that goes the way the cursor points.
+
+    A typed height runs to the cursor's side of `base`, a negative one to
+    the other side, and the forward way when there is no cursor to ask.
+    """
+    def along(v):
+        aim = ctx.aim_direction()
+        if aim is not None and sum(a * d for a, d in
+                                   zip(aim[1], direction)) < 0:
+            v = -v
+        return tuple(b + v * d for b, d in zip(base, direction))
+    return along
+
+
 @dataclass
 class NumberReq(Req):
     prompt: str
@@ -1418,6 +1433,11 @@ class CommandProcessor:
             self._select_text(text)
             return
         ok, result = parse_value(req, text, self.ctx)
+        if not ok and not text.strip() and not isinstance(req, TextReq):
+            # Enter, Space or a right-click on a prompt with nothing to
+            # offer for them ends the command, as Esc does
+            self.cancel()
+            return
         if not ok:
             self.ctx.echo(result)
             self._notify()

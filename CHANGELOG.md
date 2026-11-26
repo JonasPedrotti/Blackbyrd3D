@@ -6,6 +6,10 @@
   lit while you click the parts away.
 - **Bigger view strip icons.** The buttons over Properties are larger and
   fill the row, centred in a wider panel.
+- **Typed distances and early exits while drawing.** Enter, Space or a
+  right-click ends any drawing command early. A typed extrude, box or
+  cylinder height goes the way the cursor points (negative the other way),
+  and a left-click keeps to the number typed.
 - **Update from inside the app.** On Windows and in an AppImage, Update now
   downloads the new release, checks it against GitHub's checksum, installs
   it and restarts. The installer's progress bar is the app's gold one.

@@ -3,7 +3,8 @@
 import numpy as np
 
 from ..core import geometry as g
-from .base import NumberReq, PointReq, SelectReq, command, frame_sides
+from .base import (NumberReq, PointReq, SelectReq, aimed_along, command,
+                   frame_sides)
 
 
 def _corner_surface(pts):
@@ -162,9 +163,9 @@ def cmd_extrude(ctx):
 
     dp = yield PointReq(
         "Extrusion distance (click, or type a number)",
-        axis_lock=(base, direction), number_from=(base, direction),
+        axis_lock=(base, direction),
+        number_from=aimed_along(ctx, base, direction),
         rubber_from=base, choices=choices,
-        default=tuple(b + 10.0 * d for b, d in zip(base, direction)),
         preview_fn=_preview)
     dist = _dist_of(dp)
     if abs(dist) < 1e-9:

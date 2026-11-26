@@ -137,16 +137,14 @@ def test_right_drag_does_not_trigger_enter(window):
     window.processor.cancel()
 
 
-def test_right_click_accepts_defaults(window):
+def test_right_click_ends_extrude_without_extruding(window):
     from blackbyrd3d.core import geometry as g
     c = window.scene.add(g.make_circle((0, 0, 0), 5))
     window.selection.set([c.id])
     window.processor.run("extrude")      # preselection consumed
-    _rmb_click(window.viewport)          # accept default distance 10
+    _rmb_click(window.viewport)
     assert not window.processor.busy
-    solid = window.scene.all()[-1]
-    assert solid.kind == "solid"
-    assert g.bbox(solid.shape)[1][2] == pytest.approx(10)
+    assert [o.id for o in window.scene.all()] == [c.id]
 
 
 def test_command_terminates_cleanly_after_completion(window):

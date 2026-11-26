@@ -2059,6 +2059,10 @@ class MainWindow(QMainWindow):
 
     def _on_point_picked(self, point):
         if isinstance(self.processor.request, PointReq):
+            if self.command_line.input.text().strip():
+                # what was typed wins, aimed where the click was
+                self.command_line.submit_input()
+                return
             self.ctx.last_point = point
             self.processor.provide(point)
 
@@ -2130,7 +2134,10 @@ class MainWindow(QMainWindow):
     def _show_cursor_ghost(self, point):
         from time import perf_counter
         start = perf_counter()
-        ghost = self.processor.preview_for(point)
+        typed = self.command_line.input.text()
+        # a typed number is aimed by the cursor, so its ghost follows it
+        ghost = (self.processor.preview_shape(typed) if typed.strip()
+                 else self.processor.preview_for(point))
         for vp in self.all_viewports():
             vp.set_ghost(ghost)
         self._ghost_cost_ms = (perf_counter() - start) * 1000.0
