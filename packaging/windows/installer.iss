@@ -5,6 +5,8 @@
 #define AppName "Blackbyrd3D"
 #define AppPublisher "Jonas Pedrotti"
 #define AppURL "https://github.com/JonasPedrotti/Blackbyrd3D"
+; held by the running app (utils/updates.RUNNING_MUTEX)
+#define AppMutexName "Blackbyrd3D-running"
 
 ; The version is not written here. make_version_info.py puts the one in
 ; pyproject.toml into byrd3d.exe, and the installer reads it back out, so
@@ -130,8 +132,38 @@ Root: HKA; Subkey: "Software\Blackbyrd3D"; \
 [Run]
 Filename: "{app}\byrd3d.exe"; Description: "Launch {#AppName}"; \
   Flags: nowait postinstall skipifsilent
+; An update started from the app runs silently and opens it again after
+Filename: "{app}\byrd3d.exe"; Flags: nowait runasoriginaluser; \
+  Check: IsAppUpdate
 
 [Code]
+{ /UPDATE: started by the app's own updater, which quits right after. }
+function IsAppUpdate: Boolean;
+var
+  I: Integer;
+begin
+  Result := False;
+  for I := 1 to ParamCount do
+    if CompareText(ParamStr(I), '/UPDATE') = 0 then
+      Result := True;
+end;
+
+{ The app is still closing when it starts us; its files cannot be replaced
+  until it is gone. }
+function InitializeSetup: Boolean;
+var
+  Waited: Integer;
+begin
+  Waited := 0;
+  if IsAppUpdate then
+    while CheckForMutexes('{#AppMutexName}') and (Waited < 60000) do
+    begin
+      Sleep(250);
+      Waited := Waited + 250;
+    end;
+  Result := True;
+end;
+
 { The "check for updates" task is applied to settings.json on every install,
   ticked or cleared - SignPath's terms require an opt-out at install time, not
   only a runtime setting. Ticking it again must also undo an earlier opt-out,
@@ -222,6 +254,70 @@ begin
   C.Width := C.Width - Delta;
 end;
 
+{ The app's progress bar (ui/progress_card.py) in place of the style's green
+  one: a slim rounded gold fill on a grey track. Drawn into a bitmap, as the
+  style overrides colours set on controls. }
+const
+  BarPageColor = $002B2B2B;
+  BarTrackColor = $00413B3A;
+  BarFillColor = $0067BDE6;
+
+var
+  ProgressBar: TBitmapImage;
+
+procedure DrawProgress(Done, Total: Integer);
+var
+  B: TBitmap;
+  R: TRect;
+  W, H: Integer;
+begin
+  B := ProgressBar.Bitmap;
+  W := ProgressBar.Width;
+  H := ProgressBar.Height;
+  B.Width := W;
+  B.Height := H;
+  R.Left := 0;
+  R.Top := 0;
+  R.Right := W;
+  R.Bottom := H;
+  B.Canvas.Brush.Color := BarPageColor;
+  B.Canvas.FillRect(R);
+  B.Canvas.Pen.Color := BarTrackColor;
+  B.Canvas.Brush.Color := BarTrackColor;
+  B.Canvas.RoundRect(0, 0, W, H, H, H);
+  if (Total > 0) and (Done > 0) then
+  begin
+    W := Trunc(W * (Done * 1.0 / Total));
+    if W < H then
+      W := H;
+    B.Canvas.Pen.Color := BarFillColor;
+    B.Canvas.Brush.Color := BarFillColor;
+    B.Canvas.RoundRect(0, 0, W, H, H, H);
+  end;
+end;
+
+procedure MakeProgressBar;
+var
+  G: TNewProgressBar;
+begin
+  G := WizardForm.ProgressGauge;
+  ProgressBar := TBitmapImage.Create(WizardForm);
+  ProgressBar.Parent := G.Parent;
+  ProgressBar.Left := G.Left;
+  ProgressBar.Width := G.Width;
+  ProgressBar.Height := ScaleY(6);
+  ProgressBar.Top := G.Top + (G.Height - ProgressBar.Height) div 2;
+  ProgressBar.BackColor := BarPageColor;
+  G.Visible := False;
+  DrawProgress(0, 0);
+end;
+
+procedure CurInstallProgressChanged(CurProgress, MaxProgress: Integer);
+begin
+  WizardForm.ProgressGauge.Visible := False;
+  DrawProgress(CurProgress, MaxProgress);
+end;
+
 procedure InitializeWizard;
 var
   F: TWizardForm;
@@ -238,6 +334,7 @@ begin
   MakeRoom(F.RunList, Delta);
   MakeRoom(F.YesRadio, Delta);
   MakeRoom(F.NoRadio, Delta);
+  MakeProgressBar;
 end;
 
 { A list as tall as its rows, so it can be centred with the text above it. }

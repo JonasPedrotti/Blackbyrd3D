@@ -41,6 +41,13 @@ class UpdatePrompt(CardDialog):
         self.download.clicked.connect(self.accept)
         self.cancel.clicked.connect(self.reject)
 
-    def set_release(self, version: str, current: str):
+    def set_release(self, version: str, current: str,
+                    installs: bool = False):
         self.heading.setText(f"Blackbyrd3D {version} is available")
-        self.body.setText(f"You have version {current}.")
+        if installs:
+            self.download.setText("Update now")
+            self.body.setText(f"You have version {current}. Blackbyrd3D "
+                              "downloads and installs it, then restarts.")
+        else:
+            self.download.setText("Download now")
+            self.body.setText(f"You have version {current}.")

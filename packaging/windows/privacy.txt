@@ -4,6 +4,7 @@ Blackbyrd3D has no telemetry, analytics or crash reporting. Your models stay on 
 
 Update check (on unless you turn it off)
 Each time Blackbyrd3D starts, it asks api.github.com whether a newer release exists. The request carries no information about you or your work, but GitHub sees your IP address (GitHub's privacy statement: https://docs.github.com/site-policy/privacy-policies/github-general-privacy-statement).
+If you choose "Update now", the new installer is downloaded from github.com in the same way.
 To turn it off, clear "Check GitHub for updates on startup" on the next pages. You can change it later in Settings > Updates.
 
 AI assistant (off until you set it up)

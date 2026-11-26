@@ -75,6 +75,7 @@ def test_check_now_runs_the_manual_check(dlg):
 class _Main(QMainWindow):
     _on_update_available = MainWindow._on_update_available
     _download_update = MainWindow._download_update
+    _open_update_page = MainWindow._open_update_page
     _on_update_none = MainWindow._on_update_none
     UPDATE_NOTE_MS = MainWindow.UPDATE_NOTE_MS
 

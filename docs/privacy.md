@@ -18,8 +18,11 @@ To turn it off at any time:
 - or start the app with `BYRD3D_NO_UPDATE_CHECK=1` in the environment.
 
 **Help ▸ Check for Updates** and **Check Now** in Settings ask GitHub when you
-press them, whatever the setting. The *Download* and *Release Notes* buttons
-open GitHub in your browser. See the
+press them, whatever the setting. *Update now* (the Windows installer and an
+AppImage) downloads the new release from github.com with the user agent
+`Blackbyrd3D-updater`, checks it against the SHA256 GitHub lists for it, and
+installs it. Elsewhere *Download* and *Release Notes* open GitHub in your
+browser. See the
 [GitHub General Privacy Statement](https://docs.github.com/en/site-policy/privacy-policies/github-general-privacy-statement).
 
 **AI assistant (off until you set it up).** The assistant sends nothing until
