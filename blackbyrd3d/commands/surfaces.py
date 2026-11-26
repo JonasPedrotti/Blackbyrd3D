@@ -164,7 +164,6 @@ def cmd_extrude(ctx):
         "Extrusion distance (click, or type a number)",
         axis_lock=(base, direction), number_from=(base, direction),
         rubber_from=base, choices=choices,
-        default=tuple(b + 10.0 * d for b, d in zip(base, direction)),
         preview_fn=_preview)
     dist = _dist_of(dp)
     if abs(dist) < 1e-9:

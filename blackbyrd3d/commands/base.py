@@ -1413,6 +1413,11 @@ class CommandProcessor:
             self._select_text(text)
             return
         ok, result = parse_value(req, text, self.ctx)
+        if not ok and not text.strip() and not isinstance(req, TextReq):
+            # Enter, Space or a right-click on a prompt with nothing to
+            # offer for them ends the command, as Esc does
+            self.cancel()
+            return
         if not ok:
             self.ctx.echo(result)
             self._notify()
