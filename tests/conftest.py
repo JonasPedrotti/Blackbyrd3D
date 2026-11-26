@@ -30,6 +30,8 @@ def _isolated_config(tmp_path_factory):
     """
     os.environ["BYRD3D_CONFIG"] = str(
         tmp_path_factory.mktemp("settings") / "settings.json")
+    os.environ["BYRD3D_SHARED_CLIPBOARD"] = str(
+        tmp_path_factory.mktemp("clipboard") / "clipboard.json")
 
 
 @pytest.fixture(autouse=True)
