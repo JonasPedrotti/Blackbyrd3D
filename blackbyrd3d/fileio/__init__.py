@@ -431,17 +431,16 @@ def export_file(scene, path: str, only_ids: list | None = None,
     report = Progress(progress, f"Saving {os.path.basename(path)}…")
     report(0.0)
     writing = report
-    if ext != ".byrd":
-        # A .byrd keeps what was never converted as it is; every other
-        # format needs the geometry, and some of it converts to nothing
-        # (a hidden layer's text) and leaves the scene, so this comes
-        # before the list of what to write is taken.
-        ids = scene._order if only_ids is None else only_ids
-        if any(i in scene.objects and not scene.objects[i].shape_ready
-               for i in ids):
-            scene.realise_all(only_ids, progress=report.part(
-                0.0, 0.4, "Converting hidden objects…"))
-            writing = report.part(0.4, 1.0)
+    # Every format needs the geometry, .byrd too, and some of it converts
+    # to nothing (a hidden layer's text) and leaves the scene, so this
+    # comes before the list of what to write is taken. All at once: one
+    # object at a time, each told the layers panel to recount the scene.
+    ids = scene._order if only_ids is None else only_ids
+    if any(i in scene.objects and not scene.objects[i].shape_ready
+           for i in ids):
+        scene.realise_all(only_ids, progress=report.part(
+            0.0, 0.4, "Converting hidden objects…"))
+        writing = report.part(0.4, 1.0)
     note = _export_file(scene, path, ext, only_ids, thumbnail, stl_quality,
                         rhino_version, writing)
     report.done()

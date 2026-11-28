@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+- **Faster .byrd saving.** A big Rhino survey saves in seconds instead of
+  a minute, and .byrd files open faster too.
+- **Curves stay behind faces.** Curves just under a roof or a wall no
+  longer show through it when seen from a distance.
+- **Hidden selection outlines.** A selected object hidden behind something
+  shows its edges through in the selection colour.
+
 ## 0.5.0
 
 - **Trim keeps its cutters selected.** Objects selected before Trim stay

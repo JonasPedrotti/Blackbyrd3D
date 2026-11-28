@@ -7,9 +7,7 @@ Points are (x, y, z) tuples throughout; vectors likewise.
 from __future__ import annotations
 
 import math
-import os
 import struct
-import tempfile
 import warnings
 import weakref
 
@@ -5875,14 +5873,7 @@ def shape_to_bytes(shape) -> bytes:
         return (_MESH_ORIGIN_TAG + struct.pack("<II", len(v), len(t))
                 + np.ascontiguousarray(origin, "<f8").tobytes()
                 + v.tobytes() + t.tobytes())
-    fd, path = tempfile.mkstemp(suffix=".brep")
-    os.close(fd)
-    try:
-        occ.brep_write(shape, path)
-        with open(path, "rb") as f:
-            return f.read()
-    finally:
-        os.unlink(path)
+    return occ.brep_to_bytes(shape)
 
 
 def _cloud_pack(cloud) -> bytes:
@@ -5964,14 +5955,7 @@ def shape_from_bytes(data: bytes):
                           offset=head).reshape(-1, 3).astype(float) + origin,
             np.frombuffer(data, "<u4", count=nt * 3,
                           offset=cut).reshape(-1, 3))
-    fd, path = tempfile.mkstemp(suffix=".brep")
-    os.close(fd)
-    try:
-        with open(path, "wb") as f:
-            f.write(data)
-        return occ.brep_read(path)
-    finally:
-        os.unlink(path)
+    return occ.brep_from_bytes(data)
 
 
 def make_compound(shapes: list) -> TopoDS_Shape:

@@ -2127,22 +2127,20 @@ class Viewport(QOpenGLWidget):
         # A parallel view's slab wraps the drawing alone (Camera.clip_planes),
         # so the grid, a rubber band on a construction plane back at the
         # world's origin or a ghost behind the model can fall outside it.
-        # Clamping depth keeps them, at the front or the back of the slab,
+        # A perspective view's near plane comes forward to what is drawn
+        # nearest the eye, and a gumball or a rubber band can stand in front
+        # of that. Clamping depth keeps them, at the front or the back,
         # where clipping would cut them away. What is drawn after the model
         # compares with LEQUAL, so a ghost clamped to the back still shows
         # wherever nothing stands in front of it.
-        parallel = self.camera.projection == "parallel"
-        if parallel:
-            GL.glEnable(GL.GL_DEPTH_CLAMP)
+        GL.glEnable(GL.GL_DEPTH_CLAMP)
 
         if self.display_mode == "technical":
             self._paint_technical(w, h)
-            if parallel:
-                GL.glDepthFunc(GL.GL_LEQUAL)
+            GL.glDepthFunc(GL.GL_LEQUAL)
             self._draw_pending(mvp)
-            if parallel:
-                GL.glDepthFunc(GL.GL_LESS)
-                GL.glDisable(GL.GL_DEPTH_CLAMP)
+            GL.glDepthFunc(GL.GL_LESS)
+            GL.glDisable(GL.GL_DEPTH_CLAMP)
             self._draw_selection_box(w, h)
             return
 
@@ -2162,11 +2160,10 @@ class Viewport(QOpenGLWidget):
             if occlude and draws:
                 self._draw_ambient_occlusion(draws, proj,
                                              self._ao_ground(mvp), caps)
-            if parallel:
-                GL.glDepthFunc(GL.GL_LEQUAL)
+            GL.glDepthFunc(GL.GL_LEQUAL)
             self._draw_image_planes(mvp)
             self._keep_scene(scene_key)
-        elif parallel:
+        else:
             GL.glDepthFunc(GL.GL_LEQUAL)
         self._draw_pending(mvp)
         self._draw_control_points(mvp)
@@ -2176,9 +2173,8 @@ class Viewport(QOpenGLWidget):
         self._draw_direction_arrows(mvp)
         self._draw_clip_normals(mvp)
         self.gumball.paint(mvp)
-        if parallel:
-            GL.glDepthFunc(GL.GL_LESS)
-            GL.glDisable(GL.GL_DEPTH_CLAMP)
+        GL.glDepthFunc(GL.GL_LESS)
+        GL.glDisable(GL.GL_DEPTH_CLAMP)
         if self.world_axes_visible:
             self._draw_axis_triad(view, w, h)
         self._draw_frame_guides(w, h)
@@ -3325,7 +3321,10 @@ class Viewport(QOpenGLWidget):
         if self._cam_bounds_key == key:
             return
         self._cam_bounds_key = key
-        box = self.scene.bbox()
+        boxes = self.scene.boxes()
+        self.camera.object_boxes = boxes
+        box = (None if not len(boxes) else
+               (tuple(boxes[:, 0].min(axis=0)), tuple(boxes[:, 1].max(axis=0))))
         self.camera.drawing_bounds = box
         if self.grid_visible:
             extent = float(self._grid_params[0])
@@ -3553,6 +3552,7 @@ class Viewport(QOpenGLWidget):
         GL.glUniform1i(self._uloc(self._mesh_prog, "uPlaster"),
                        1 if plaster else 0)
         from ..core.text_object import TextShape
+        behind = []          # what is selected, to be shown where it is hidden
         for obj in objects:
             if isinstance(obj, _Batch):
                 self._draw_batch(obj, mvp, view, fill_alpha,
@@ -3740,10 +3740,13 @@ class Viewport(QOpenGLWidget):
                 else:
                     edge_color = face_edge_color(line_color, obj.kind)
                 lw = self.scene.screen_width_of(obj)
+                rank = self._line_rank.get(obj.id, 0)
                 self._draw_edges(gpu, omvp, edge_color,
                                  2.2 if selected else lw,
-                                 hatch=obj.kind == "hatch",
-                                 rank=self._line_rank.get(obj.id, 0))
+                                 hatch=obj.kind == "hatch", rank=rank)
+                if selected:
+                    behind.append((gpu, omvp, oclips, edge_color, rank,
+                                   obj.kind == "hatch"))
             if lettering and selected:
                 dots = self._text_frame_dots(obj.shape.frame_box(), mvp)
                 if len(dots):
@@ -3807,6 +3810,7 @@ class Viewport(QOpenGLWidget):
                     omvp, obj.mesh.points,
                     (*gold, 1.0) if selected else (0.0, 0.0, 0.0, 1.0),
                     selected, anchor=gpu.anchor)
+        self._draw_selected_behind(behind, clips)
         self._line_width(1.0)
         self._nudge_curves(False)
         if clips and mode in CAP_MODES:
@@ -4420,6 +4424,27 @@ class Viewport(QOpenGLWidget):
                  else self._pane_ratio)
         return 1.0 / ratio if ratio > 0 else 1.0
 
+    def _draw_selected_behind(self, behind, clips):
+        """The outlines of what is selected, faint and thin, where something
+        in front hides them: a picked solid behind a wall is still seen to
+        be picked, and where it is. Only the hidden part, so what is in
+        sight keeps its own full outline."""
+        if not behind:
+            return
+        GL.glDepthFunc(GL.GL_GREATER)
+        GL.glDepthMask(False)
+        try:
+            for gpu, omvp, oclips, color, rank, hatch in behind:
+                if clips:
+                    self._want_clips(oclips)
+                self._draw_edges(gpu, omvp, (*color[:3], HIDDEN_SELECTION_ALPHA),
+                                 HIDDEN_SELECTION_WIDTH, hatch=hatch, rank=rank)
+        finally:
+            GL.glDepthMask(True)
+            GL.glDepthFunc(GL.GL_LESS)
+            if clips:
+                self._want_clips(clips)
+
     def _draw_edges(self, gpu, mvp, color, width: float,
                     hatch: bool = False, rank: int = 0):
         """Object edges at a given pixel width, through the screen-space
@@ -4454,19 +4479,23 @@ class Viewport(QOpenGLWidget):
         and between equal pens the layer higher in the list. A rank per
         object, 0 at the bottom; hatches have none, being under every line.
 
+        Only what is in sight is ranked: every rank brings a line nearer,
+        and ranks spent on switched-off layers brought the top ones so far
+        forward that curves showed through the faces in front of them.
+
         Worked out once per change to the drawing or its layers, not per
         frame: a frame only looks the ranks up."""
         scene = self.scene
         layers = scene.layers.all()
-        key = (scene.revision,
-               tuple((layer.id, layer.lineweight, layer.screen_pinned)
-                     for layer in layers))
+        key = (scene.revision, scene.showing_only,
+               tuple((layer.id, layer.lineweight, layer.screen_pinned,
+                      layer.visible, layer.parent) for layer in layers))
         cached = getattr(self, "_line_rank_cache", None)
         if cached is not None and cached[0] == key:
             return cached[1]
         place = {layer.id: i for i, layer in enumerate(layers)}
         keys = {o.id: (scene.screen_width_of(o), -place.get(o.layer_id, 0))
-                for o in scene.all() if o.kind != "hatch"}
+                for o in scene.visible_objects() if o.kind != "hatch"}
         order = {k: i for i, k in enumerate(sorted(set(keys.values())))}
         ranks = {oid: min(order[k], MAX_LINE_RANK)
                  for oid, k in keys.items()}
@@ -4482,9 +4511,9 @@ class Viewport(QOpenGLWidget):
         The higher its rank (_line_ranks), the nearer: two lines lying on
         each other, a wall's outline on a pane's, fought pixel by pixel for
         a depth the rounding made a little different along each, and came
-        out dashed. Each rank is a whole nudge apart, far more than the
-        rounding, so the order holds."""
-        self._nudge_depth(CURVE_DEPTH_NUDGE * (1.0 + rank) if on else 0.0)
+        out dashed. Each rank is a few steps of the depth buffer apart,
+        more than the rounding, so the order holds."""
+        self._nudge_depth(line_nudge(rank) if on else 0.0)
 
     def _nudge_depth(self, amount: float):
         if getattr(self, "_curves_nudged", 0.0) == amount:
@@ -8590,13 +8619,28 @@ def _boxes_on_ray(boxes, origin, direction, reach) -> np.ndarray:
 # How much of the depth range a curve is drawn nearer than it is, so that
 # lying on an edge it wins the tie (see Viewport._draw_edges).
 CURVE_DEPTH_NUDGE = 1e-6
+# How much nearer each line rank stands than the one below it: five steps
+# of a 24 bit depth buffer, past the rounding of two lines on each other
+# and the fringe bias in THICK_FRAG. A whole CURVE_DEPTH_NUDGE a rank put
+# the top rank of a drawing with 32 of them 3% of the view distance in
+# front, and a curve that far behind a face showed through it.
+LINE_RANK_STEP = 3e-7
 # How many distinct line ranks (pen widths by layers) are told apart before
 # the rest share the top one: enough for any drawing, few enough that the
 # nearest line still stands a mere hair in front of the faces it lies on.
 MAX_LINE_RANK = 63
+
+
+def line_nudge(rank: int) -> float:
+    return CURVE_DEPTH_NUDGE + LINE_RANK_STEP * rank
+
+
 # A text background stands in front of every curve rank in its plane, and
 # its lettering a nudge further still.
-TEXT_BACKGROUND_NUDGE = CURVE_DEPTH_NUDGE * (MAX_LINE_RANK + 2)
+TEXT_BACKGROUND_NUDGE = line_nudge(MAX_LINE_RANK + 1)
+# How the hidden part of a selected object's outline is drawn.
+HIDDEN_SELECTION_ALPHA = 1.0
+HIDDEN_SELECTION_WIDTH = 1.2
 # The least grey a mesh's edges are drawn in: darkened from a black mesh's
 # own colour they were black on black, and its triangles could not be told
 # apart.

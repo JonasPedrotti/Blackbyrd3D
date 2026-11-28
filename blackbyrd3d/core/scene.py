@@ -804,11 +804,15 @@ class Scene:
         from ..utils.units import format_paper_length
         return format_paper_length(mm, self.units)
 
-    def bbox(self) -> tuple[tuple, tuple] | None:
+    def boxes(self) -> np.ndarray:
+        """Each visible object's bounding box, as an (n, 2, 3) array."""
         objs = self.visible_objects()
-        if not objs:
+        return np.array([o.bbox() for o in objs], float).reshape(-1, 2, 3)
+
+    def bbox(self) -> tuple[tuple, tuple] | None:
+        boxes = self.boxes()
+        if not len(boxes):
             return None
-        boxes = np.array([o.bbox() for o in objs], float)
         return (tuple(boxes[:, 0].min(axis=0)),
                 tuple(boxes[:, 1].max(axis=0)))
 
