@@ -451,6 +451,20 @@ def brep_read(path: str) -> TopoDS_Shape:
     BinTools.Read_s(shape, path)
     return shape
 
+# In memory: a temporary file per shape made saving a drawing of ten
+# thousand objects take most of a minute, the virus scanner opening each.
+def brep_to_bytes(shape) -> bytes:
+    import io
+    out = io.BytesIO()
+    BinTools.Write_s(shape, out)
+    return out.getvalue()
+
+def brep_from_bytes(data: bytes) -> TopoDS_Shape:
+    import io
+    shape = TopoDS_Shape()
+    BinTools.Read_s(shape, io.BytesIO(data))
+    return shape
+
 def map_shapes(shape, kind) -> TopTools_IndexedMapOfShape:
     m = TopTools_IndexedMapOfShape()
     TopExp.MapShapes_s(shape, kind, m)

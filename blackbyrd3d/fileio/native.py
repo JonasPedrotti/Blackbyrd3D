@@ -90,6 +90,16 @@ def read_thumbnail(path: str) -> bytes | None:
 
 def save_scene(scene, path: str, thumbnail: bytes | None = None,
                progress=None):
+    # Reading a hidden object's shape converts it, which notifies.
+    batched = getattr(scene, "batched", None)
+    if batched is None:
+        _save_scene(scene, path, thumbnail, progress)
+        return
+    with batched():
+        _save_scene(scene, path, thumbnail, progress)
+
+
+def _save_scene(scene, path, thumbnail, progress):
     if getattr(scene, "before_save", None) is not None:
         scene.before_save()
     from ..core.layout import layouts_to_json, sheet_groups_to_json, style_set
