@@ -174,6 +174,7 @@ class Camera:
         self.projection = "perspective"        # or "parallel" (orthographic)
         self.scene_bounds = None               # ((x,y,z),(x,y,z)); clip_planes
         self.drawing_bounds = None             # the same, without the grid
+        self.object_boxes = None               # (n, 2, 3) of what is drawn
         self._vp_cache = None                  # see _view_proj
 
     @property
@@ -267,8 +268,23 @@ class Camera:
             drawn = _corners(self.drawing_bounds)
             reach = max(float(np.linalg.norm(drawn - eye, axis=1).max())
                         * 1.05, d * 1.05, 1e-3)
-        near = max(d * 0.001, reach * 1e-6)
+        near = max(d * 0.001, reach * 1e-6,
+                   min(0.5 * self._clearance(eye), 0.5 * d))
         return near, far
+
+    def _clearance(self, eye) -> float:
+        """How far the eye is from the nearest thing drawn, 0 inside one.
+
+        The near plane comes forward to half of it. Depth is finest at the
+        near plane and coarsens with the square of the distance past it, so
+        one at a thousandth of the zoom left a tower 22 m off so coarse that
+        a curve 4 cm under its roof drew in front of it.
+        """
+        boxes = self.object_boxes
+        if boxes is None or not len(boxes):
+            return 0.0
+        gap = np.maximum(np.maximum(boxes[:, 0] - eye, eye - boxes[:, 1]), 0.0)
+        return float(np.sqrt((gap * gap).sum(axis=1)).min())
 
     def proj_matrix(self, width: int, height: int) -> np.ndarray:
         aspect = width / max(height, 1)
@@ -489,7 +505,8 @@ class Camera:
                None if bounds is None else (tuple(bounds[0]),
                                             tuple(bounds[1])),
                None if drawn is None else (tuple(drawn[0]),
-                                           tuple(drawn[1])))
+                                           tuple(drawn[1])),
+               id(self.object_boxes))
         cached = self._vp_cache
         if cached is None or cached[0] != key:
             pos = self.position
